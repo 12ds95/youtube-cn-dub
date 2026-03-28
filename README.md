@@ -158,9 +158,11 @@ youtube-cn-dub/
 ├── download_model.sh      # Whisper 模型下载（国内镜像）
 ├── config.example.json    # 配置模板
 ├── tests/                 # 单元测试
+│   ├── test_estimate_speed.py      # 字符估算语速测试
 │   ├── test_expand_disabled.py     # expand 禁用验证测试
 │   ├── test_parse_translation.py   # 翻译解析器测试
 │   ├── test_refine_dedup.py        # 迭代去重测试
+│   ├── test_translate_retry.py     # 翻译重试回退测试
 │   ├── test_translation_quality.py # 翻译质量优化测试
 │   └── test_voice_smoothing.py     # 语速平滑测试
 ├── devlog/                # 开发日志（排查记录）
@@ -206,14 +208,16 @@ bash test.sh unit     # 仅单元测试
   - `_translate_llm` 注入视频标题和前文（上一批最后 2 句译文）作为上下文，提升术语一致性
   - 解析后校验有效翻译数 ≥ batch 70%，不满足则降级逐条翻译，避免翻译-原文错位
   - `DEFAULT_CONFIG["llm"]` 新增 `style` 字段，支持 "口语化"、"正式"、"学术" 等自定义翻译风格
+  - LLM 翻译失败时自动回退 Google Translate（回退链：LLM 批量 → LLM 逐条重试 → Google → 保留原文）
 
 - **语音一致性优化**（已解决）：各片段独立计算加速/降速比，语速方差大、听感割裂。修复方案：
   - `_align_tts_to_timeline` 实现三步语速平滑：收集原始 speed_ratio → 计算中位数基线 → 混合（60% 自身 + 40% 基线）+ 指数平滑（α=0.3）
   - 语速分布方差显著缩小，相邻片段过渡更自然
 
-- **迭代性能优化**（已解决）：迭代优化对所有片段重复计算，包括已收敛的。修复方案：
+- **迭代性能优化**（已解决）：迭代优化对所有片段重复计算，且先生成 TTS 再迭代导致大量浪费。修复方案：
   - 引入 `converged_indices` 集合，已满足阈值的片段在后续轮次中跳过
-  - 增量 TTS：只对翻译变更的片段重新生成，未变更的复用上一轮缓存
+  - 迭代阶段改用 `_estimate_speed_ratios` 基于字符数估算语速（中文 ~250ms/字），不依赖 TTS 文件
+  - 流程重排：翻译 → 迭代优化（纯文本）→ TTS（一次性）→ 对齐 → 合成，避免首轮 50% TTS 白生成
   - 所有片段收敛时 early stop，无需跑满 max_iterations
 
 - **0 字节 TTS 文件**（已解决）：edge-tts 网络不稳时生成 0 字节空文件，导致最终视频对应时段无配音。修复方案：

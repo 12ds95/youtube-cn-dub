@@ -566,23 +566,46 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
 
         batch_results = []
-        for seg, zh in zip(batch, translations):
-            # 校验：翻译过短（<2字符且原文>10字符）视为解析失败，保留原文
+        failed_indices = []  # 记录翻译失败的段（需要回退 Google）
+        for j, (seg, zh) in enumerate(zip(batch, translations)):
+            # 校验：翻译过短（<2字符且原文>10字符）视为解析失败
             if zh and len(zh.strip()) >= 2:
                 text_zh = zh.strip()
-            elif len(seg["text"]) > 10:
-                print(f"     ⚠️  翻译异常（\"{zh}\"），保留原文: \"{seg['text'][:30]}\"")
-                text_zh = seg["text"]
             else:
-                text_zh = zh or seg["text"]
-            # 最终安全网：确保 text_zh 没有 [N] 前缀泄漏
-            if re.match(r"^\[\d+\]", text_zh):
-                text_zh = _strip_numbered_prefix(text_zh)
+                text_zh = None  # 标记为失败
+                failed_indices.append(j)
+            if text_zh:
+                # 安全网：确保 text_zh 没有 [N] 前缀泄漏
+                if re.match(r"^\[\d+\]", text_zh):
+                    text_zh = _strip_numbered_prefix(text_zh)
             batch_results.append({
                 "start": seg["start"], "end": seg["end"],
-                "text_en": seg["text"], "text_zh": text_zh,
+                "text_en": seg["text"], "text_zh": text_zh or seg["text"],
             })
-            result.append(batch_results[-1])
+
+        # 对失败的段进行 Google Translate 回退
+        if failed_indices:
+            print(f"     ⚠️  {len(failed_indices)} 段 LLM 翻译失败，回退 Google Translate")
+            try:
+                from deep_translator import GoogleTranslator
+                gt = GoogleTranslator(source="en", target="zh-CN")
+                for j in failed_indices:
+                    seg = batch[j]
+                    try:
+                        gt_zh = gt.translate(seg["text"])
+                        if gt_zh and len(gt_zh.strip()) >= 2:
+                            batch_results[j]["text_zh"] = gt_zh.strip()
+                            print(f"       ✅ Google 翻译成功: \"{seg['text'][:30]}\"")
+                        else:
+                            print(f"       ⚠️  Google 翻译也为空，保留原文: \"{seg['text'][:30]}\"")
+                    except Exception as e:
+                        print(f"       ⚠️  Google 翻译失败 ({e})，保留原文: \"{seg['text'][:30]}\"")
+                    time.sleep(0.3)
+            except ImportError:
+                print(f"       ⚠️  deep_translator 未安装，无法回退 Google 翻译")
+
+        for br in batch_results:
+            result.append(br)
 
         # 保存最后两句作为下一批的上下文
         if batch_results:
@@ -594,29 +617,37 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     return result
 
 
-def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature):
-    """逐条 LLM 翻译（降级方案）"""
+def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature,
+                          max_retries: int = 3):
+    """逐条 LLM 翻译（降级方案），带重试"""
     import httpx
     results = []
     for seg in batch:
-        try:
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": seg["text"]},
-                ],
-                "temperature": temperature,
-                "max_tokens": 512,
-            }
-            with httpx.Client(timeout=30.0) as client:
-                resp = client.post(endpoint, json=payload, headers=headers)
-                resp.raise_for_status()
-                zh = resp.json()["choices"][0]["message"]["content"].strip()
-                zh = _strip_think_block(zh)  # 去除可能的 <think> 块
-                results.append(zh)
-        except Exception:
-            results.append(seg["text"])
+        zh = None
+        for attempt in range(max_retries):
+            try:
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": seg["text"]},
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": 512,
+                }
+                with httpx.Client(timeout=30.0) as client:
+                    resp = client.post(endpoint, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    zh = resp.json()["choices"][0]["message"]["content"].strip()
+                    zh = _strip_think_block(zh)
+                    if zh and len(zh.strip()) >= 2:
+                        break
+                    zh = None  # 空结果，重试
+            except Exception:
+                zh = None
+            if attempt < max_retries - 1:
+                time.sleep(1 * (attempt + 1))
+        results.append(zh if zh else "")
     return results
 
 
@@ -760,10 +791,54 @@ async def _generate_tts_segments(
                     print(f"     ⚠️  seg_{idx:04d}.mp3 重试失败，已填充静音")
 
 
+def _estimate_speed_ratios(
+    segments: List[dict], threshold: float = 1.5,
+    ms_per_zh_char: float = 250.0, ms_per_en_char: float = 100.0,
+) -> List[dict]:
+    """基于字符数估算语速比（不需要 TTS 文件），用于迭代优化阶段。
+    中文字符 ~250ms/字, 英文/数字 ~100ms/字 (基于 edge-tts zh-CN-YunxiNeural 实测)
+    """
+    results = []
+    underslow_threshold = 0.7
+    for idx, seg in enumerate(segments):
+        text_zh = seg.get("text_zh", "")
+        target_ms = int((seg["end"] - seg["start"]) * 1000)
+        if target_ms <= 0 or not text_zh.strip():
+            results.append({
+                "idx": idx, "speed_ratio": 0.0,
+                "estimated_ms": 0, "target_ms": target_ms,
+                "status": "skipped", "skip_reason": "no_text",
+                "text_en": seg.get("text_en", ""),
+                "text_zh": text_zh,
+            })
+            continue
+        # 分别计算中文和非中文字符的估算时长
+        zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
+        other_chars = sum(1 for c in text_zh if c.isalnum() and not ('\u4e00' <= c <= '\u9fff'))
+        estimated_ms = zh_chars * ms_per_zh_char + other_chars * ms_per_en_char
+        # 标点和空格约占 10% 额外时间（停顿）
+        estimated_ms *= 1.1
+        ratio = estimated_ms / target_ms
+        if ratio > threshold:
+            status = "overfast"
+        elif ratio < underslow_threshold:
+            status = "underslow"
+        else:
+            status = "ok"
+        results.append({
+            "idx": idx, "speed_ratio": round(ratio, 3),
+            "estimated_ms": int(estimated_ms), "target_ms": target_ms,
+            "text_en": seg.get("text_en", ""),
+            "text_zh": text_zh,
+            "status": status,
+        })
+    return results
+
+
 def _measure_speed_ratios(
     segments: List[dict], tts_dir: Path, threshold: float = 1.5,
 ) -> List[dict]:
-    """阶段 B: 测量每个片段 TTS 时长 vs 原始时间窗口的比率"""
+    """阶段 B: 测量每个片段 TTS 时长 vs 原始时间窗口的比率（需要 TTS 文件）"""
     from pydub import AudioSegment as PydubSegment
     results = []
     for idx, seg in enumerate(segments):
@@ -949,8 +1024,9 @@ async def run_refinement_loop(
     segments: List[dict], output_dir: Path, config: dict,
 ) -> List[dict]:
     """
-    迭代优化主循环:
-      测量语速比 → 筛选超速片段 → LLM 精简翻译 → 重新 TTS → 重复
+    迭代优化主循环 (纯文本阶段，不依赖 TTS):
+      字符数估算语速比 → 筛选超速片段 → LLM 精简翻译 → 重复
+    TTS 在所有翻译定稿后由主流程统一生成。
     返回优化后的 segments (同时更新 segments_cache.json)
     """
     import copy
@@ -959,15 +1035,12 @@ async def run_refinement_loop(
     max_iter = refine_cfg.get("max_iterations", 3)
     threshold = refine_cfg.get("speed_threshold", 1.5)
     resume_iter = refine_cfg.get("resume_iteration")
-    voice = config["voice"]
-    concurrency = config.get("tts_concurrency", 5)
     llm_config = config.get("llm", {})
 
     if not llm_config.get("api_key"):
         print("  ⚠️  迭代优化需要 LLM 翻译引擎 (llm.api_key 为空)，跳过")
         return segments
 
-    tts_dir = output_dir / "tts_segments"
     iter_dir = output_dir / "iterations"
     iter_dir.mkdir(exist_ok=True)
 
@@ -994,11 +1067,11 @@ async def run_refinement_loop(
 
     for it in range(start_iter, max_iter):
         print(f"\n  {'─'*50}")
-        print(f"  🔄 迭代优化 第 {it+1}/{max_iter} 轮 (阈值: >{threshold}x)")
+        print(f"  🔄 迭代优化 第 {it+1}/{max_iter} 轮 (阈值: >{threshold}x, 字符估算)")
         print(f"  {'─'*50}")
 
-        # 1) 测量语速
-        speed_data = _measure_speed_ratios(segments, tts_dir, threshold)
+        # 1) 基于字符数估算语速（无需 TTS 文件）
+        speed_data = _estimate_speed_ratios(segments, threshold)
         overfast = [d for d in speed_data if d["status"] == "overfast" and d["idx"] not in converged_indices]
         underslow = [d for d in speed_data if d["status"] == "underslow" and d["idx"] not in converged_indices]
 
@@ -1015,6 +1088,7 @@ async def run_refinement_loop(
         # 保存速度报告
         report = {
             "iteration": it, "threshold": threshold,
+            "mode": "estimate",
             "total": len(segments), "overfast_count": len(overfast),
             "underslow_count": len(underslow),
             "max_ratio": round(max_ratio, 3),
@@ -1034,36 +1108,31 @@ async def run_refinement_loop(
             print(f"     已收敛片段: {len(converged_indices)}/{len(segments)} (本轮跳过)")
         skipped = [d for d in speed_data if d["status"] == "skipped"]
         if skipped:
-            no_tts = [d for d in skipped if d.get("skip_reason") == "no_tts"]
-            print(f"     跳过片段: {len(skipped)} (无TTS: {len(no_tts)}, 零时长: {len(skipped)-len(no_tts)})")
+            print(f"     跳过片段: {len(skipped)} (无文本)")
         if overfast:
             top = sorted(overfast, key=lambda x: x["speed_ratio"], reverse=True)[:5]
             for d in top:
                 zh_pre = d["text_zh"][:25] + ("..." if len(d["text_zh"]) > 25 else "")
                 print(f"       #{d['idx']:3d}  {d['speed_ratio']:.2f}x  \"{zh_pre}\"")
 
-        # 2) 无超速且无过短 → 收敛
-        if not overfast and not underslow:
-            print(f"\n  ✅ 所有片段语速均在合理范围内，优化完成!")
+        # 2) 无超速 → 收敛（过短交给时间对齐阶段处理）
+        if not overfast:
+            if underslow:
+                print(f"\n  ✅ 翻译优化完成! ({len(underslow)} 个过短片段将由时间线对齐阶段静音填充)")
+            else:
+                print(f"\n  ✅ 所有片段语速均在合理范围内，优化完成!")
             break
 
         new_segments = segments
 
-        # 3a) LLM 精简过长翻译
-        if overfast:
-            print(f"     调用 LLM 精简 {len(overfast)} 个超速片段...")
-            new_segments = _refine_with_llm(new_segments, overfast, llm_config)
-
-        # 3b) 过短片段不再调用 LLM 扩展（LLM 容易生成偏离原文的内容）
-        #     改为交给 _align_tts_to_timeline 的静音填充 + 轻微降速处理
-        if underslow:
-            print(f"     ⏭  {len(underslow)} 个过短片段将由时间线对齐阶段处理（静音填充+降速）")
+        # 3) LLM 精简过长翻译
+        print(f"     调用 LLM 精简 {len(overfast)} 个超速片段...")
+        new_segments = _refine_with_llm(new_segments, overfast, llm_config)
 
         # 4) 统计变更
         changes = []
         changed_indices = []
-        all_adjusted = overfast + underslow
-        for item in all_adjusted:
+        for item in overfast:
             idx = item["idx"]
             old_zh = segments[idx]["text_zh"]
             new_zh = new_segments[idx]["text_zh"]
@@ -1098,39 +1167,28 @@ async def run_refinement_loop(
             json.dump({"changed_indices": changed_indices, "changes": changes},
                       f, ensure_ascii=False, indent=2)
 
-        # 6) 删除被修改片段的 TTS 缓存，重新生成
-        for idx in changed_indices:
-            for suffix in [".mp3", "_adj.wav"]:
-                p = tts_dir / f"seg_{idx:04d}{suffix}"
-                if p.exists():
-                    p.unlink()
-        print(f"     增量 TTS: 仅重新生成 {len(changed_indices)}/{len(segments)} 个变更片段")
-        await _generate_tts_segments(segments, tts_dir, voice, concurrency)
-
     # 写回主缓存
     cache_file = output_dir / "segments_cache.json"
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
 
-    # 输出大循环引导（人工审听）
-    final_speed = _measure_speed_ratios(segments, tts_dir, threshold)
+    # 输出估算汇总
+    final_speed = _estimate_speed_ratios(segments, threshold)
     final_overfast = [d for d in final_speed if d["status"] == "overfast"]
-    final_underslow = [d for d in final_speed if d["status"] == "underslow"]
     final_active = [d for d in final_speed if d["status"] != "skipped"]
     final_max = max((d["speed_ratio"] for d in final_active), default=0)
     final_min = min((d["speed_ratio"] for d in final_active if d["speed_ratio"] > 0), default=0)
     final_avg = sum(d["speed_ratio"] for d in final_active) / max(1, len(final_active))
 
     print(f"\n  {'━'*50}")
-    print(f"  📊 小循环完成 — 语速分析汇总:")
-    print(f"     总片段: {len(final_active)}, 仍超速: {len(final_overfast)}, 仍过短: {len(final_underslow)}")
+    print(f"  📊 迭代优化完成（字符估算）:")
+    print(f"     总片段: {len(final_active)}, 仍超速: {len(final_overfast)}")
     print(f"     最大: {final_max:.2f}x, 最小: {final_min:.2f}x, 平均: {final_avg:.2f}x")
-    if final_overfast or final_underslow:
+    if final_overfast:
         print(f"  💡 建议：播放 final.mp4 实际审听，若仍有语速问题可再次运行:")
         print(f"     python pipeline.py --resume-from {output_dir} --refine 5")
-        print(f"     或手动编辑 segments_cache.json 中 text_zh 字段后重跑")
     else:
-        print(f"  ✅ 所有片段语速均在合理范围内，语速自然")
+        print(f"  ✅ 翻译已优化，接下来将生成 TTS 并校验实际语速")
     print(f"  {'━'*50}")
 
     return segments
@@ -1532,20 +1590,24 @@ async def process_video(config: dict):
     if refine_enabled and segments:
         # ── 迭代优化流程 (8步) ──
 
-        # Step 5: 生成 TTS
+        # Step 5: 迭代优化翻译（纯文本，基于字符数估算，不需要 TTS）
+        if "refine" not in skip:
+            print(f"[5/{total_steps}] 迭代优化翻译（字符估算）")
+            segments = await run_refinement_loop(segments, output_dir, config)
+            print()
+
+        # Step 6: 翻译定稿后一次性生成 TTS
         if "tts" not in skip:
-            print(f"[5/{total_steps}] 生成 TTS 片段")
+            print(f"[6/{total_steps}] 生成 TTS 片段")
             print(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
             tts_dir = output_dir / "tts_segments"
+            # 清除旧的 TTS 缓存（翻译已变更，旧文件内容可能不匹配）
+            if tts_dir.exists():
+                for f in tts_dir.iterdir():
+                    f.unlink()
             await _generate_tts_segments(
                 segments, tts_dir, config["voice"],
                 config.get("tts_concurrency", 5))
-            print()
-
-        # Step 6: 迭代优化
-        if "refine" not in skip:
-            print(f"[6/{total_steps}] 迭代优化翻译")
-            segments = await run_refinement_loop(segments, output_dir, config)
             print()
 
         # Step 7: 字幕 + 时间线对齐

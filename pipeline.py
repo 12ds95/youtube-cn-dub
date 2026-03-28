@@ -508,6 +508,9 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
                 text_zh = seg["text"]
             else:
                 text_zh = zh or seg["text"]
+            # 最终安全网：确保 text_zh 没有 [N] 前缀泄漏
+            if re.match(r"^\[\d+\]", text_zh):
+                text_zh = _strip_numbered_prefix(text_zh)
             result.append({
                 "start": seg["start"], "end": seg["end"],
                 "text_en": seg["text"], "text_zh": text_zh,
@@ -537,14 +540,29 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                 resp = client.post(endpoint, json=payload, headers=headers)
                 resp.raise_for_status()
                 zh = resp.json()["choices"][0]["message"]["content"].strip()
+                zh = _strip_think_block(zh)  # 去除可能的 <think> 块
                 results.append(zh)
         except Exception:
             results.append(seg["text"])
     return results
 
 
+def _strip_think_block(content: str) -> str:
+    """去除 Qwen3 等模型返回的 <think>...</think> 推理块"""
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+
+def _strip_numbered_prefix(line: str) -> str:
+    """去除行首的 [N] 或 N. 编号前缀"""
+    cleaned = re.sub(r"^\[?\d+\]?\s*\.?\s*", "", line.strip())
+    return cleaned.strip()
+
+
 def _parse_numbered_translations(content: str, expected_count: int) -> List[str]:
     """解析 LLM 返回的编号格式翻译"""
+    # 第一层：去除 <think> 推理块（qwen3-coder 等模型会输出）
+    content = _strip_think_block(content)
+
     lines = content.strip().split("\n")
     translations = []
 
@@ -553,16 +571,23 @@ def _parse_numbered_translations(content: str, expected_count: int) -> List[str]
         if not line:
             continue
         # 匹配 [1] 翻译内容 或 1. 翻译内容
-        match = re.match(r"^\[?\d+\]?\s*\.?\s*(.+)$", line)
+        match = re.match(r"^\[(\d+)\]\s*(.+)$", line)
+        if not match:
+            match = re.match(r"^(\d+)\.\s*(.+)$", line)
         if match:
-            translations.append(match.group(1).strip())
+            translations.append(match.group(2).strip())
         elif translations:
             # 可能是上一行的续行
             translations[-1] += line
 
-    # 如果解析数量不对，按行分割
+    # 第二层：如果解析数量不对，按行分割并同样去除编号前缀
     if len(translations) != expected_count:
-        translations = [l.strip() for l in content.strip().split("\n") if l.strip()]
+        raw_lines = [l.strip() for l in content.strip().split("\n") if l.strip()]
+        translations = [_strip_numbered_prefix(l) for l in raw_lines]
+
+    # 第三层：最终安全检查，确保没有 [N] 前缀泄漏
+    translations = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
+                    for t in translations]
 
     # 补足或截断
     while len(translations) < expected_count:
@@ -980,9 +1005,11 @@ def _refine_with_llm(
             translations = _parse_numbered_translations(content, len(batch))
             for item, new_zh in zip(batch, translations):
                 if new_zh and new_zh.strip():
+                    # 安全网：去除可能的 [N] 前缀
+                    clean_zh = _strip_numbered_prefix(new_zh) if re.match(r"^\[\d+\]", new_zh) else new_zh
                     # 只有确实变短了才采纳
-                    if len(new_zh) < len(item["text_zh"]):
-                        refined[item["idx"]]["text_zh"] = new_zh
+                    if len(clean_zh) < len(item["text_zh"]):
+                        refined[item["idx"]]["text_zh"] = clean_zh
         except Exception as e:
             print(f"     ⚠️  LLM 精简批次 {i//batch_size+1} 失败: {e}")
 

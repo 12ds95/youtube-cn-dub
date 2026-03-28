@@ -145,7 +145,11 @@ python pipeline.py "URL" --whisper-model tiny
 
 ### 迭代优化（自动精简过长翻译）
 
-这是 v3 的核心新功能。当中文翻译过长导致配音需要大幅加速时，pipeline 会自动检测这些片段，调用 LLM 携带上下文信息进行精简，然后重新生成 TTS，循环迭代直到所有片段的语速在可接受范围内。
+这是 v3 的核心新功能。迭代优化分为两层循环：
+
+**小循环（自动）**：一次 `--refine N` 执行中，自动进行 N 轮"测量→精简→重生成 TTS"，直到所有片段加速倍率 ≤ 阈值（默认 1.25x）或达到轮次上限。
+
+**大循环（人工）**：小循环完成后，人工播放 `final.mp4` 实际审听配音效果。若仍不满意，可用 `--resume-iteration` 断点续跑下一轮，或手动编辑 `segments_cache.json` 微调后重跑。
 
 **工作原理：**
 
@@ -170,8 +174,8 @@ python pipeline.py "URL" --translator llm --llm-api-key sk-xxx --refine 3
 # Google 翻译 + 迭代优化（初始翻译用 Google，精简阶段用 LLM）
 python pipeline.py "URL" --refine 3 --llm-api-key sk-xxx
 
-# 自定义加速阈值（默认 1.5x，可调低以获得更自然的语速）
-python pipeline.py "URL" --refine 3 --refine-threshold 1.3
+# 自定义加速阈值（默认 1.25x，可调低以获得更自然的语速）
+python pipeline.py "URL" --refine 5 --refine-threshold 1.2
 ```
 
 **断点管理：**
@@ -201,7 +205,7 @@ config.json 中的配置：
   "refine": {
     "enabled": true,
     "max_iterations": 3,
-    "speed_threshold": 1.5,
+    "speed_threshold": 1.25,
     "resume_iteration": null
   }
 }
@@ -243,3 +247,47 @@ bash download_model.sh tiny     # 轻量，约 75MB
 4. **配音语速**：部分中文翻译较长的片段会被加速，使用 `--refine` 可自动优化
 5. **Intel Mac 性能**：Whisper small 模型转录一个 6 分钟视频大约需要 2-3 分钟
 6. **LLM 依赖**：使用 LLM 翻译或迭代优化需额外安装 `pip install httpx`
+7. **ffmpeg 版本**：Anaconda 自带的 ffmpeg 3.4 无法解码 edge-tts MP3，需确保 Homebrew ffmpeg ≥ 4.x 在 PATH 中优先（`run.sh` 已自动处理）
+
+### 测试记录
+
+#### 测试 1: zjMuIxRvygQ (四元数科普, ~6 分钟)
+
+**环境**: Intel i7-9750H, 16GB RAM, macOS, Python 3.11
+
+**LLM 配置**: 百炼 qwen3-coder-next (`coding.dashscope.aliyuncs.com`)
+
+**运行命令**:
+```bash
+python pipeline.py --config config.json
+# config.json: translator=llm, refine.enabled=true, max_iterations=5, speed_threshold=1.25
+```
+
+**各阶段耗时** (总计 565s ≈ 9.4 分钟):
+
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| Whisper 转录 | ~150s | small 模型, 72 段, Intel CPU |
+| LLM 翻译 | ~30s | 5 批次, 每批 15 段 |
+| TTS 生成 | ~60s | 72 段, 并发 5 |
+| 迭代优化 (5轮) | ~200s | 含 LLM 精简 + TTS 重生成 |
+| 时间线对齐 + 合成 | ~30s | ffmpeg atempo + amix |
+
+**迭代优化效果**:
+
+| 轮次 | 超速片段 | 最大加速 | 平均加速 | 精简数 |
+|------|----------|----------|----------|--------|
+| 初始 | 39/72 | 6.63x | 1.37x | - |
+| 第 1 轮 | 13/72 | 3.63x | 1.12x | 36 |
+| 第 2 轮 | 8/72 | 2.40x | 1.06x | 13 |
+| 第 3 轮 | 7/72 | 2.40x | 1.05x | 3 |
+| 第 4 轮 | 4/72 | 2.40x | 1.04x | 5 |
+| 第 5 轮 | 3/72 | 2.40x | 1.03x | 1 |
+
+超速片段从 39 个降到 3 个，平均加速从 1.37x 降到 1.03x。剩余 3 个顽固片段（#71 时间窗口极短仅 ~1.5s, #11 含大量专有名词难以缩短, #17 技术术语密集）属于结构性瓶颈，需人工编辑 `segments_cache.json` 微调。
+
+**发现的问题与修复**:
+
+- **翻译解析异常**: LLM 批量返回中偶尔有编号解析错误，导致个别段翻译为单个字符。已增加校验逻辑（翻译 < 2 字符且原文 > 10 字符时保留原文）
+- **ffmpeg 版本冲突**: Anaconda 的 ffmpeg 3.4 无法解码 edge-tts 生成的 MP3。已在 run.sh 中固定 Homebrew ffmpeg 优先
+- **TTS 空文件**: 翻译异常导致 edge-tts 生成 0 字节 MP3，pydub 崩溃。已增加 0 字节文件跳过逻辑

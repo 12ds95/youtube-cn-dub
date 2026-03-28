@@ -12,6 +12,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # 激活虚拟环境
 source "$SCRIPT_DIR/venv/bin/activate"
 
+# 确保 Homebrew ffmpeg 优先于 Anaconda 的旧版
+if [ -d "/usr/local/opt/ffmpeg/bin" ]; then
+    export PATH="/usr/local/opt/ffmpeg/bin:$PATH"
+elif [ -d "/opt/homebrew/opt/ffmpeg/bin" ]; then
+    export PATH="/opt/homebrew/opt/ffmpeg/bin:$PATH"
+fi
+
 # 确保 Node.js 在 PATH (nvm 环境)
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null

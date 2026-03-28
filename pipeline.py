@@ -87,11 +87,13 @@ DEFAULT_CONFIG = {
     "skip_steps": [],            # 跳过的步骤: ["download","transcribe","translate","subtitle","tts","merge"]
 
     # 迭代优化（翻译过长时自动精简）
+    # 小循环（自动）：测量→精简→重TTS→再测量→仍超速则继续精简，直到收敛
+    # 大循环（人工）：人工审听后决定是否再跑一轮，用 --resume-iteration 断点续跑
     "refine": {
         "enabled": False,          # 是否启用
-        "max_iterations": 3,       # 最大迭代轮次
-        "speed_threshold": 1.5,    # 加速倍率阈值（超过此值触发精简）
-        "resume_iteration": None,  # 从第 N 轮迭代恢复（断点续跑）
+        "max_iterations": 5,       # 小循环最大迭代轮次
+        "speed_threshold": 1.25,   # 加速倍率阈值（>1.25x 即触发精简，1.5x 已很明显）
+        "resume_iteration": None,  # 从第 N 轮迭代恢复（大循环断点续跑）
     },
     "clean_iterations": False,     # 清理迭代中间数据
 }
@@ -419,9 +421,10 @@ def _translate_google(segments: List[dict], batch_size: int = 20) -> List[dict]:
                     translations.append(t)
                 time.sleep(0.5)
         for seg, zh in zip(batch, translations):
+            text_zh = zh if (zh and len(zh.strip()) >= 2) else seg["text"]
             result.append({
                 "start": seg["start"], "end": seg["end"],
-                "text_en": seg["text"], "text_zh": zh or seg["text"],
+                "text_en": seg["text"], "text_zh": text_zh,
             })
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
         if i + batch_size < len(segments):
@@ -497,9 +500,17 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
             translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
 
         for seg, zh in zip(batch, translations):
+            # 校验：翻译过短（<2字符且原文>10字符）视为解析失败，保留原文
+            if zh and len(zh.strip()) >= 2:
+                text_zh = zh.strip()
+            elif len(seg["text"]) > 10:
+                print(f"     ⚠️  翻译异常（\"{zh}\"），保留原文: \"{seg['text'][:30]}\"")
+                text_zh = seg["text"]
+            else:
+                text_zh = zh or seg["text"]
             result.append({
                 "start": seg["start"], "end": seg["end"],
-                "text_en": seg["text"], "text_zh": zh or seg["text"],
+                "text_en": seg["text"], "text_zh": text_zh,
             })
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
 
@@ -606,8 +617,12 @@ async def _generate_tts_segments(
     tasks = []
     for idx, seg in enumerate(segments):
         p = tts_dir / f"seg_{idx:04d}.mp3"
-        if not p.exists():
+        if not p.exists() or p.stat().st_size == 0:
             text_zh = seg.get("text_zh", seg.get("text", ""))
+            if len(text_zh.strip()) < 2:
+                continue  # 跳过空/垃圾文本，避免生成空 mp3
+            if p.exists():
+                p.unlink()  # 删除 0 字节文件
             tasks.append(_tts_one(text_zh, str(p), voice, semaphore))
 
     if tasks:
@@ -630,7 +645,7 @@ def _measure_speed_ratios(
     for idx, seg in enumerate(segments):
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
         target_ms = int((seg["end"] - seg["start"]) * 1000)
-        if target_ms <= 0 or not tts_path.exists():
+        if target_ms <= 0 or not tts_path.exists() or tts_path.stat().st_size == 0:
             results.append({
                 "idx": idx, "speed_ratio": 0.0,
                 "tts_ms": 0, "target_ms": target_ms, "status": "skipped",
@@ -664,7 +679,7 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
 
     for idx, seg in enumerate(segments):
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
-        if not tts_path.exists():
+        if not tts_path.exists() or tts_path.stat().st_size == 0:
             stats["skipped"] += 1
             continue
 
@@ -866,6 +881,25 @@ async def run_refinement_loop(
     cache_file = output_dir / "segments_cache.json"
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
+
+    # 输出大循环引导（人工审听）
+    final_speed = _measure_speed_ratios(segments, tts_dir, threshold)
+    final_overfast = [d for d in final_speed if d["status"] == "overfast"]
+    final_active = [d for d in final_speed if d["status"] != "skipped"]
+    final_max = max((d["speed_ratio"] for d in final_active), default=0)
+    final_avg = sum(d["speed_ratio"] for d in final_active) / max(1, len(final_active))
+
+    print(f"\n  {'━'*50}")
+    print(f"  📊 小循环完成 — 语速分析汇总:")
+    print(f"     总片段: {len(final_active)}, 仍超速: {len(final_overfast)}")
+    print(f"     最大: {final_max:.2f}x, 平均: {final_avg:.2f}x")
+    if final_overfast:
+        print(f"  💡 建议：播放 final.mp4 实际审听，若仍有语速问题可再次运行:")
+        print(f"     python pipeline.py --resume-from {output_dir} --refine 5")
+        print(f"     或手动编辑 segments_cache.json 中 text_zh 字段后重跑")
+    else:
+        print(f"  ✅ 所有片段均在 {threshold}x 以内，语速自然")
+    print(f"  {'━'*50}")
 
     return segments
 

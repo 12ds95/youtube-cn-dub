@@ -1,4 +1,4 @@
-## YouTube 英文视频中文配音方案 (v2)
+## YouTube 英文视频中文配音方案 (v3)
 
 ### 方案概览
 
@@ -15,6 +15,7 @@
 | 翻译 | Google Translate / LLM (可选) | 英文翻译为中文，支持大模型翻译 |
 | 中文配音 | edge-tts | 微软 TTS 引擎，自然中文语音（并发生成） |
 | 时间对齐 | ffmpeg atempo | 调速使中文配音匹配原始时间线 |
+| 迭代优化 | LLM + edge-tts | 自动精简过长翻译，循环至语速自然 |
 | 视频合成 | ffmpeg | 合并视频+配音+原声背景 |
 
 ### 快速使用
@@ -140,7 +141,71 @@ python pipeline.py "URL" --whisper-model tiny
   "skip_steps": ["download", "transcribe"]
 }
 ```
-可跳过的步骤名：`download`, `extract`, `transcribe`, `translate`, `subtitle`, `tts`, `merge`
+可跳过的步骤名：`download`, `extract`, `transcribe`, `translate`, `subtitle`, `tts`, `refine`, `merge`
+
+### 迭代优化（自动精简过长翻译）
+
+这是 v3 的核心新功能。当中文翻译过长导致配音需要大幅加速时，pipeline 会自动检测这些片段，调用 LLM 携带上下文信息进行精简，然后重新生成 TTS，循环迭代直到所有片段的语速在可接受范围内。
+
+**工作原理：**
+
+```
+┌─ 生成 TTS ──→ 测量语速比 ──→ 全部 ≤ 阈值? ──→ 完成! 
+│                                    ↓ 否
+│              筛选超速片段 ←────────┘
+│                    ↓
+│         LLM 精简翻译 (带上下文)
+│                    ↓
+│            重新生成 TTS
+│                    ↓
+└────────────── 下一轮迭代
+```
+
+**使用方式：**
+
+```bash
+# LLM 翻译 + 3 轮迭代优化（推荐）
+python pipeline.py "URL" --translator llm --llm-api-key sk-xxx --refine 3
+
+# Google 翻译 + 迭代优化（初始翻译用 Google，精简阶段用 LLM）
+python pipeline.py "URL" --refine 3 --llm-api-key sk-xxx
+
+# 自定义加速阈值（默认 1.5x，可调低以获得更自然的语速）
+python pipeline.py "URL" --refine 3 --refine-threshold 1.3
+```
+
+**断点管理：**
+
+```bash
+# 从第 2 轮迭代恢复（之前的迭代数据保留在 iterations/ 目录）
+python pipeline.py --resume-from output/VIDEO_ID --refine 5 --resume-iteration 2
+
+# 清理所有迭代数据，恢复初始翻译重新开始
+python pipeline.py --resume-from output/VIDEO_ID --clean-iterations --refine 3
+```
+
+`--clean-iterations` 会做三件事：恢复 `segments_cache.json` 为初始翻译、删除 `iterations/` 快照目录、清理 `tts_segments/` 缓存。
+
+**迭代产物 (`iterations/` 目录)：**
+
+| 文件 | 说明 |
+|------|------|
+| `iter_0_segments.json` | 初始翻译快照（clean 时用于恢复） |
+| `iter_0_speed_report.json` | 第 0 轮语速分析（含每段的 speed_ratio） |
+| `iter_1_segments.json` | 第 1 轮优化后的翻译 |
+| `iter_1_changes.json` | 第 1 轮变更记录（哪些段被改了、改前改后） |
+
+config.json 中的配置：
+```json
+{
+  "refine": {
+    "enabled": true,
+    "max_iterations": 3,
+    "speed_threshold": 1.5,
+    "resume_iteration": null
+  }
+}
+```
 
 ### 输出文件说明
 
@@ -175,6 +240,6 @@ bash download_model.sh tiny     # 轻量，约 75MB
 1. **网络要求**：YouTube 下载需要代理；Google 翻译和 edge-tts 需要网络连接
 2. **Chrome 需关闭**：yt-dlp 读取 Chrome cookies 时，Chrome 浏览器需要处于关闭状态
 3. **翻译质量**：Google Translate 对技术内容翻译偏弱，推荐使用 LLM 翻译（DeepSeek 费用低效果好）
-4. **配音语速**：部分中文翻译较长的片段会被加速，极端情况下可能听起来不自然
+4. **配音语速**：部分中文翻译较长的片段会被加速，使用 `--refine` 可自动优化
 5. **Intel Mac 性能**：Whisper small 模型转录一个 6 分钟视频大约需要 2-3 分钟
-6. **LLM 依赖**：使用 LLM 翻译需额外安装 `pip install httpx`
+6. **LLM 依赖**：使用 LLM 翻译或迭代优化需额外安装 `pip install httpx`

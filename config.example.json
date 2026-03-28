@@ -1,5 +1,5 @@
 {
-  "__说明__": "此文件为 pipeline.py 的示例配置，复制为 config.json 后按需修改",
+  "__说明__": "此文件为 pipeline.py v3 的示例配置，复制为 config.json 后按需修改",
 
   "url": "https://www.youtube.com/watch?v=zjMuIxRvygQ",
   "output": "output",
@@ -13,7 +13,7 @@
   "translator": "google",
 
   "llm": {
-    "__说明__": "当 translator 设为 llm 时启用。支持所有 OpenAI 兼容 API（DeepSeek、OpenAI、Moonshot 等）",
+    "__说明__": "当 translator=llm 或 refine.enabled=true 时需要配置。支持 DeepSeek、OpenAI、Moonshot 等 OpenAI 兼容 API",
     "api_url": "https://api.deepseek.com/v1",
     "api_key": "",
     "model": "deepseek-chat",
@@ -24,5 +24,14 @@
 
   "tts_concurrency": 5,
   "whisper_beam_size": 5,
-  "skip_steps": []
+  "skip_steps": [],
+
+  "refine": {
+    "__说明__": "迭代优化: 自动检测配音过长片段，调用 LLM 精简翻译，循环直到语速自然",
+    "enabled": false,
+    "max_iterations": 3,
+    "speed_threshold": 1.5,
+    "resume_iteration": null
+  },
+  "clean_iterations": false
 }

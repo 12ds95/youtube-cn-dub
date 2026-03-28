@@ -4,7 +4,7 @@
 
 这是一套完整的端到端工具链，可以将 YouTube 英文视频自动转换为带中文配音和中英双语字幕的视频。所有工具均为免费开源，全部在本地运行。
 
-项目位置: `/Users/caixin/Desktop/youtube-cn-dub/`
+项目位置: 克隆到本地后的目录
 
 ### 工具链
 
@@ -21,7 +21,7 @@
 ### 快速使用
 
 ```bash
-cd /Users/caixin/Desktop/youtube-cn-dub
+cd youtube-cn-dub
 
 # 方式一：直接指定 URL
 source venv/bin/activate
@@ -253,9 +253,9 @@ bash download_model.sh tiny     # 轻量，约 75MB
 
 #### 测试 1: zjMuIxRvygQ (四元数科普, ~6 分钟)
 
-**环境**: Intel i7-9750H, 16GB RAM, macOS, Python 3.11
+**环境**: macOS, Python 3.11 (Intel Mac 实测)
 
-**LLM 配置**: 百炼 qwen3-coder-next (`coding.dashscope.aliyuncs.com`)
+**LLM 配置**: qwen3-coder-next (通过 OpenAI 兼容 API)
 
 **运行命令**:
 ```bash

@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
         ),
         "batch_size": 15,
         "temperature": 0.3,
+        "style": "",  # 翻译风格: "" (默认), "口语化", "正式", "学术" 等
     },
 
     # 性能选项
@@ -445,7 +446,7 @@ def translate_segments(segments: List[dict], config: dict) -> List[dict]:
     """根据配置选择翻译引擎"""
     engine = config.get("translator", "google")
     if engine == "llm":
-        return _translate_llm(segments, config["llm"])
+        return _translate_llm(segments, config["llm"], config.get("video_title", ""))
     else:
         return _translate_google(segments)
 
@@ -482,7 +483,7 @@ def _translate_google(segments: List[dict], batch_size: int = 20) -> List[dict]:
     return result
 
 
-def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
+def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = "") -> List[dict]:
     """LLM 大模型翻译引擎 (OpenAI 兼容 API)"""
     import httpx
 
@@ -492,6 +493,9 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
     system_prompt = llm_config.get("system_prompt", "将英文翻译为中文，只输出翻译结果。")
     batch_size = llm_config.get("batch_size", 15)
     temperature = llm_config.get("temperature", 0.3)
+    style = llm_config.get("style", "")
+    if style:
+        system_prompt += f"\n翻译风格要求：{style}"
 
     if not api_key:
         print("  ⚠️  LLM api_key 未设置，降级为 Google 翻译")
@@ -511,7 +515,8 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
     }
 
     result = []
-    for i in range(0, len(segments), batch_size):
+    prev_context = None
+    for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
         batch = segments[i:i + batch_size]
         # 构造批量翻译请求：每行一句，用编号标记
         lines = []
@@ -519,9 +524,17 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
             lines.append(f"[{j+1}] {seg['text']}")
         user_msg = "\n".join(lines)
 
+        # 构造上下文提示
+        context_hint = ""
+        if video_title:
+            context_hint += f"视频主题：{video_title}\n"
+        if prev_context:
+            context_hint += f"前文：{'；'.join(prev_context)}\n"
+
         batch_prompt = (
             f"{system_prompt}\n\n"
-            f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
+            + (f"{context_hint}\n" if context_hint else "")
+            + f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
             f"一行一句，不要合并或拆分：\n\n{user_msg}"
         )
 
@@ -543,11 +556,16 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
 
             # 解析返回的编号格式
             translations = _parse_numbered_translations(content, len(batch))
+            # 对齐保证：验证解析结果数量是否匹配
+            if len([t for t in translations if t.strip()]) < len(batch) * 0.7:
+                print(f"     ⚠️  LLM 批次对齐失败 ({len(translations)} vs {len(batch)})，降级逐条翻译")
+                translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
         except Exception as e:
-            print(f"     ⚠️  LLM 批次 {i//batch_size+1} 失败: {e}")
+            print(f"     ⚠️  LLM 批次 {batch_idx+1} 失败: {e}")
             # 降级：逐条翻译
             translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
 
+        batch_results = []
         for seg, zh in zip(batch, translations):
             # 校验：翻译过短（<2字符且原文>10字符）视为解析失败，保留原文
             if zh and len(zh.strip()) >= 2:
@@ -560,10 +578,16 @@ def _translate_llm(segments: List[dict], llm_config: dict) -> List[dict]:
             # 最终安全网：确保 text_zh 没有 [N] 前缀泄漏
             if re.match(r"^\[\d+\]", text_zh):
                 text_zh = _strip_numbered_prefix(text_zh)
-            result.append({
+            batch_results.append({
                 "start": seg["start"], "end": seg["end"],
                 "text_en": seg["text"], "text_zh": text_zh,
             })
+            result.append(batch_results[-1])
+
+        # 保存最后两句作为下一批的上下文
+        if batch_results:
+            prev_context = [r["text_zh"] for r in batch_results[-2:]]
+
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
 
     print(f"  ✅ LLM 翻译完成")
@@ -709,6 +733,32 @@ async def _generate_tts_segments(
     else:
         print(f"     TTS 片段已缓存，跳过生成")
 
+    # Retry pass: detect and retry 0-byte TTS files
+    retry_tasks = []
+    for idx, seg in enumerate(segments):
+        p = tts_dir / f"seg_{idx:04d}.mp3"
+        if p.exists() and p.stat().st_size == 0:
+            text_zh = seg.get("text_zh", seg.get("text", ""))
+            if len(text_zh.strip()) >= 2:
+                p.unlink()  # Remove 0-byte file
+                retry_tasks.append(_tts_one(text_zh, str(p), voice, semaphore))
+
+    if retry_tasks:
+        print(f"     重试 {len(retry_tasks)} 个 0 字节 TTS 片段...")
+        await asyncio.gather(*retry_tasks, return_exceptions=True)
+
+        # If still 0-byte after retry, generate silence placeholder
+        for idx, seg in enumerate(segments):
+            p = tts_dir / f"seg_{idx:04d}.mp3"
+            if p.exists() and p.stat().st_size == 0:
+                # Create a minimal silence file so downstream doesn't break
+                target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
+                if target_ms > 0:
+                    from pydub import AudioSegment as PydubSegment
+                    silence = PydubSegment.silent(duration=min(target_ms, 500), frame_rate=16000)
+                    silence.export(str(p), format="mp3")
+                    print(f"     ⚠️  seg_{idx:04d}.mp3 重试失败，已填充静音")
+
 
 def _measure_speed_ratios(
     segments: List[dict], tts_dir: Path, threshold: float = 1.5,
@@ -720,9 +770,11 @@ def _measure_speed_ratios(
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
         target_ms = int((seg["end"] - seg["start"]) * 1000)
         if target_ms <= 0 or not tts_path.exists() or tts_path.stat().st_size == 0:
+            reason = "no_tts" if (not tts_path.exists() or tts_path.stat().st_size == 0) else "zero_duration"
             results.append({
                 "idx": idx, "speed_ratio": 0.0,
                 "tts_ms": 0, "target_ms": target_ms, "status": "skipped",
+                "skip_reason": reason,
             })
             continue
         tts_audio = PydubSegment.from_mp3(str(tts_path))
@@ -759,6 +811,47 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
     final_audio = PydubSegment.silent(duration=total_ms, frame_rate=16000)
     stats = {"adjusted": 0, "skipped": 0, "padded": 0}
 
+    # First pass: collect all raw speed ratios
+    raw_ratios = []
+    for idx, seg in enumerate(segments):
+        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+        target_start = int(seg["start"] * 1000)
+        target_dur = int(seg["end"] * 1000) - target_start
+        if not tts_path.exists() or tts_path.stat().st_size == 0 or target_dur <= 0:
+            raw_ratios.append(None)
+            continue
+        tts_audio = PydubSegment.from_mp3(str(tts_path))
+        raw_ratios.append(len(tts_audio) / target_dur)
+
+    # Compute global baseline (median of valid ratios)
+    valid_ratios = [r for r in raw_ratios if r is not None and r > 0]
+    if valid_ratios:
+        sorted_ratios = sorted(valid_ratios)
+        median_ratio = sorted_ratios[len(sorted_ratios) // 2]
+    else:
+        median_ratio = 1.0
+
+    # Blend toward median and apply smoothing
+    BLEND_WEIGHT = 0.4  # 40% toward global median
+    SMOOTH_ALPHA = 0.3  # exponential smoothing factor
+    blended_ratios = []
+    for r in raw_ratios:
+        if r is None:
+            blended_ratios.append(None)
+        else:
+            blended_ratios.append(r * (1 - BLEND_WEIGHT) + median_ratio * BLEND_WEIGHT)
+
+    # Exponential smoothing pass
+    smoothed_ratios = list(blended_ratios)
+    prev_valid = None
+    for i, r in enumerate(smoothed_ratios):
+        if r is not None:
+            if prev_valid is not None:
+                smoothed_ratios[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
+            prev_valid = smoothed_ratios[i]
+
+    print(f"     全局语速基线: {median_ratio:.2f}x (混合权重={BLEND_WEIGHT}, 平滑系数={SMOOTH_ALPHA})")
+
     for idx, seg in enumerate(segments):
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
         if not tts_path.exists() or tts_path.stat().st_size == 0:
@@ -773,7 +866,7 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
             stats["skipped"] += 1
             continue
 
-        speed_ratio = len(tts_audio) / target_dur
+        speed_ratio = smoothed_ratios[idx] if smoothed_ratios[idx] is not None else (len(tts_audio) / target_dur)
 
         # 对于过短片段 (ratio < 0.7)：不做极端降速，改用静音填充居中放置
         if speed_ratio < 0.7 and len(tts_audio) > 0:
@@ -897,6 +990,8 @@ async def run_refinement_loop(
         with open(iter_dir / "iter_0_segments.json", "w", encoding="utf-8") as f:
             json.dump(segments, f, ensure_ascii=False, indent=2)
 
+    converged_indices = set()  # Segments that are already within threshold
+
     for it in range(start_iter, max_iter):
         print(f"\n  {'─'*50}")
         print(f"  🔄 迭代优化 第 {it+1}/{max_iter} 轮 (阈值: >{threshold}x)")
@@ -904,8 +999,13 @@ async def run_refinement_loop(
 
         # 1) 测量语速
         speed_data = _measure_speed_ratios(segments, tts_dir, threshold)
-        overfast = [d for d in speed_data if d["status"] == "overfast"]
-        underslow = [d for d in speed_data if d["status"] == "underslow"]
+        overfast = [d for d in speed_data if d["status"] == "overfast" and d["idx"] not in converged_indices]
+        underslow = [d for d in speed_data if d["status"] == "underslow" and d["idx"] not in converged_indices]
+
+        # Mark newly converged
+        for d in speed_data:
+            if d["status"] == "ok" and d["idx"] not in converged_indices:
+                converged_indices.add(d["idx"])
 
         active = [d for d in speed_data if d["status"] != "skipped"]
         avg_ratio = (sum(d["speed_ratio"] for d in active) / max(1, len(active)))
@@ -930,6 +1030,12 @@ async def run_refinement_loop(
         if underslow:
             print(f"     过短片段: {len(underslow)}/{len(active)}"
                   f" (最小: {min_ratio:.2f}x)")
+        if converged_indices:
+            print(f"     已收敛片段: {len(converged_indices)}/{len(segments)} (本轮跳过)")
+        skipped = [d for d in speed_data if d["status"] == "skipped"]
+        if skipped:
+            no_tts = [d for d in skipped if d.get("skip_reason") == "no_tts"]
+            print(f"     跳过片段: {len(skipped)} (无TTS: {len(no_tts)}, 零时长: {len(skipped)-len(no_tts)})")
         if overfast:
             top = sorted(overfast, key=lambda x: x["speed_ratio"], reverse=True)[:5]
             for d in top:
@@ -998,7 +1104,7 @@ async def run_refinement_loop(
                 p = tts_dir / f"seg_{idx:04d}{suffix}"
                 if p.exists():
                     p.unlink()
-        print(f"     重新生成 {len(changed_indices)} 个 TTS 片段...")
+        print(f"     增量 TTS: 仅重新生成 {len(changed_indices)}/{len(segments)} 个变更片段")
         await _generate_tts_segments(segments, tts_dir, voice, concurrency)
 
     # 写回主缓存
@@ -1379,6 +1485,7 @@ async def process_video(config: dict):
                 title = json.load(open(info_file))["title"]
         else:
             video_path, title = download_video(url, output_dir, config["browser"])
+        config["video_title"] = title
         print()
 
     # Step 2: 提取音频

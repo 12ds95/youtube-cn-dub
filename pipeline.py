@@ -1054,10 +1054,10 @@ async def run_refinement_loop(
             print(f"     调用 LLM 精简 {len(overfast)} 个超速片段...")
             new_segments = _refine_with_llm(new_segments, overfast, llm_config)
 
-        # 3b) LLM 扩展过短翻译
+        # 3b) 过短片段不再调用 LLM 扩展（LLM 容易生成偏离原文的内容）
+        #     改为交给 _align_tts_to_timeline 的静音填充 + 轻微降速处理
         if underslow:
-            print(f"     调用 LLM 扩展 {len(underslow)} 个过短片段...")
-            new_segments = _expand_with_llm(new_segments, underslow, llm_config)
+            print(f"     ⏭  {len(underslow)} 个过短片段将由时间线对齐阶段处理（静音填充+降速）")
 
         # 4) 统计变更
         changes = []

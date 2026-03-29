@@ -7,6 +7,7 @@
   "whisper_model": "small",
   "volume": 0.15,
   "browser": "chrome",
+  "download_quality": "best",
   "rename": null,
   "resume_from": null,
 
@@ -98,6 +99,7 @@
   "__=== 性能选项 ===__": "",
   "tts_concurrency": 5,
   "whisper_beam_size": 5,
+  "__skip_steps 说明__": "按执行顺序: download / extract / transcribe / translate / refine / tts / subtitle / merge",
   "skip_steps": [],
 
   "__=== 迭代优化 ===__": "",

@@ -5,16 +5,21 @@
 ## 工作流程
 
 ```
-YouTube 视频 → yt-dlp 下载 → faster-whisper 语音识别 → LLM/Google 翻译
-    → edge-tts 中文配音 → ffmpeg 时间对齐与合成 → 最终视频
+YouTube 视频 → yt-dlp 下载 → ffmpeg 提取音频 → faster-whisper 语音识别
+    → LLM 主题识别 + LLM/Google 翻译 → (可选)迭代优化
+    → edge-tts 中文配音 → ffmpeg 时间对齐(语速钳制) + 字幕生成 → 合成最终视频
 ```
 
 核心特性：
 
 - **多翻译引擎**：Google Translate（免费）或 LLM 大模型（DeepSeek、Qwen、OpenAI 等 OpenAI 兼容 API）
+- **翻译质量增强**：翻译前 LLM 自动扫描完整内容识别主题和专业术语，注入保护规则（如数学符号、负号）
 - **迭代优化**：自动检测配音语速过快的片段，调用 LLM 精简翻译并重新生成，循环直到语速自然
+- **语速钳制**：配音速度限定在 [0.95x, 1.25x] 区间，过慢静音填充、过快限速截断，听感自然
 - **断点续跑**：每个步骤的中间结果均有缓存，支持从任意阶段恢复
-- **批量高效**：TTS 并发生成、LLM 批量翻译
+- **结构化错误反馈**：可预知错误给出诊断信息和可操作的修复建议，不只打印 traceback
+- **执行日志**：每次运行自动生成 `pipeline_*.log` 日志文件，记录各步骤耗时和错误详情
+- **批量高效**：TTS 并发生成、LLM 批量翻译（带多层重试：批量→逐条→Google 兜底）
 
 ## 环境要求
 
@@ -95,7 +100,7 @@ bash run.sh --config config.json
 
 ### LLM 翻译配置
 
-支持所有 OpenAI 兼容 API（DeepSeek、Qwen、Moonshot、GPT 等）。当 `translator` 设为 `"llm"` 或 `refine.enabled` 为 true 时需要配置。LLM 翻译失败会自动降级为 Google Translate（回退链：LLM 批量 → LLM 逐条重试 → Google → 保留原文）。
+支持所有 OpenAI 兼容 API（DeepSeek、Qwen、Moonshot、GPT 等）。当 `translator` 设为 `"llm"` 或 `refine.enabled` 为 true 时需要配置。LLM 翻译失败会多层重试后降级为 Google Translate（回退链：LLM 批量(重试2次) → LLM 逐条(重试3次/条) → Google → 保留原文）。
 
 ```json
 {
@@ -222,7 +227,7 @@ bash run.sh --config config.json
 |------|------|--------|------|
 | `tts_concurrency` | int | `5` | TTS 并发数（远程引擎失败时自动阶梯降并发） |
 | `whisper_beam_size` | int | `5` | Whisper beam search 大小（越大越精确但越慢） |
-| `skip_steps` | list | `[]` | 跳过指定步骤：`download` / `transcribe` / `translate` / `subtitle` / `tts` / `merge` |
+| `skip_steps` | list | `[]` | 跳过指定步骤（按执行顺序）：`download` / `extract` / `transcribe` / `translate` / `refine` / `tts` / `subtitle` / `merge` |
 
 ### 迭代优化
 
@@ -274,12 +279,17 @@ bash run.sh --resume-from output/VIDEO_ID
 
 | 文件 | 说明 |
 |------|------|
+| `original.mp4` | 下载的原始视频 |
+| `audio.wav` | 提取的音频 |
+| `info.json` | 视频元信息（标题、时长、帧率、分辨率） |
 | `final.mp4` | 最终视频（中文配音 + 原声背景） |
 | `subtitle_bilingual.srt` | 中英双语字幕 |
 | `subtitle_zh.srt` / `subtitle_en.srt` | 单语字幕 |
 | `segments_cache.json` | 转录+翻译缓存（可手动编辑微调） |
+| `speed_report.json` | 语速调整统计（中位数、钳制数等） |
 | `pipeline_YYYYMMDD_HHMMSS.log` | 执行日志（各步骤耗时 + 错误详情） |
 | `tts_failure.json` | TTS 断点恢复文件（失败时生成） |
+| `tts_segments/` | TTS 音频片段目录（含调速后的 `_adj.wav` 缓存） |
 | `iterations/` | 迭代优化快照（`--refine` 时生成） |
 
 播放时用 VLC/IINA 等播放器打开 `final.mp4`，加载 `subtitle_bilingual.srt` 即可。
@@ -455,10 +465,11 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - `_translate_llm` 注入视频标题和前文（上一批最后 2 句译文）作为上下文，提升术语一致性
   - 解析后校验有效翻译数 ≥ batch 70%，不满足则降级逐条翻译，避免翻译-原文错位
   - `DEFAULT_CONFIG["llm"]` 新增 `style` 字段，支持 "口语化"、"正式"、"学术" 等自定义翻译风格
-  - LLM 翻译失败时自动回退 Google Translate（回退链：LLM 批量 → LLM 逐条重试 → Google → 保留原文）
+  - LLM 翻译失败会多层重试后回退 Google Translate（回退链：LLM 批量(重试2次) → LLM 逐条(重试3次) → Google → 保留原文）
 
 - **语音一致性优化**（已解决）：各片段独立计算加速/降速比，语速方差大、听感割裂。修复方案：
   - `_align_tts_to_timeline` 实现三步语速平滑：收集原始 speed_ratio → 计算中位数基线 → 混合（60% 自身 + 40% 基线）+ 指数平滑（α=0.3）
+  - 最终钳制到 [0.95, 1.25] 区间：过慢段静音居中填充，过快段限速截断
   - 语速分布方差显著缩小，相邻片段过渡更自然
 
 - **迭代性能优化**（已解决）：迭代优化对所有片段重复计算，且先生成 TTS 再迭代导致大量浪费。修复方案：
@@ -479,7 +490,7 @@ commit message 格式：`{type}: {描述}`，type 取值：
 
 - **翻译长度匹配问题**（已解决）：中文翻译与英文原文长度不匹配时的处理：
   - **过长翻译**（加速）：通过迭代优化（`--refine`）调用 LLM 精简翻译
-  - **过短翻译**（降速）：时间对齐阶段对过短片段采用轻微降速（0.85x）+ 静音填充居中放置，避免极端降速导致的不自然感
+  - **过短翻译**（降速）：时间对齐阶段对过短片段采用轻微降速（0.95x 下限）+ 静音填充居中放置，避免极端降速导致的不自然感
   - ⚠️ 曾尝试用 LLM 扩展过短翻译（`_expand_with_llm`），但实测发现 LLM 会生成与英文原文完全无关的内容（如将"唯一需要记住的规则是……"扩展为"四元数非交换、天然适配三维旋转"），且后续迭代在错误基础上越改越偏。已禁用此功能，改为纯静音填充方案
 
 - **语句重复问题**（已解决）：根因是迭代优化(`--refine`)过程中 LLM 精简翻译时偷懒复制相邻段内容。修复方案：
@@ -499,9 +510,15 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - 调速后的 `seg_XXXX_adj.wav` 自动缓存，断点恢复时跳过已调速片段
 
 - **翻译术语保护**（已解决）：LLM 翻译数学/科学内容时将 "i" 翻译为"我"、丢失负号等。修复方案：
-  - 首批翻译前用 LLM 自动识别视频主题（数学/物理/编程等）和翻译风格
+  - 翻译前 LLM 扫描完整视频内容（均匀采样头/中/尾，避免被开头广告误导）自动识别主题和专业领域
   - 根据识别结果生成专业术语保护规则（如 `i→虚数i`、`负号不可省略`）注入到 system_prompt
   - 始终注入通用规则：数学符号不译为日常用语、负号必须保留、倒装句调整语序
+
+- **LLM 翻译过早回退 Google**（已解决）：批量 LLM 翻译成功（HTTP 200）但部分段解析为空时，直接跳到 Google Translate，没给 LLM 逐条重试的机会。修复方案：
+  - 批量请求本身增加 2 次重试（对齐失败或请求异常时等待后重试）
+  - 批量解析后单条校验失败的段，先走 LLM 逐条重试（3 次/条）
+  - 仅 LLM 逐条重试仍失败的段，才回退 Google Translate
+  - 完整链路：批量LLM(重试2次) → 逐条LLM(重试3次) → Google → 保留原文
 
 ## TODO（按难度 / 优先级排序）
 

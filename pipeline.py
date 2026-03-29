@@ -243,7 +243,9 @@ DEFAULT_CONFIG = {
     # ── 性能选项 ──
     "tts_concurrency": 5,            # TTS 并发数（远程引擎失败时会自动阶梯降并发）
     "whisper_beam_size": 5,          # Whisper beam search 大小（越大越精确但越慢）
-    "skip_steps": [],                # 跳过指定步骤: ["download","transcribe","translate","subtitle","tts","merge"]
+    "skip_steps": [],                # 跳过指定步骤（按执行顺序）:
+                                     #   标准流程(7步): download / extract / transcribe / translate / subtitle / tts / merge
+                                     #   迭代流程(8步): download / extract / transcribe / translate / refine / tts / subtitle / merge
 
     # ── 迭代优化（翻译过长时自动精简）──
     #   小循环（自动）：字符估算语速 → LLM 精简过长翻译 → 再估算 → 仍超速则继续精简，直到收敛

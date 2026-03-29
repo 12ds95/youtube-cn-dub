@@ -2242,11 +2242,24 @@ async def process_video(config: dict):
             video_path, title = download_video(url, output_dir, config["browser"])
         config["video_title"] = title
         print()
+    elif not video_path.exists():
+        print(f"[1/{total_steps}] 下载视频 - 跳过")
+        print(f"  ⚠️  视频文件不存在: {video_path}")
+        print(f"     从 skip_steps 移除 'download' 或手动放置视频文件")
+        print()
 
     # Step 2: 提取音频
+    audio_path = output_dir / "audio.wav"
     if "extract" not in skip:
         print(f"[2/{total_steps}] 提取音频")
+        if not video_path.exists():
+            print(f"  ❌ 视频文件不存在，无法提取音频: {video_path}")
+            return
         audio_path = extract_audio(video_path, output_dir)
+        print()
+    elif not audio_path.exists():
+        print(f"[2/{total_steps}] 提取音频 - 跳过")
+        print(f"  ⚠️  音频文件不存在: {audio_path}")
         print()
 
     # Step 3+4: 转录 + 翻译
@@ -2286,6 +2299,35 @@ async def process_video(config: dict):
             print(f"[4/{total_steps}] 翻译 - 跳过")
             segments = []
             print()
+
+    # ──────────── 前置条件检查 ────────────
+    # segments 为空时诊断原因并报错，避免后续步骤全部静默跳过
+    if not segments:
+        missing = []
+        if "download" in skip and not video_path.exists():
+            missing.append(f"  - skip_steps 包含 'download' 但视频不存在: {video_path}")
+        if "extract" in skip and not (output_dir / "audio.wav").exists():
+            missing.append(f"  - skip_steps 包含 'extract' 但音频不存在: {output_dir / 'audio.wav'}")
+        if "transcribe" in skip and not cache_file.exists():
+            missing.append(f"  - skip_steps 包含 'transcribe' 但缓存不存在: {cache_file}")
+        if "translate" in skip and not cache_file.exists():
+            missing.append(f"  - skip_steps 包含 'translate' 但缓存不存在: {cache_file}")
+
+        if missing:
+            print(f"\n{'='*60}")
+            print(f"❌ 错误: segments 为空，无法继续处理!")
+            print(f"   skip_steps 跳过了关键步骤，但对应的产出文件不存在:")
+            for m in missing:
+                print(m)
+            print(f"\n   解决方法:")
+            print(f"   1. 从 skip_steps 中移除已跳过的步骤，让 pipeline 重新执行")
+            print(f"   2. 或确保 {cache_file} 已存在（从之前的运行中保留）")
+            print(f"{'='*60}")
+            return
+        else:
+            # segments 为空但没有 skip 问题 → 可能视频确实没有人声
+            print(f"\n  ⚠️  未识别到任何语音片段，跳过后续处理\n")
+            return
 
     # ──────────── 分支: 标准 vs 迭代优化 ────────────
     if refine_enabled and segments:

@@ -429,6 +429,10 @@ commit message 格式：`{type}: {描述}`，type 取值：
 
 **7. LLM 生成内容必须校验再采纳。** 迭代优化中 LLM 曾将"唯一需要记住的规则是"扩展为"四元数非交换、天然适配三维旋转"（与原文完全无关）。所有 LLM 结果应做对齐校验、重叠率检测、长度合理性检查后再采纳。
 
+**8. 永远不要在"没有工作可做"时报告成功。** pipeline 曾在 skip_steps 跳过所有关键步骤 + output 目录为空的情况下，0 秒"处理完成"并报告 final.mp4（实际不存在）。任何 skip 项必须检查前置产出是否存在，不存在则报错并给出诊断信息，而不是静默跳过。配置残留（换视频后忘清 skip_steps）是常见的用户错误，代码必须容错。
+
+**9. 运行时依赖不只是 Python 包。** yt-dlp 需要 `yt-dlp-ejs` 包提供 JS challenge solver 脚本才能下载 YouTube 视频。裸装 `pip install yt-dlp` 不包含，必须用 `pip install "yt-dlp[default]"`。安装文档和环境检查（test.sh）应覆盖所有运行时依赖，包括非 Python 组件。
+
 ## 已知限制
 
 1. YouTube 下载需要能访问 YouTube 的网络环境

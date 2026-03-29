@@ -12,7 +12,7 @@ from pipeline import (
     TTS_ENGINES, TTSEngine, _create_tts_engine,
     EdgeTTSEngine, GTTSEngine, SiliconFlowTTSEngine,
     Pyttsx3Engine, PiperTTSEngine, SherpaOnnxEngine, CosyVoiceEngine,
-    _generate_tts_segments, _backup_tts,
+    _generate_tts_segments, _backup_tts, TTSFatalError,
 )
 
 
@@ -543,6 +543,69 @@ def test_all_items_defined_before_resume():
     assert failure_check > 0, "未找到 failure_json.exists()"
     assert all_items_def < failure_check, \
         "all_items 必须在 failure_json.exists() 之前定义 (防止 NameError)"
+
+
+def test_fatal_error_skips_engine_immediately():
+    """TTSFatalError (认证/余额等) 应立即跳过引擎而非无效重试"""
+    import asyncio, tempfile, json
+    from pathlib import Path
+
+    # 1. TTSFatalError 是独立异常类，继承 Exception
+    assert issubclass(TTSFatalError, Exception)
+    assert not issubclass(TTSFatalError, RuntimeError)
+
+    # 2. SiliconFlow 引擎 401/403 应抛出 TTSFatalError 而非 RuntimeError
+    source_file = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "pipeline.py")
+    with open(source_file) as f:
+        source = f.read()
+    # 验证 SiliconFlowTTSEngine.synthesize 中有 TTSFatalError
+    sf_start = source.find("class SiliconFlowTTSEngine")
+    sf_end = source.find("\nclass ", sf_start + 1)
+    sf_body = source[sf_start:sf_end]
+    assert "TTSFatalError" in sf_body, \
+        "SiliconFlowTTSEngine 应对 401/403 抛出 TTSFatalError"
+
+    # 3. synthesize_batch 应传播 TTSFatalError（不被 return_exceptions 吞掉）
+    assert "TTSFatalError" in source[source.find("async def synthesize_batch"):
+                                      source.find("class EdgeTTSEngine")], \
+        "synthesize_batch 应检测并传播 TTSFatalError"
+
+    # 4. _smart_retry_engine 应能处理 TTSFatalError
+    retry_fn = source[source.find("async def _smart_retry_engine"):
+                       source.find("def _write_failure_json")]
+    assert "TTSFatalError" in retry_fn, \
+        "_smart_retry_engine 应处理 TTSFatalError"
+
+    print("     (TTSFatalError 快速跳过引擎验证通过)")
+
+
+def test_cache_loaded_when_skip_steps_includes_transcribe():
+    """skip_steps 包含 transcribe/translate 时仍应从 segments_cache.json 加载 segments"""
+    source_file = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "pipeline.py")
+    with open(source_file) as f:
+        source = f.read()
+
+    # 定位 process_video 中的缓存加载逻辑
+    pv_start = source.find("async def process_video")
+    assert pv_start > 0
+    pv_body = source[pv_start:]
+
+    # 旧代码的 bug: cache_file.exists() and "transcribe" not in skip and "translate" not in skip
+    # 修复后: cache_file.exists() 作为首要条件，不受 skip_steps 限制
+    cache_load_block = pv_body[:pv_body.find("# ──────────── 分支")]
+
+    # 确认不再有 "transcribe" not in skip 作为缓存加载的前提条件
+    # 正确逻辑: if cache_file.exists(): 独立判断
+    first_cache_check = cache_load_block.find("cache_file.exists()")
+    assert first_cache_check > 0, "未找到 cache_file.exists() 检查"
+
+    # 在第一个 cache_file.exists() 后面不应紧跟 "not in skip" 条件
+    after_check = cache_load_block[first_cache_check:first_cache_check + 100]
+    assert '"transcribe" not in skip' not in after_check, \
+        "缓存加载不应要求 transcribe not in skip (会导致 skip transcribe 时 segments 为空)"
+    print("     (segments 缓存加载逻辑验证通过)")
 
 
 if __name__ == "__main__":

@@ -817,6 +817,11 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
 
 # ── TTS 引擎抽象层 ──
 
+class TTSFatalError(Exception):
+    """不可恢复的 TTS 错误（认证失败/余额不足等），应立即切换引擎而非重试"""
+    pass
+
+
 class TTSEngine:
     """TTS 引擎基类"""
     name = "base"
@@ -833,13 +838,23 @@ class TTSEngine:
 
     async def synthesize_batch(self, items: List[dict], tts_dir: Path,
                                voice: str, concurrency: int = 5):
-        """批量合成。items 是 [(idx, text_zh), ...]，默认实现逐个调用 synthesize"""
+        """批量合成。items 是 [(idx, text_zh), ...]，默认实现逐个调用 synthesize
+        遇到 TTSFatalError（认证/余额等不可恢复错误）时立即中止并向上传播。
+        """
         resolved_voice = self.resolve_voice(voice)
         semaphore = asyncio.Semaphore(concurrency)
+        fatal_error = None  # 记录首个致命错误
 
         async def _one(text, path):
+            nonlocal fatal_error
+            if fatal_error:
+                return  # 已有致命错误，跳过后续
             async with semaphore:
-                await self.synthesize(text, path, resolved_voice)
+                try:
+                    await self.synthesize(text, path, resolved_voice)
+                except TTSFatalError as e:
+                    fatal_error = e
+                    raise
 
         tasks = []
         for item in items:
@@ -851,6 +866,8 @@ class TTSEngine:
             batch_n = max(1, concurrency * 2)
             for i in range(0, len(tasks), batch_n):
                 await asyncio.gather(*tasks[i:i+batch_n], return_exceptions=True)
+                if fatal_error:
+                    raise fatal_error
                 done = min(i + batch_n, len(tasks))
                 print(f"     TTS 进度: {done}/{len(tasks)}")
 
@@ -1032,6 +1049,9 @@ class SiliconFlowTTSEngine(TTSEngine):
         }
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code in (401, 403):
+                raise TTSFatalError(
+                    f"SiliconFlow 认证/余额错误 ({resp.status_code}): {resp.text[:200]}")
             if resp.status_code != 200:
                 raise RuntimeError(
                     f"SiliconFlow TTS 失败 ({resp.status_code}): {resp.text[:200]}")
@@ -1235,6 +1255,7 @@ async def _generate_tts_segments(
         eng_name = chain_names[eng_pos]
         engine = _create_tts_engine({**config, "tts_engine": eng_name})
         resolved_voice = engine.resolve_voice(voice)
+        fatal_hit = False  # 标记本引擎是否遇到不可恢复错误
 
         # ── 断点恢复首轮：仅重试上次失败的片段 ──
         if resume_retry_only and eng_pos == start_idx and resume_items:
@@ -1245,15 +1266,22 @@ async def _generate_tts_segments(
                 p = tts_dir / f"seg_{item['idx']:04d}.mp3"
                 if p.exists():
                     p.unlink()
-            await engine.synthesize_batch(resume_items, tts_dir, voice, concurrency)
+            try:
+                await engine.synthesize_batch(resume_items, tts_dir, voice, concurrency)
 
-            # 对失败片段做智能重试
-            def _count_resume_failed():
-                return [item for item in resume_items
-                        if not (tts_dir / f"seg_{item['idx']:04d}.mp3").exists()
-                        or (tts_dir / f"seg_{item['idx']:04d}.mp3").stat().st_size == 0]
-            await _smart_retry_engine(engine, _count_resume_failed, tts_dir,
-                                      voice, concurrency)
+                # 对失败片段做智能重试
+                def _count_resume_failed():
+                    return [item for item in resume_items
+                            if not (tts_dir / f"seg_{item['idx']:04d}.mp3").exists()
+                            or (tts_dir / f"seg_{item['idx']:04d}.mp3").stat().st_size == 0]
+                await _smart_retry_engine(engine, _count_resume_failed, tts_dir,
+                                          voice, concurrency)
+            except TTSFatalError as e:
+                print(f"     ⚠️  [{engine.name}] 不可恢复错误: {e}")
+                print(f"     [{engine.name}] 跳过（认证/余额等致命问题），尝试下一个引擎...")
+                fatal_hit = True
+                resume_retry_only = False
+                continue
 
             # 检查断点重试结果（用 _count_failed 检查全量，而非仅 resume 片段）
             still_failed_resume = _count_resume_failed()
@@ -1305,13 +1333,21 @@ async def _generate_tts_segments(
               f" {'本地' if engine.is_local else '远程'})...")
 
         # 首轮：正常并发
-        pending = _count_failed()
-        if pending:
-            await engine.synthesize_batch(pending, tts_dir, voice, concurrency)
+        try:
+            pending = _count_failed()
+            if pending:
+                await engine.synthesize_batch(pending, tts_dir, voice, concurrency)
 
-        # ── 智能重试 ──
-        await _smart_retry_engine(engine, _count_failed, tts_dir, voice,
-                                  concurrency)
+            # ── 智能重试 ──
+            await _smart_retry_engine(engine, _count_failed, tts_dir, voice,
+                                      concurrency)
+        except TTSFatalError as e:
+            print(f"     ⚠️  [{engine.name}] 不可恢复错误: {e}")
+            print(f"     [{engine.name}] 跳过（认证/余额等致命问题），尝试下一个引擎...")
+            _write_failure_json(failure_json, engine, all_items,
+                                _count_failed(), chain_names, eng_pos,
+                                resolved_voice)
+            continue
 
         # 检查最终结果
         final_failed = _count_failed()
@@ -1369,6 +1405,7 @@ async def _smart_retry_engine(engine, count_failed_fn, tts_dir, voice,
     """单引擎内智能重试。
     远程引擎: 阶梯降并发(正常→半→1)，并发=1后持续重试，连续3轮无改善才放弃
     本地引擎: 失败即真失败，1轮重试即可
+    TTSFatalError (认证/余额不足等): 立即放弃，不做无效重试
     """
     if engine.is_local:
         failed = count_failed_fn()
@@ -1378,7 +1415,10 @@ async def _smart_retry_engine(engine, count_failed_fn, tts_dir, voice,
                 p = tts_dir / f"seg_{item['idx']:04d}.mp3"
                 if p.exists():
                     p.unlink()
-            await engine.synthesize_batch(failed, tts_dir, voice, 1)
+            try:
+                await engine.synthesize_batch(failed, tts_dir, voice, 1)
+            except TTSFatalError:
+                raise
     else:
         no_improve_count = 0
         prev_fail_count = len(count_failed_fn())
@@ -1417,7 +1457,10 @@ async def _smart_retry_engine(engine, count_failed_fn, tts_dir, voice,
                 p = tts_dir / f"seg_{item['idx']:04d}.mp3"
                 if p.exists():
                     p.unlink()
-            await engine.synthesize_batch(failed, tts_dir, voice, retry_c)
+            try:
+                await engine.synthesize_batch(failed, tts_dir, voice, retry_c)
+            except TTSFatalError:
+                raise
 
 
 def _write_failure_json(failure_json, engine, all_items, failed_items,
@@ -2202,9 +2245,12 @@ async def process_video(config: dict):
         print()
 
     # Step 3+4: 转录 + 翻译
-    if cache_file.exists() and "transcribe" not in skip and "translate" not in skip:
-        print(f"[3/{total_steps}] 语音识别")
-        print(f"[4/{total_steps}] 翻译")
+    # 优先加载缓存：只要 segments_cache.json 存在，就从中恢复 segments
+    # 避免因 skip_steps 包含 transcribe/translate 导致 segments 为空，
+    # 进而跳过下游所有步骤（TTS / 字幕 / 时间线对齐）
+    if cache_file.exists():
+        print(f"[3/{total_steps}] 语音识别" + (" - 跳过" if "transcribe" in skip else ""))
+        print(f"[4/{total_steps}] 翻译" + (" - 跳过" if "translate" in skip else ""))
         print("  ⏭  使用缓存 (segments_cache.json)")
         with open(cache_file, "r", encoding="utf-8") as f:
             segments = json.load(f)

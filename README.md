@@ -97,6 +97,45 @@ bash run.sh --config config.json
 
 命令行参数可覆盖配置文件中的值。如果 LLM 调用失败，会自动降级为 Google Translate。
 
+### TTS 引擎配置
+
+支持 7 个 TTS 引擎，可在 `config.json` 中切换。失败时自动按 `tts_fallback` 列表依次降级。
+
+| 引擎 | 类型 | 中文质量 | 需要 | 说明 |
+|------|------|---------|------|------|
+| `edge-tts` | 在线免费 | 优秀 | 网络 | 默认引擎，微软免费 API，多音色 |
+| `siliconflow` | 在线免费 | 最佳 | API Key | 硅基流动 CosyVoice2，注册送额度 |
+| `gtts` | 在线免费 | 良好 | 网络 | Google Translate TTS，单音色 |
+| `pyttsx3` | 离线免费 | 一般 | 无 | 系统自带 TTS，零依赖终极兜底 |
+| `piper` | 离线免费 | 良好 | 下载模型 | ONNX 推理，CPU 友好 |
+| `sherpa-onnx` | 离线免费 | 良好 | 下载模型 | 含 MeloTTS 中文模型，CPU 友好 |
+| `cosyvoice` | 本地部署 | 最佳 | GPU | 阿里开源，支持声音克隆 |
+
+配置示例（推荐 edge-tts 主引擎 + gtts/pyttsx3 兜底）：
+
+```json
+{
+  "tts_engine": "edge-tts",
+  "tts_fallback": ["gtts", "pyttsx3"]
+}
+```
+
+使用 SiliconFlow CosyVoice2（注册 https://cloud.siliconflow.cn 获取免费 API Key）：
+
+```json
+{
+  "tts_engine": "siliconflow",
+  "tts_fallback": ["edge-tts", "pyttsx3"],
+  "siliconflow": {
+    "api_key": "sk-xxx",
+    "model": "FunAudioLLM/CosyVoice2-0.5B",
+    "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
+  }
+}
+```
+
+`pyttsx3` 离线兜底需 macOS 中文语音包（系统设置 → 辅助功能 → 朗读内容 → 管理声音 → 下载 Ting-Ting）。
+
 ### 迭代优化
 
 当中文翻译比英文原文长时，TTS 配音需要加速播放以匹配时间线。迭代优化功能会自动检测加速过大的片段，调用 LLM 精简翻译后重新生成：

@@ -921,6 +921,99 @@ class CosyVoiceEngine(TTSEngine):
         await loop.run_in_executor(None, _gen)
 
 
+class SiliconFlowTTSEngine(TTSEngine):
+    """SiliconFlow: 硅基流动云端 CosyVoice2（免费额度，OpenAI 兼容 API，中文音质最佳）
+    注册即送额度: https://cloud.siliconflow.cn
+    配置示例:
+      "siliconflow": {
+          "api_key": "sk-xxx",
+          "model": "FunAudioLLM/CosyVoice2-0.5B",
+          "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
+      }
+    """
+    name = "siliconflow"
+
+    def __init__(self, api_key: str = None, model: str = None, voice_id: str = None):
+        self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY", "")
+        self.model = model or "FunAudioLLM/CosyVoice2-0.5B"
+        self.voice_id = voice_id  # 如 "FunAudioLLM/CosyVoice2-0.5B:alex"
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        import httpx
+        url = "https://api.siliconflow.cn/v1/audio/speech"
+        # voice 优先级：引擎配置 > 全局 voice 参数 > 默认
+        actual_voice = self.voice_id or voice or "FunAudioLLM/CosyVoice2-0.5B:alex"
+        payload = {
+            "model": self.model,
+            "input": text,
+            "voice": actual_voice,
+            "response_format": "mp3",
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"SiliconFlow TTS 失败 ({resp.status_code}): {resp.text[:200]}")
+            with open(path, "wb") as f:
+                f.write(resp.content)
+
+
+class Pyttsx3Engine(TTSEngine):
+    """pyttsx3: 系统自带 TTS（macOS=NSSpeech, Windows=SAPI5），完全离线零依赖
+    macOS 中文语音需在 系统设置 → 辅助功能 → 朗读内容 → 管理声音 中下载。
+    默认使用 Ting-Ting（普通话女声），如未安装则回退到系统默认语音。
+    """
+    name = "pyttsx3"
+
+    def __init__(self, voice_name: str = None, rate: int = None):
+        self.voice_name = voice_name  # 如 "Ting-Ting", "Mei-Jia"
+        self.rate = rate or 180  # 默认语速
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        loop = asyncio.get_event_loop()
+        vname = self.voice_name
+        rate = self.rate
+
+        def _gen():
+            import pyttsx3
+            engine = pyttsx3.init()
+            engine.setProperty('rate', rate)
+
+            # 尝试找中文语音
+            if vname:
+                voices = engine.getProperty('voices')
+                for v in voices:
+                    if vname.lower() in v.name.lower():
+                        engine.setProperty('voice', v.id)
+                        break
+            else:
+                # 自动查找中文语音
+                voices = engine.getProperty('voices')
+                for v in voices:
+                    if any(k in v.name.lower() for k in ['ting-ting', 'mei-jia', 'chinese', 'zh']):
+                        engine.setProperty('voice', v.id)
+                        break
+
+            # pyttsx3 只能保存为 aiff/wav，需要转 mp3
+            wav_path = path.replace(".mp3", ".wav")
+            engine.save_to_file(text, wav_path)
+            engine.runAndWait()
+            engine.stop()
+
+            if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+                from pydub import AudioSegment as PydubSegment
+                PydubSegment.from_file(wav_path).export(path, format="mp3")
+                os.remove(wav_path)
+            else:
+                raise RuntimeError(f"pyttsx3 生成失败: {wav_path} 为空或不存在")
+
+        await loop.run_in_executor(None, _gen)
+
+
 # ── TTS 引擎注册表 ──
 
 TTS_ENGINES = {
@@ -929,6 +1022,8 @@ TTS_ENGINES = {
     "piper": PiperTTSEngine,
     "sherpa-onnx": SherpaOnnxEngine,
     "cosyvoice": CosyVoiceEngine,
+    "siliconflow": SiliconFlowTTSEngine,
+    "pyttsx3": Pyttsx3Engine,
 }
 
 
@@ -946,6 +1041,17 @@ def _create_tts_engine(config: dict) -> TTSEngine:
         return engine_cls(model_path=engine_config.get("model_path"))
     elif engine_name == "sherpa-onnx":
         return engine_cls(model_config=engine_config)
+    elif engine_name == "siliconflow":
+        return engine_cls(
+            api_key=engine_config.get("api_key"),
+            model=engine_config.get("model"),
+            voice_id=engine_config.get("voice"),
+        )
+    elif engine_name == "pyttsx3":
+        return engine_cls(
+            voice_name=engine_config.get("voice_name"),
+            rate=engine_config.get("rate"),
+        )
     else:
         return engine_cls()
 

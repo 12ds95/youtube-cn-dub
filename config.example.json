@@ -22,6 +22,23 @@
     "temperature": 0.3
   },
 
+  "__TTS 引擎说明__": "可选: edge-tts(默认) / gtts / siliconflow / pyttsx3 / piper / sherpa-onnx / cosyvoice",
+  "tts_engine": "edge-tts",
+  "tts_fallback": ["gtts", "pyttsx3"],
+
+  "siliconflow": {
+    "__说明__": "硅基流动 CosyVoice2 云端推理（免费额度，中文音质最佳）。注册: https://cloud.siliconflow.cn",
+    "api_key": "",
+    "model": "FunAudioLLM/CosyVoice2-0.5B",
+    "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
+  },
+
+  "pyttsx3": {
+    "__说明__": "系统自带 TTS（完全离线）。macOS 需在系统设置中下载中文语音包（Ting-Ting）",
+    "voice_name": "Ting-Ting",
+    "rate": 180
+  },
+
   "tts_concurrency": 5,
   "whisper_beam_size": 5,
   "skip_steps": [],

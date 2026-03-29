@@ -1221,7 +1221,8 @@ async def _generate_tts_segments(
                 # 只重试上次记录的失败片段
                 resume_items = [item for item in all_items
                                 if item["idx"] in failed_segs]
-                print(f"     📋 断点恢复: 上次 [{failed_engine}] 有"
+                print(f"     📋 断点恢复: 读取 {failure_json}")
+                print(f"        上次 [{failed_engine}] 有"
                       f" {len(resume_items)} 个片段失败，先重试这些片段...")
         except Exception:
             pass
@@ -1313,7 +1314,8 @@ async def _generate_tts_segments(
                                         eng_pos, resolved_voice)
                     print(f"     ❌ [{engine.name}] 仍有"
                           f" {len(still_failed_resume)} 个片段失败"
-                          f"，引擎链已用尽  (详见 {failure_json.name})")
+                          f"，引擎链已用尽")
+                    print(f"     📄 失败记录: {failure_json}")
                 continue
 
         if eng_pos > start_idx or (resume_retry_only is False and eng_pos == start_idx and eng_pos > 0):
@@ -1347,6 +1349,7 @@ async def _generate_tts_segments(
             _write_failure_json(failure_json, engine, all_items,
                                 _count_failed(), chain_names, eng_pos,
                                 resolved_voice)
+            print(f"     📄 失败记录: {failure_json}")
             continue
 
         # 检查最终结果
@@ -1364,8 +1367,8 @@ async def _generate_tts_segments(
                                 resolved_voice)
             is_last = eng_pos >= len(chain_names) - 1
             print(f"     ❌ [{engine.name}] 仍有 {len(final_failed)} 个片段失败"
-                  + (f"，尝试下一个引擎..." if not is_last else "，引擎链已用尽")
-                  + f"  (详见 {failure_json.name})")
+                  + (f"，尝试下一个引擎..." if not is_last else "，引擎链已用尽"))
+            print(f"     📄 失败记录: {failure_json}")
 
     # 最终兜底：所有引擎都失败的片段填充静音
     if not success_engine:
@@ -1384,6 +1387,8 @@ async def _generate_tts_segments(
                 print(f"     ⚠️  seg_{idx:04d}.mp3 所有引擎均失败，填充静音")
         if silence_count:
             print(f"     共 {silence_count} 个片段填充静音（所有引擎均已尝试）")
+            print(f"     📄 下次可断点重试: {failure_json}")
+            print(f"        修改 tts_chain 或删除静音片段后重新运行即可恢复")
 
 
 def _backup_tts(tts_dir: Path, backup_dir: Path, all_items: List[dict]):

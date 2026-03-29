@@ -392,6 +392,50 @@ def transcribe_audio(audio_path: Path, model_size: str = "small",
 
 
 # ─── Step 3.5: 去重 ────────────────────────────────────────────────
+def merge_short_segments(segments: List[dict], min_chars: int = 3) -> List[dict]:
+    """
+    将过短的翻译片段合并到相邻段，避免 TTS 无法正常生成。
+    text_zh < min_chars 的片段合并到前一段（优先）或后一段。
+    合并后的时间窗口覆盖两段。
+    """
+    if not segments:
+        return segments
+
+    merged = []
+    skip_next = False
+    for i, seg in enumerate(segments):
+        if skip_next:
+            skip_next = False
+            continue
+
+        text_zh = seg.get("text_zh", seg.get("text", "")).strip()
+        if len(text_zh) < min_chars and text_zh:
+            # 尝试合并到前一段
+            if merged:
+                prev = merged[-1]
+                prev["text_zh"] = prev.get("text_zh", "") + text_zh
+                prev["text_en"] = prev.get("text_en", "") + " " + seg.get("text_en", seg.get("text", ""))
+                prev["end"] = max(prev["end"], seg["end"])
+                print(f"  🔗 合并短段 #{i}（\"{text_zh}\"）→ 前段")
+                continue
+            # 没有前段，合并到后一段
+            elif i + 1 < len(segments):
+                nxt = segments[i + 1].copy()
+                nxt["text_zh"] = text_zh + nxt.get("text_zh", "")
+                nxt["text_en"] = seg.get("text_en", seg.get("text", "")) + " " + nxt.get("text_en", nxt.get("text", ""))
+                nxt["start"] = min(seg["start"], nxt["start"])
+                merged.append(nxt)
+                skip_next = True
+                print(f"  🔗 合并短段 #{i}（\"{text_zh}\"）→ 后段")
+                continue
+
+        merged.append(seg)
+
+    if len(merged) < len(segments):
+        print(f"  🔗 短段合并: {len(segments)} → {len(merged)} 段")
+    return merged
+
+
 def deduplicate_segments(segments: List[dict]) -> List[dict]:
     """
     去除 Whisper 转录中的重复片段。
@@ -727,68 +771,277 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
     return paths["en"], paths["zh"], paths["bi"]
 
 
-# ─── Step 6: 中文配音 (拆分为三阶段) ──────────────────────────────
-async def _tts_one(text: str, path: str, voice: str, semaphore):
-    """生成单个 TTS 片段（带并发控制）"""
-    import edge_tts
-    async with semaphore:
+# ─── Step 6: 中文配音 (可插拔 TTS 引擎) ─────────────────────────
+
+# ── TTS 引擎抽象层 ──
+
+class TTSEngine:
+    """TTS 引擎基类"""
+    name = "base"
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        """将 text 合成为音频文件，保存到 path"""
+        raise NotImplementedError
+
+    async def synthesize_batch(self, items: List[dict], tts_dir: Path,
+                               voice: str, concurrency: int = 5):
+        """批量合成。items 是 [(idx, text_zh), ...]，默认实现逐个调用 synthesize"""
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _one(text, path):
+            async with semaphore:
+                await self.synthesize(text, path, voice)
+
+        tasks = []
+        for item in items:
+            idx, text_zh = item["idx"], item["text_zh"]
+            p = tts_dir / f"seg_{idx:04d}.mp3"
+            tasks.append(_one(text_zh, str(p)))
+
+        if tasks:
+            batch_n = max(1, concurrency * 2)
+            for i in range(0, len(tasks), batch_n):
+                await asyncio.gather(*tasks[i:i+batch_n], return_exceptions=True)
+                done = min(i + batch_n, len(tasks))
+                print(f"     TTS 进度: {done}/{len(tasks)}")
+
+
+class EdgeTTSEngine(TTSEngine):
+    """edge-tts: 微软免费在线 TTS（默认引擎）"""
+    name = "edge-tts"
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        import edge_tts
         communicate = edge_tts.Communicate(text, voice)
         await communicate.save(path)
 
 
+class GTTSEngine(TTSEngine):
+    """gTTS: Google Translate TTS（免费，无需 API key）"""
+    name = "gtts"
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        from gtts import gTTS
+        loop = asyncio.get_event_loop()
+        def _gen():
+            tts = gTTS(text=text, lang="zh-cn")
+            tts.save(path)
+        await loop.run_in_executor(None, _gen)
+
+
+class PiperTTSEngine(TTSEngine):
+    """Piper: 本地 ONNX 推理，无需 GPU，超轻量"""
+    name = "piper"
+
+    def __init__(self, model_path: str = None):
+        self.model_path = model_path
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        loop = asyncio.get_event_loop()
+        model = self.model_path or voice
+        def _gen():
+            import subprocess
+            proc = subprocess.run(
+                ["piper", "--model", model, "--output_file", path],
+                input=text, capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"piper failed: {proc.stderr[:200]}")
+        await loop.run_in_executor(None, _gen)
+
+
+class SherpaOnnxEngine(TTSEngine):
+    """sherpa-onnx: 本地 ONNX 推理（含 MeloTTS 中文模型），无需 GPU"""
+    name = "sherpa-onnx"
+
+    def __init__(self, model_config: dict = None):
+        self.model_config = model_config or {}
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        loop = asyncio.get_event_loop()
+        cfg = self.model_config
+        def _gen():
+            import sherpa_onnx
+            tts_config = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                        model=cfg.get("model", ""),
+                        lexicon=cfg.get("lexicon", ""),
+                        tokens=cfg.get("tokens", ""),
+                        dict_dir=cfg.get("dict_dir", ""),
+                    ),
+                ),
+                max_num_sentences=1,
+            )
+            tts = sherpa_onnx.OfflineTts(tts_config)
+            audio = tts.generate(text, sid=int(cfg.get("speaker_id", 0)), speed=1.0)
+            import wave
+            wav_path = path.replace(".mp3", ".wav")
+            with wave.open(wav_path, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(audio.sample_rate)
+                import struct
+                samples = struct.pack(f"<{len(audio.samples)}h",
+                    *[int(max(-32768, min(32767, s * 32767))) for s in audio.samples])
+                wf.writeframes(samples)
+            # 转 mp3
+            from pydub import AudioSegment as PydubSegment
+            PydubSegment.from_wav(wav_path).export(path, format="mp3")
+            os.remove(wav_path)
+        await loop.run_in_executor(None, _gen)
+
+
+class CosyVoiceEngine(TTSEngine):
+    """CosyVoice: 阿里开源 TTS（需 GPU，中文最佳音质）"""
+    name = "cosyvoice"
+
+    def __init__(self, model_path: str = None):
+        self.model_path = model_path
+        self._model = None
+
+    def _load_model(self):
+        if self._model is None:
+            from cosyvoice import CosyVoice
+            self._model = CosyVoice(self.model_path or "CosyVoice-300M")
+        return self._model
+
+    async def synthesize(self, text: str, path: str, voice: str):
+        loop = asyncio.get_event_loop()
+        def _gen():
+            model = self._load_model()
+            output = model.inference_sft(text, voice or "中文女")
+            import torchaudio
+            torchaudio.save(path.replace(".mp3", ".wav"),
+                            output["tts_speech"], 22050)
+            from pydub import AudioSegment as PydubSegment
+            wav_path = path.replace(".mp3", ".wav")
+            PydubSegment.from_wav(wav_path).export(path, format="mp3")
+            os.remove(wav_path)
+        await loop.run_in_executor(None, _gen)
+
+
+# ── TTS 引擎注册表 ──
+
+TTS_ENGINES = {
+    "edge-tts": EdgeTTSEngine,
+    "gtts": GTTSEngine,
+    "piper": PiperTTSEngine,
+    "sherpa-onnx": SherpaOnnxEngine,
+    "cosyvoice": CosyVoiceEngine,
+}
+
+
+def _create_tts_engine(config: dict) -> TTSEngine:
+    """根据配置创建 TTS 引擎实例"""
+    engine_name = config.get("tts_engine", "edge-tts")
+    engine_config = config.get(engine_name.replace("-", "_"), {})
+
+    if engine_name not in TTS_ENGINES:
+        print(f"  ⚠️  未知 TTS 引擎 '{engine_name}'，回退到 edge-tts")
+        engine_name = "edge-tts"
+
+    engine_cls = TTS_ENGINES[engine_name]
+    if engine_name in ("piper", "cosyvoice"):
+        return engine_cls(model_path=engine_config.get("model_path"))
+    elif engine_name == "sherpa-onnx":
+        return engine_cls(model_config=engine_config)
+    else:
+        return engine_cls()
+
+
+# ── TTS 生成主函数 ──
+
 async def _generate_tts_segments(
     segments: List[dict], tts_dir: Path,
     voice: str = "zh-CN-YunxiNeural", concurrency: int = 5,
+    config: dict = None,
 ):
-    """阶段 A: 并发生成 TTS .mp3 文件"""
+    """阶段 A: 生成 TTS .mp3 文件（支持多引擎 + fallback）"""
     tts_dir.mkdir(exist_ok=True)
-    semaphore = asyncio.Semaphore(concurrency)
-    tasks = []
+    config = config or {}
+
+    engine = _create_tts_engine(config)
+    fallback_names = config.get("tts_fallback", [])
+    if isinstance(fallback_names, str):
+        fallback_names = [fallback_names]
+
+    print(f"     TTS 引擎: {engine.name}" +
+          (f" (fallback: {', '.join(fallback_names)})" if fallback_names else ""))
+
+    # 收集需要生成的片段
+    pending = []
     for idx, seg in enumerate(segments):
         p = tts_dir / f"seg_{idx:04d}.mp3"
         if not p.exists() or p.stat().st_size == 0:
             text_zh = seg.get("text_zh", seg.get("text", ""))
             if len(text_zh.strip()) < 2:
-                continue  # 跳过空/垃圾文本，避免生成空 mp3
+                continue
             if p.exists():
-                p.unlink()  # 删除 0 字节文件
-            tasks.append(_tts_one(text_zh, str(p), voice, semaphore))
+                p.unlink()
+            pending.append({"idx": idx, "text_zh": text_zh})
 
-    if tasks:
-        print(f"     生成 {len(tasks)} 个新 TTS 片段...")
-        batch_n = max(1, concurrency * 2)
-        for i in range(0, len(tasks), batch_n):
-            await asyncio.gather(*tasks[i:i+batch_n], return_exceptions=True)
-            done = min(i + batch_n, len(tasks))
-            print(f"     TTS 进度: {done}/{len(tasks)}")
-    else:
+    if not pending:
         print(f"     TTS 片段已缓存，跳过生成")
+        return
 
-    # Retry pass: detect and retry 0-byte TTS files
-    retry_tasks = []
-    for idx, seg in enumerate(segments):
-        p = tts_dir / f"seg_{idx:04d}.mp3"
-        if p.exists() and p.stat().st_size == 0:
-            text_zh = seg.get("text_zh", seg.get("text", ""))
-            if len(text_zh.strip()) >= 2:
-                p.unlink()  # Remove 0-byte file
-                retry_tasks.append(_tts_one(text_zh, str(p), voice, semaphore))
+    print(f"     生成 {len(pending)} 个新 TTS 片段...")
+    await engine.synthesize_batch(pending, tts_dir, voice, concurrency)
 
-    if retry_tasks:
-        print(f"     重试 {len(retry_tasks)} 个 0 字节 TTS 片段...")
-        await asyncio.gather(*retry_tasks, return_exceptions=True)
+    # Retry pass: 0-byte files with lower concurrency and backoff
+    max_retry_rounds = 3
+    all_engines = [engine] + [_create_tts_engine({**config, "tts_engine": fb})
+                               for fb in fallback_names if fb in TTS_ENGINES]
 
-        # If still 0-byte after retry, generate silence placeholder
+    for retry_round in range(max_retry_rounds):
+        retry_items = []
         for idx, seg in enumerate(segments):
             p = tts_dir / f"seg_{idx:04d}.mp3"
             if p.exists() and p.stat().st_size == 0:
-                # Create a minimal silence file so downstream doesn't break
-                target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
-                if target_ms > 0:
-                    from pydub import AudioSegment as PydubSegment
-                    silence = PydubSegment.silent(duration=min(target_ms, 500), frame_rate=16000)
-                    silence.export(str(p), format="mp3")
-                    print(f"     ⚠️  seg_{idx:04d}.mp3 重试失败，已填充静音")
+                text_zh = seg.get("text_zh", seg.get("text", ""))
+                if len(text_zh.strip()) >= 2:
+                    retry_items.append({"idx": idx, "text_zh": text_zh})
+
+        if not retry_items:
+            break
+
+        # 选引擎：首轮用主引擎低并发重试，后续轮用 fallback 引擎
+        eng_idx = min(retry_round, len(all_engines) - 1)
+        retry_engine = all_engines[eng_idx]
+        print(f"     重试 {len(retry_items)} 个 0 字节 TTS (第{retry_round+1}轮,"
+              f" 引擎={retry_engine.name}, 并发=2)...")
+        await asyncio.sleep(2 * (retry_round + 1))
+
+        # 逐个重试
+        for item in retry_items:
+            idx = item["idx"]
+            p = tts_dir / f"seg_{idx:04d}.mp3"
+            if p.exists():
+                p.unlink()
+            try:
+                await retry_engine.synthesize(item["text_zh"], str(p), voice)
+            except Exception:
+                # 写入空文件以便下一轮检测
+                p.touch()
+            await asyncio.sleep(0.5)
+
+    # Final fallback: still 0-byte → silence placeholder
+    silence_count = 0
+    for idx, seg in enumerate(segments):
+        p = tts_dir / f"seg_{idx:04d}.mp3"
+        if not p.exists() or p.stat().st_size == 0:
+            text_zh = seg.get("text_zh", seg.get("text", "")).strip()
+            if len(text_zh) < 2:
+                continue
+            target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
+            if target_ms > 0:
+                from pydub import AudioSegment as PydubSegment
+                silence = PydubSegment.silent(duration=min(target_ms, 500), frame_rate=16000)
+                silence.export(str(p), format="mp3")
+                silence_count += 1
+                print(f"     ⚠️  seg_{idx:04d}.mp3 全部重试失败，已填充静音")
+    if silence_count:
+        print(f"     共 {silence_count} 个片段填充静音")
 
 
 def _estimate_speed_ratios(
@@ -1578,6 +1831,7 @@ async def process_video(config: dict):
             print(f"[4/{total_steps}] 翻译")
             segments = translate_segments(raw_segments, config)
             segments = deduplicate_segments(segments)
+            segments = merge_short_segments(segments)
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(segments, f, ensure_ascii=False, indent=2)
             print()

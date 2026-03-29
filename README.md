@@ -160,10 +160,12 @@ youtube-cn-dub/
 ├── tests/                 # 单元测试
 │   ├── test_estimate_speed.py      # 字符估算语速测试
 │   ├── test_expand_disabled.py     # expand 禁用验证测试
+│   ├── test_merge_short.py         # 短段合并测试
 │   ├── test_parse_translation.py   # 翻译解析器测试
 │   ├── test_refine_dedup.py        # 迭代去重测试
 │   ├── test_translate_retry.py     # 翻译重试回退测试
 │   ├── test_translation_quality.py # 翻译质量优化测试
+│   ├── test_tts_retry.py           # TTS 重试增强测试
 │   └── test_voice_smoothing.py     # 语速平滑测试
 ├── devlog/                # 开发日志（排查记录）
 └── models/                # Whisper 模型目录（不入库）
@@ -220,8 +222,9 @@ bash test.sh unit     # 仅单元测试
   - 流程重排：翻译 → 迭代优化（纯文本）→ TTS（一次性）→ 对齐 → 合成，避免首轮 50% TTS 白生成
   - 所有片段收敛时 early stop，无需跑满 max_iterations
 
-- **0 字节 TTS 文件**（已解决）：edge-tts 网络不稳时生成 0 字节空文件，导致最终视频对应时段无配音。修复方案：
-  - `_generate_tts_segments` 末尾增加重试：扫描 0 字节文件，删除后重新生成
+- **0 字节 TTS 文件**（已解决）：edge-tts 网络不稳时生成 0 字节空文件（非文本问题，同长度文本有成功有失败），导致最终视频对应时段无配音。修复方案：
+  - 翻译后 `merge_short_segments` 将 < 3 字的极短片段合并到相邻段，从源头减少 TTS 失败
+  - 0 字节文件最多 3 轮重试，每轮并发降到 2、间隔递增（2s/4s/6s），避免触发 edge-tts 限流
   - 重试仍失败的，生成静音 mp3 占位，避免下游完全无声
 
 - **speed_report 中 skipped 段**（已解决）：`status: "skipped"` 的段全部是 tts_ms=0（TTS 文件不存在或 0 字节）。修复方案：

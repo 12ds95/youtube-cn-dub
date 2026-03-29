@@ -1,38 +1,195 @@
 #!/bin/bash
 # ============================================================
-# 模型下载脚本 - 通过 hf-mirror.com 国内镜像下载 Whisper 模型
-# 用法: bash download_model.sh [tiny|base|small|medium]
+# 模型下载脚本
+# 用法:
+#   bash download_model.sh whisper [tiny|base|small|medium]
+#   bash download_model.sh piper
+#   bash download_model.sh sherpa
+#   bash download_model.sh all        # 下载全部
+#
+# 默认使用国内镜像 (hf-mirror.com)；海外环境可加 --no-mirror
 # ============================================================
 
-MODEL_SIZE="${1:-small}"
+set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MODEL_DIR="$SCRIPT_DIR/models/faster-whisper-$MODEL_SIZE"
+USE_MIRROR=true
 
-echo "📥 下载 faster-whisper-$MODEL_SIZE 模型..."
-echo "   目标目录: $MODEL_DIR"
-
-mkdir -p "$MODEL_DIR"
-
-BASE="https://hf-mirror.com/Systran/faster-whisper-$MODEL_SIZE/resolve/main"
-
-FILES="config.json vocabulary.txt tokenizer.json preprocessor_config.json model.bin"
-
-for f in $FILES; do
-    if [ -f "$MODEL_DIR/$f" ]; then
-        echo "  ⏭  $f 已存在，跳过"
-        continue
+# 解析 --no-mirror
+for arg in "$@"; do
+    if [ "$arg" = "--no-mirror" ]; then
+        USE_MIRROR=false
     fi
-    echo "  📦 下载 $f ..."
-    curl -L --connect-timeout 30 --max-time 1800 --retry 5 --retry-delay 10 -C - \
-        "$BASE/$f" -o "$MODEL_DIR/$f"
-    if [ $? -ne 0 ]; then
-        echo "  ❌ 下载 $f 失败！请重试"
-        exit 1
-    fi
-    echo "  ✅ $f 下载完成 ($(du -h "$MODEL_DIR/$f" | cut -f1))"
 done
+# 清理 flag 参数，保留位置参数
+ARGS=()
+for arg in "$@"; do
+    [[ "$arg" != "--no-mirror" ]] && ARGS+=("$arg")
+done
+set -- "${ARGS[@]}"
 
-echo ""
-echo "🎉 模型下载完成！"
-echo "   位置: $MODEL_DIR"
-ls -lh "$MODEL_DIR/"
+COMPONENT="${1:-whisper}"
+
+_curl_download() {
+    local url="$1" dest="$2"
+    curl -L --connect-timeout 30 --max-time 1800 --retry 5 --retry-delay 10 -C - \
+        "$url" -o "$dest"
+}
+
+# ── Whisper 模型 ──────────────────────────────────────────────
+download_whisper() {
+    local size="${1:-small}"
+    local model_dir="$SCRIPT_DIR/models/faster-whisper-$size"
+    mkdir -p "$model_dir"
+
+    if $USE_MIRROR; then
+        local base="https://hf-mirror.com/Systran/faster-whisper-$size/resolve/main"
+    else
+        local base="https://huggingface.co/Systran/faster-whisper-$size/resolve/main"
+    fi
+
+    echo "📥 下载 faster-whisper-$size 模型..."
+    echo "   目标目录: $model_dir"
+
+    local files="config.json vocabulary.txt tokenizer.json preprocessor_config.json model.bin"
+    for f in $files; do
+        if [ -f "$model_dir/$f" ]; then
+            echo "  ⏭  $f 已存在，跳过"
+            continue
+        fi
+        echo "  📦 下载 $f ..."
+        _curl_download "$base/$f" "$model_dir/$f"
+        echo "  ✅ $f 下载完成 ($(du -h "$model_dir/$f" | cut -f1))"
+    done
+
+    echo "🎉 Whisper 模型下载完成: $model_dir"
+    ls -lh "$model_dir/"
+}
+
+# ── Piper TTS 中文模型 ───────────────────────────────────────
+# 官方: https://huggingface.co/rhasspy/piper-voices/tree/main/zh/zh_CN
+# 模型: zh_CN-huayan-medium（~70MB，普通话女声，质量最佳）
+# 可选: zh_CN-huayan-medium / zh_CN-chaowen-medium / zh_CN-xiao_ya-medium
+download_piper() {
+    local voice="${1:-huayan}"
+    local quality="${2:-medium}"
+    local model_name="zh_CN-${voice}-${quality}"
+    local model_dir="$SCRIPT_DIR/models/piper"
+    mkdir -p "$model_dir"
+
+    if $USE_MIRROR; then
+        local base="https://hf-mirror.com/rhasspy/piper-voices/resolve/main/zh/zh_CN/${voice}/${quality}"
+    else
+        local base="https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/${voice}/${quality}"
+    fi
+
+    echo "📥 下载 Piper TTS 模型: $model_name ..."
+    echo "   官方仓库: https://huggingface.co/rhasspy/piper-voices"
+    echo "   目标目录: $model_dir"
+
+    # 模型文件 (.onnx) + 配置文件 (.onnx.json)
+    for f in "${model_name}.onnx" "${model_name}.onnx.json"; do
+        if [ -f "$model_dir/$f" ]; then
+            echo "  ⏭  $f 已存在，跳过"
+            continue
+        fi
+        echo "  📦 下载 $f ..."
+        _curl_download "$base/$f" "$model_dir/$f"
+        echo "  ✅ $f 下载完成 ($(du -h "$model_dir/$f" | cut -f1))"
+    done
+
+    echo "🎉 Piper 模型下载完成: $model_dir/$model_name.onnx"
+    echo ""
+    echo "   配置 config.json 使用方法:"
+    echo '   "tts_chain": ["piper", "edge-tts", "pyttsx3"],'
+    echo '   "piper": { "model_path": "models/piper/'"$model_name"'.onnx" }'
+    echo ""
+    echo "   可选中文语音: huayan（女声）/ chaowen / xiao_ya"
+    echo "   下载其他语音: bash download_model.sh piper chaowen"
+}
+
+# ── sherpa-onnx MeloTTS 中文模型 ─────────────────────────────
+# 官方: https://github.com/k2-fsa/sherpa-onnx/releases (tts-models)
+# 模型: vits-melo-tts-zh_en（~110MB，中英混合，质量优秀）
+download_sherpa() {
+    local model_name="vits-melo-tts-zh_en"
+    local model_dir="$SCRIPT_DIR/models/sherpa-onnx"
+    local tar_file="$model_dir/${model_name}.tar.bz2"
+    mkdir -p "$model_dir"
+
+    # sherpa-onnx 模型托管在 GitHub Releases
+    local official_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/${model_name}.tar.bz2"
+    # 国内 GitHub 加速镜像
+    local mirror_url="https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/${model_name}.tar.bz2"
+
+    echo "📥 下载 sherpa-onnx MeloTTS 中文模型: $model_name ..."
+    echo "   官方仓库: https://github.com/k2-fsa/sherpa-onnx"
+    echo "   目标目录: $model_dir"
+
+    # 如果已解压则跳过
+    if [ -f "$model_dir/$model_name/model.onnx" ]; then
+        echo "  ⏭  模型已存在，跳过"
+        echo "🎉 sherpa-onnx 模型位置: $model_dir/$model_name/"
+        return 0
+    fi
+
+    echo "  📦 下载 ${model_name}.tar.bz2 ..."
+    if $USE_MIRROR; then
+        echo "  🌐 尝试国内镜像..."
+        _curl_download "$mirror_url" "$tar_file" 2>/dev/null || {
+            echo "  ⚠️  镜像下载失败，尝试官方地址..."
+            _curl_download "$official_url" "$tar_file"
+        }
+    else
+        _curl_download "$official_url" "$tar_file"
+    fi
+
+    echo "  📦 解压..."
+    tar -xjf "$tar_file" -C "$model_dir"
+    rm -f "$tar_file"
+
+    echo "🎉 sherpa-onnx 模型下载完成: $model_dir/$model_name/"
+    echo ""
+    echo "   配置 config.json 使用方法:"
+    echo '   "tts_chain": ["sherpa-onnx", "edge-tts", "pyttsx3"],'
+    echo '   "sherpa_onnx": {'
+    echo '     "model": "models/sherpa-onnx/'"$model_name"'/model.onnx",'
+    echo '     "lexicon": "models/sherpa-onnx/'"$model_name"'/lexicon.txt",'
+    echo '     "tokens": "models/sherpa-onnx/'"$model_name"'/tokens.txt"'
+    echo '   }'
+    ls -lh "$model_dir/$model_name/"
+}
+
+# ── 入口 ─────────────────────────────────────────────────────
+case "$COMPONENT" in
+    whisper)
+        download_whisper "${2:-small}"
+        ;;
+    piper)
+        download_piper "${2:-huayan}" "${3:-medium}"
+        ;;
+    sherpa|sherpa-onnx)
+        download_sherpa
+        ;;
+    all)
+        download_whisper "${2:-small}"
+        echo ""
+        download_piper
+        echo ""
+        download_sherpa
+        ;;
+    tiny|base|small|medium)
+        # 兼容旧用法: bash download_model.sh small
+        download_whisper "$COMPONENT"
+        ;;
+    *)
+        echo "用法:"
+        echo "  bash download_model.sh whisper [tiny|base|small|medium]  # Whisper 语音识别模型"
+        echo "  bash download_model.sh piper [huayan|chaowen|xiao_ya]   # Piper TTS 中文模型（CPU）"
+        echo "  bash download_model.sh sherpa                           # sherpa-onnx MeloTTS 中文模型（CPU）"
+        echo "  bash download_model.sh all                              # 下载全部模型"
+        echo ""
+        echo "选项:"
+        echo "  --no-mirror    使用官方源（海外环境推荐）"
+        exit 1
+        ;;
+esac

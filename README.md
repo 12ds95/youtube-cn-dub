@@ -99,24 +99,35 @@ bash run.sh --config config.json
 
 ### TTS 引擎配置
 
-支持 7 个 TTS 引擎，可在 `config.json` 中切换。失败时自动按 `tts_fallback` 列表依次降级。
+支持 7 个 TTS 引擎，可在 `config.json` 中通过 `tts_chain` 自定义引擎优先级。单引擎失败时整体回退到下一个引擎重新生成全部片段，保证语音一致。
 
 | 引擎 | 类型 | 中文质量 | 需要 | 说明 |
 |------|------|---------|------|------|
-| `edge-tts` | 在线免费 | 优秀 | 网络 | 默认引擎，微软免费 API，多音色 |
+| `edge-tts` | 在线免费 | 优秀 | 网络 | 默认引擎，微软免费 API，6 个中文音色 |
 | `siliconflow` | 在线免费 | 最佳 | API Key | 硅基流动 CosyVoice2，注册送额度 |
 | `gtts` | 在线免费 | 良好 | 网络 | Google Translate TTS，单音色 |
 | `pyttsx3` | 离线免费 | 一般 | 无 | 系统自带 TTS，零依赖终极兜底 |
-| `piper` | 离线免费 | 良好 | 下载模型 | ONNX 推理，CPU 友好 |
-| `sherpa-onnx` | 离线免费 | 良好 | 下载模型 | 含 MeloTTS 中文模型，CPU 友好 |
+| `piper` | 离线免费 | 良好 | 下载模型(~70MB) | ONNX 推理，CPU 友好 |
+| `sherpa-onnx` | 离线免费 | 良好 | 下载模型(~110MB) | MeloTTS 中英混合模型，CPU 友好 |
 | `cosyvoice` | 本地部署 | 最佳 | GPU | 阿里开源，支持声音克隆 |
 
-配置示例（推荐 edge-tts 主引擎 + gtts/pyttsx3 兜底）：
+**edge-tts 可选中文语音**（`voice` 字段，仅影响 edge-tts）：
+
+| 语音 ID | 性别 | 风格 |
+|---------|------|------|
+| `zh-CN-YunxiNeural` | 男 | 自然流畅（默认） |
+| `zh-CN-YunjianNeural` | 男 | 硬朗，适合新闻/纪录片 |
+| `zh-CN-YunyangNeural` | 男 | 播音腔 |
+| `zh-CN-XiaoxiaoNeural` | 女 | 温柔自然 |
+| `zh-CN-XiaoyiNeural` | 女 | 活泼 |
+| `zh-CN-YunxiaNeural` | 男 | 偏年轻 |
+
+配置示例（`tts_chain` 定义引擎优先级，第一个是主引擎，后面的按顺序整体回退）：
 
 ```json
 {
-  "tts_engine": "edge-tts",
-  "tts_fallback": ["gtts", "pyttsx3"]
+  "tts_chain": ["edge-tts", "gtts", "pyttsx3"],
+  "voice": "zh-CN-YunxiNeural"
 }
 ```
 
@@ -124,12 +135,25 @@ bash run.sh --config config.json
 
 ```json
 {
-  "tts_engine": "siliconflow",
-  "tts_fallback": ["edge-tts", "pyttsx3"],
+  "tts_chain": ["siliconflow", "edge-tts", "pyttsx3"],
   "siliconflow": {
     "api_key": "sk-xxx",
     "model": "FunAudioLLM/CosyVoice2-0.5B",
     "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
+  }
+}
+```
+
+使用本地离线引擎（需先下载模型，见下方）：
+
+```json
+{
+  "tts_chain": ["piper", "sherpa-onnx", "pyttsx3"],
+  "piper": { "model_path": "models/piper/zh_CN-huayan-medium.onnx" },
+  "sherpa_onnx": {
+    "model": "models/sherpa-onnx/vits-melo-tts-zh_en/model.onnx",
+    "lexicon": "models/sherpa-onnx/vits-melo-tts-zh_en/lexicon.txt",
+    "tokens": "models/sherpa-onnx/vits-melo-tts-zh_en/tokens.txt"
   }
 }
 ```
@@ -194,7 +218,7 @@ youtube-cn-dub/
 ├── run.sh                 # 一键启动脚本
 ├── setup.sh               # 环境部署脚本
 ├── test.sh                # 测试入口（smoke / unit / all）
-├── download_model.sh      # Whisper 模型下载（国内镜像）
+├── download_model.sh      # 模型下载（Whisper / Piper / sherpa-onnx，含国内镜像）
 ├── config.example.json    # 配置模板
 ├── tests/                 # 单元测试
 │   ├── test_estimate_speed.py      # 字符估算语速测试
@@ -205,19 +229,42 @@ youtube-cn-dub/
 │   ├── test_translate_retry.py     # 翻译重试回退测试
 │   ├── test_translation_quality.py # 翻译质量优化测试
 │   ├── test_tts_retry.py           # TTS 重试增强测试
+│   ├── test_tts_engines.py        # TTS 可插拔引擎架构测试
 │   └── test_voice_smoothing.py     # 语速平滑测试
 ├── devlog/                # 开发日志（排查记录）
-└── models/                # Whisper 模型目录（不入库）
+└── models/                # 模型目录（不入库）
+    ├── faster-whisper-*/   # Whisper 语音识别模型
+    ├── piper/              # Piper TTS 中文模型
+    └── sherpa-onnx/        # sherpa-onnx MeloTTS 中文模型
 ```
 
-## Whisper 模型下载
+## 模型下载
 
-如果 HuggingFace 访问不畅，可用国内镜像下载：
+统一下载脚本，默认使用国内镜像（海外加 `--no-mirror`）：
 
 ```bash
-bash download_model.sh small    # 推荐，约 500MB
-bash download_model.sh tiny     # 轻量，约 75MB
+# Whisper 语音识别模型
+bash download_model.sh whisper small    # 推荐，约 500MB
+bash download_model.sh whisper tiny     # 轻量，约 75MB
+
+# Piper TTS 中文模型（CPU 离线，~70MB）
+bash download_model.sh piper            # 默认 huayan 女声
+bash download_model.sh piper chaowen    # 其他语音
+
+# sherpa-onnx MeloTTS 中文模型（CPU 离线，~110MB）
+bash download_model.sh sherpa
+
+# 一次下载全部
+bash download_model.sh all
 ```
+
+模型源：
+
+| 模型 | 官方地址 | 国内镜像 |
+|------|---------|---------|
+| Whisper | `huggingface.co/Systran/faster-whisper-*` | `hf-mirror.com/Systran/faster-whisper-*` |
+| Piper | `huggingface.co/rhasspy/piper-voices` | `hf-mirror.com/rhasspy/piper-voices` |
+| sherpa-onnx | `github.com/k2-fsa/sherpa-onnx/releases` | `ghfast.top` 加速 |
 
 ## 开发规范
 
@@ -280,6 +327,15 @@ bash test.sh unit     # 仅单元测试
   - 精简 prompt 中明确要求不得与上下文重复
   - 采纳 LLM 结果前自动检测与相邻段的字符重叠率（`_is_duplicate_of_neighbors`，阈值 60%），重复内容不予采纳
   - 转录和翻译后各调用 `deduplicate_segments()` 去重，清理完全相同或子串包含的连续重复片段
+
+## TODO（待规划）
+
+- **多人声识别与差异化配音**：当前所有片段使用同一语音参数，无法区分不同说话人。目标：
+  - 基于 Whisper 或 speaker diarization（如 pyannote-audio）识别不同人物的声音片段
+  - 为不同说话人分配不同的语音参数（如 edge-tts 的 YunxiNeural / XiaoxiaoNeural 对应不同角色）
+  - 如果单一引擎的可选音色不够覆盖所有说话人，则沿 `tts_chain` 循环查找可用的不同音色进行生成（例如主角用 edge-tts YunxiNeural，配角用 edge-tts XiaoxiaoNeural，旁白用 siliconflow alex）
+  - 需要评估：speaker diarization 的准确率、跨引擎混用时音质一致性、config 中多角色语音映射的配置方式
+  - 可能涉及较大代码重构（segments 需携带 speaker_id，TTS 生成逻辑从单语音改为按角色分发），先记录不做
 
 ## 许可
 

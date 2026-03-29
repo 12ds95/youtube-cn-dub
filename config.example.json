@@ -26,7 +26,31 @@
   "__TTS 引擎链__": "tts_chain 定义引擎优先级：第一个是主引擎，后面的按顺序做回退。也可用旧方式 tts_engine + tts_fallback",
   "tts_chain": ["edge-tts", "gtts", "pyttsx3"],
 
-  "__voice 说明__": "此字段仅用于 edge-tts，其他引擎在各自配置段中设置语音",
+  "__voice 说明__": "此字段仅用于 edge-tts。可选中文语音见下方列表",
+  "__edge-tts 中文语音__": {
+    "zh-CN 普通话": {
+      "zh-CN-YunxiNeural":    "男声（默认），自然流畅，适合大多数场景",
+      "zh-CN-YunjianNeural":  "男声，偏硬朗，适合新闻/纪录片",
+      "zh-CN-YunxiaNeural":   "男声，偏年轻",
+      "zh-CN-YunyangNeural":  "男声，偏播音腔",
+      "zh-CN-XiaoxiaoNeural": "女声，温柔自然",
+      "zh-CN-XiaoyiNeural":   "女声，偏活泼"
+    },
+    "zh-CN 方言": {
+      "zh-CN-liaoning-XiaobeiNeural": "女声，辽宁方言",
+      "zh-CN-shaanxi-XiaoniNeural":   "女声，陕西方言"
+    },
+    "zh-HK 粤语": {
+      "zh-HK-HiuGaaiNeural": "女声",
+      "zh-HK-HiuMaanNeural": "女声",
+      "zh-HK-WanLungNeural":  "男声"
+    },
+    "zh-TW 台湾": {
+      "zh-TW-HsiaoChenNeural": "女声",
+      "zh-TW-HsiaoYuNeural":   "女声",
+      "zh-TW-YunJheNeural":    "男声"
+    }
+  },
   "voice": "zh-CN-YunxiNeural",
 
   "siliconflow": {

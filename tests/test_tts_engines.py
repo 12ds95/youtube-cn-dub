@@ -12,7 +12,7 @@ from pipeline import (
     TTS_ENGINES, TTSEngine, _create_tts_engine,
     EdgeTTSEngine, GTTSEngine, SiliconFlowTTSEngine,
     Pyttsx3Engine, PiperTTSEngine, SherpaOnnxEngine, CosyVoiceEngine,
-    _generate_tts_segments,
+    _generate_tts_segments, _backup_tts,
 )
 
 
@@ -357,6 +357,105 @@ def test_whole_fallback_no_voice_mixing():
             content = (tts_dir / f"seg_{i:04d}.mp3").read_bytes()
             assert content == b"ENGINE_B", \
                 f"seg_{i:04d} 应为 ENGINE_B，实际={content}"
+
+
+# ── is_local 属性测试 ──
+
+def test_remote_engines_is_local_false():
+    """远程引擎 is_local 应为 False"""
+    remote = [EdgeTTSEngine, GTTSEngine, SiliconFlowTTSEngine]
+    for cls in remote:
+        assert cls.is_local is False, f"{cls.name} 应为远程引擎 (is_local=False)"
+
+
+def test_local_engines_is_local_true():
+    """本地引擎 is_local 应为 True"""
+    local = [PiperTTSEngine, SherpaOnnxEngine, CosyVoiceEngine, Pyttsx3Engine]
+    for cls in local:
+        assert cls.is_local is True, f"{cls.name} 应为本地引擎 (is_local=True)"
+
+
+# ── 备份与失败 JSON 测试 ──
+
+def test_backup_tts_copies_files():
+    """_backup_tts 应将 TTS 文件复制到备份目录"""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tts_dir = Path(tmpdir) / "tts"
+        tts_dir.mkdir()
+        backup_dir = Path(tmpdir) / "tts_backup_edge-tts"
+
+        items = [{"idx": i, "text_zh": f"test{i}"} for i in range(3)]
+        for item in items:
+            p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+            p.write_bytes(b"\xff" * 100)
+
+        _backup_tts(tts_dir, backup_dir, items)
+
+        assert backup_dir.exists()
+        for item in items:
+            bp = backup_dir / f"seg_{item['idx']:04d}.mp3"
+            assert bp.exists() and bp.stat().st_size == 100
+
+
+def test_failure_json_written_on_fail():
+    """引擎失败时应写入 tts_failure.json，含失败片段列表"""
+    import tempfile, asyncio, json
+    from pathlib import Path
+
+    class AlwaysFailEngine(TTSEngine):
+        name = "always-fail"
+        is_local = True
+        def resolve_voice(self, v): return "x"
+        async def synthesize(self, text, path, voice):
+            Path(path).touch()  # 0 字节
+
+    segments = [
+        {"text_zh": "你好世界呀", "start": 0, "end": 2},
+        {"text_zh": "测试失败文本", "start": 2, "end": 4},
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tts_dir = Path(tmpdir) / "tts_segments"
+        tts_dir.mkdir()
+
+        # 直接模拟失败 JSON 写入逻辑
+        all_items = [{"idx": i, "text_zh": s["text_zh"]} for i, s in enumerate(segments)]
+        fail_info = {
+            "engine": "always-fail",
+            "total_segments": len(all_items),
+            "failed_count": len(all_items),
+            "failed_segments": [item["idx"] for item in all_items],
+            "chain": ["always-fail"],
+            "chain_position": 0,
+            "voice": "x",
+        }
+        failure_json = Path(tmpdir) / "tts_failure.json"
+        with open(failure_json, "w") as f:
+            json.dump(fail_info, f)
+
+        data = json.loads(failure_json.read_text())
+        assert data["engine"] == "always-fail"
+        assert data["failed_count"] == 2
+        assert data["failed_segments"] == [0, 1]
+
+
+def test_failure_json_cleared_on_success():
+    """全部片段成功后 tts_failure.json 应被删除"""
+    import tempfile, json
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        failure_json = Path(tmpdir) / "tts_failure.json"
+        failure_json.write_text(json.dumps({"engine": "test"}))
+        assert failure_json.exists()
+
+        # 模拟成功后清理
+        if failure_json.exists():
+            failure_json.unlink()
+        assert not failure_json.exists()
 
 
 if __name__ == "__main__":

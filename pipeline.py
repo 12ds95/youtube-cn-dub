@@ -778,6 +778,7 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
 class TTSEngine:
     """TTS 引擎基类"""
     name = "base"
+    is_local = False  # 子类覆盖：本地引擎=True，远程引擎=False
 
     def resolve_voice(self, global_voice: str) -> str:
         """返回本引擎实际使用的语音标识。
@@ -815,6 +816,7 @@ class TTSEngine:
 class EdgeTTSEngine(TTSEngine):
     """edge-tts: 微软免费在线 TTS（默认引擎）"""
     name = "edge-tts"
+    is_local = False
 
     async def synthesize(self, text: str, path: str, voice: str):
         import edge_tts
@@ -825,6 +827,7 @@ class EdgeTTSEngine(TTSEngine):
 class GTTSEngine(TTSEngine):
     """gTTS: Google Translate TTS（免费，无需 API key）"""
     name = "gtts"
+    is_local = False
 
     def resolve_voice(self, global_voice: str) -> str:
         """gTTS 使用语言代码 zh-cn，忽略全局 edge-tts voice"""
@@ -842,6 +845,7 @@ class GTTSEngine(TTSEngine):
 class PiperTTSEngine(TTSEngine):
     """Piper: 本地 ONNX 推理，无需 GPU，超轻量"""
     name = "piper"
+    is_local = True
 
     def __init__(self, model_path: str = None):
         self.model_path = model_path
@@ -867,6 +871,7 @@ class PiperTTSEngine(TTSEngine):
 class SherpaOnnxEngine(TTSEngine):
     """sherpa-onnx: 本地 ONNX 推理（含 MeloTTS 中文模型），无需 GPU"""
     name = "sherpa-onnx"
+    is_local = True
 
     def __init__(self, model_config: dict = None):
         self.model_config = model_config or {}
@@ -913,6 +918,7 @@ class SherpaOnnxEngine(TTSEngine):
 class CosyVoiceEngine(TTSEngine):
     """CosyVoice: 阿里开源 TTS（需 GPU，中文最佳音质）"""
     name = "cosyvoice"
+    is_local = True
 
     def __init__(self, model_path: str = None):
         self.model_path = model_path
@@ -954,6 +960,7 @@ class SiliconFlowTTSEngine(TTSEngine):
       }
     """
     name = "siliconflow"
+    is_local = False
 
     def __init__(self, api_key: str = None, model: str = None, voice_id: str = None):
         self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY", "")
@@ -992,6 +999,7 @@ class Pyttsx3Engine(TTSEngine):
     默认使用 Ting-Ting（普通话女声），如未安装则回退到系统默认语音。
     """
     name = "pyttsx3"
+    is_local = True
 
     def __init__(self, voice_name: str = None, rate: int = None):
         self.voice_name = voice_name  # 如 "Ting-Ting", "Mei-Jia"
@@ -1091,17 +1099,17 @@ async def _generate_tts_segments(
     voice: str = "zh-CN-YunxiNeural", concurrency: int = 5,
     config: dict = None,
 ):
-    """阶段 A: 生成 TTS .mp3 文件（整体回退策略）
+    """阶段 A: 生成 TTS .mp3 文件（整体回退 + 智能重试 + 断点恢复）
 
-    策略：单引擎内降级重试 → 仍有失败 → 清空全部片段 → 整体换下一个引擎重来。
-    保证最终所有片段来自同一个引擎，语音一致。
-
-    引擎链优先级：
-      1. tts_chain: ["siliconflow", "edge-tts", "gtts", "pyttsx3"]  ← 完全自定义顺序
-      2. tts_engine + tts_fallback: 主引擎 + 回退列表（兼容旧配置）
+    策略:
+      远程引擎: 正常并发 → 降并发 → 并发=1 后持续重试，连续 3 轮无改善才放弃
+      本地引擎: 不限重试轮数（本地不存在网络抖动问题，失败即真失败，1 轮即可）
+      切换引擎前: 备份当前产出到 tts_backup_{engine}/ + 写 tts_failure.json
+      支持从 tts_failure.json 断点恢复（跳过已失败的引擎，从下一个开始）
     """
     tts_dir.mkdir(exist_ok=True)
     config = config or {}
+    failure_json = tts_dir.parent / "tts_failure.json"
 
     # ── 解析引擎链 ──
     tts_chain = config.get("tts_chain", None)
@@ -1116,12 +1124,28 @@ async def _generate_tts_segments(
             fallback_names = [fallback_names]
         chain_names = [primary] + fallback_names
 
-    # 过滤无效引擎名
     chain_names = [n for n in chain_names if n in TTS_ENGINES]
     if not chain_names:
         chain_names = ["edge-tts"]
 
-    chain_desc = " → ".join(chain_names)
+    # ── 断点恢复：跳过上次已失败的引擎 ──
+    start_idx = 0
+    if failure_json.exists():
+        try:
+            with open(failure_json) as f:
+                prev = json.load(f)
+            failed_engine = prev.get("engine")
+            if failed_engine in chain_names:
+                skip_to = chain_names.index(failed_engine) + 1
+                if skip_to < len(chain_names):
+                    start_idx = skip_to
+                    print(f"     📋 检测到上次失败记录 (引擎={failed_engine},"
+                          f" 失败={len(prev.get('failed_segments',[]))}个)，"
+                          f"从 [{chain_names[start_idx]}] 继续")
+        except Exception:
+            pass
+
+    chain_desc = " → ".join(chain_names[start_idx:])
     print(f"     TTS 引擎链: {chain_desc}")
 
     # 收集所有需要合成的片段
@@ -1135,97 +1159,174 @@ async def _generate_tts_segments(
         print(f"     无需生成 TTS 片段")
         return
 
-    # 检查是否已有完整缓存（全部文件存在且非 0 字节）
-    cached_count = 0
-    for item in all_items:
-        p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-        if p.exists() and p.stat().st_size > 0:
-            cached_count += 1
+    # 检查是否已有完整缓存
+    cached_count = sum(1 for item in all_items
+                       if (tts_dir / f"seg_{item['idx']:04d}.mp3").exists()
+                       and (tts_dir / f"seg_{item['idx']:04d}.mp3").stat().st_size > 0)
     if cached_count == len(all_items):
         print(f"     TTS 片段已缓存（{cached_count} 个），跳过生成")
+        if failure_json.exists():
+            failure_json.unlink()
         return
 
+    # ── 辅助：统计失败片段 ──
+    def _count_failed():
+        failed = []
+        for item in all_items:
+            p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+            if not p.exists() or p.stat().st_size == 0:
+                failed.append(item)
+        return failed
+
     # ── 整体回退：逐引擎尝试 ──
-    max_retry_within_engine = 2  # 单引擎内降级重试次数
     success_engine = None
 
-    for eng_pos, eng_name in enumerate(chain_names):
+    for eng_pos in range(start_idx, len(chain_names)):
+        eng_name = chain_names[eng_pos]
         engine = _create_tts_engine({**config, "tts_engine": eng_name})
         resolved_voice = engine.resolve_voice(voice)
 
-        if eng_pos > 0:
-            # 整体回退：清空上一个引擎的全部产出
-            print(f"     🔄 整体回退到 [{engine.name}]，清空全部 TTS 片段重新生成...")
+        if eng_pos > start_idx or (start_idx > 0 and eng_pos == start_idx):
+            # 整体回退：备份 → 清空
+            backup_dir = tts_dir.parent / f"tts_backup_{chain_names[max(0,eng_pos-1)]}"
+            if eng_pos > start_idx:
+                # 有上一个引擎的产出需要备份
+                _backup_tts(tts_dir, backup_dir, all_items)
+                print(f"     🔄 整体回退到 [{engine.name}]"
+                      f"（上轮备份在 {backup_dir.name}/）")
+            else:
+                # 断点恢复：清空残留（上次失败引擎的碎片）
+                print(f"     🔄 断点恢复: 清空残留，用 [{engine.name}] 全量重新生成...")
             for item in all_items:
                 p = tts_dir / f"seg_{item['idx']:04d}.mp3"
                 if p.exists():
                     p.unlink()
 
         print(f"     [{engine.name}] 生成 {len(all_items)} 个 TTS 片段"
-              f" (voice={resolved_voice})...")
+              f" (voice={resolved_voice},"
+              f" {'本地' if engine.is_local else '远程'})...")
+
         # 首轮：正常并发
-        pending = []
-        for item in all_items:
-            p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-            if not p.exists() or p.stat().st_size == 0:
-                pending.append(item)
+        pending = _count_failed()
         if pending:
             await engine.synthesize_batch(pending, tts_dir, voice, concurrency)
 
-        # 单引擎内降级重试（降并发、加间隔）
-        for retry in range(max_retry_within_engine):
-            failed = []
-            for item in all_items:
-                p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-                if not p.exists() or p.stat().st_size == 0:
-                    failed.append(item)
-            if not failed:
-                break
-            retry_concurrency = max(1, concurrency // (2 ** (retry + 1)))
-            print(f"     [{engine.name}] 降级重试第{retry+1}轮："
-                  f" {len(failed)} 个失败片段, 并发={retry_concurrency}...")
-            await asyncio.sleep(2 * (retry + 1))
-            for item in failed:
-                p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-                if p.exists():
-                    p.unlink()
-            await engine.synthesize_batch(failed, tts_dir, voice,
-                                          retry_concurrency)
+        # ── 智能重试 ──
+        # 远程引擎：逐步降并发，到 1 后持续重试，连续 3 轮无改善才放弃
+        # 本地引擎：失败就是真失败，不需要多轮重试
+        if engine.is_local:
+            # 本地引擎：1 轮低并发重试即可
+            failed = _count_failed()
+            if failed:
+                print(f"     [{engine.name}] 本地引擎重试: {len(failed)} 个失败片段...")
+                for item in failed:
+                    p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+                    if p.exists():
+                        p.unlink()
+                await engine.synthesize_batch(failed, tts_dir, voice, 1)
+        else:
+            # 远程引擎：阶梯式降并发 + 并发=1 后持续重试
+            no_improve_count = 0
+            prev_fail_count = len(_count_failed())
+            retry_round = 0
+
+            while True:
+                failed = _count_failed()
+                if not failed:
+                    break
+
+                cur_fail_count = len(failed)
+
+                # 阶梯降并发: 正常→半→1
+                if retry_round == 0:
+                    retry_c = max(1, concurrency // 2)
+                else:
+                    retry_c = 1
+
+                # 并发=1 阶段：检查是否有改善
+                if retry_c == 1 and retry_round > 0:
+                    if cur_fail_count >= prev_fail_count:
+                        no_improve_count += 1
+                    else:
+                        no_improve_count = 0  # 有改善，重置计数
+                    if no_improve_count >= 3:
+                        print(f"     [{engine.name}] 连续 3 轮无改善"
+                              f" (仍有 {cur_fail_count} 个失败)，放弃当前引擎")
+                        break
+
+                prev_fail_count = cur_fail_count
+                retry_round += 1
+                print(f"     [{engine.name}] 重试第{retry_round}轮:"
+                      f" {cur_fail_count} 个失败, 并发={retry_c}"
+                      + (f", 无改善={no_improve_count}/3" if retry_c == 1 and retry_round > 1 else "")
+                      + "...")
+                await asyncio.sleep(2 * min(retry_round, 5))
+                for item in failed:
+                    p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+                    if p.exists():
+                        p.unlink()
+                await engine.synthesize_batch(failed, tts_dir, voice, retry_c)
 
         # 检查最终结果
-        final_failed = []
-        for item in all_items:
-            p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-            if not p.exists() or p.stat().st_size == 0:
-                final_failed.append(item)
+        final_failed = _count_failed()
 
         if not final_failed:
             success_engine = engine.name
             print(f"     ✅ [{engine.name}] 全部 {len(all_items)} 个片段生成成功")
+            if failure_json.exists():
+                failure_json.unlink()
             break
         else:
+            # 写失败状态 JSON（用于断点恢复）
+            fail_info = {
+                "engine": engine.name,
+                "total_segments": len(all_items),
+                "failed_count": len(final_failed),
+                "failed_segments": [item["idx"] for item in final_failed],
+                "chain": chain_names,
+                "chain_position": eng_pos,
+                "voice": resolved_voice,
+                "timestamp": __import__("datetime").datetime.now().isoformat(),
+            }
+            with open(failure_json, "w", encoding="utf-8") as f:
+                json.dump(fail_info, f, ensure_ascii=False, indent=2)
+
+            is_last = eng_pos >= len(chain_names) - 1
             print(f"     ❌ [{engine.name}] 仍有 {len(final_failed)} 个片段失败"
-                  + (f"，尝试下一个引擎..." if eng_pos < len(chain_names) - 1
-                     else "，引擎链已用尽"))
+                  + (f"，尝试下一个引擎..." if not is_last else "，引擎链已用尽")
+                  + f"  (详见 {failure_json.name})")
 
     # 最终兜底：所有引擎都失败的片段填充静音
     if not success_engine:
         silence_count = 0
-        for item in all_items:
-            p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-            if not p.exists() or p.stat().st_size == 0:
-                idx = item["idx"]
-                seg = segments[idx]
-                target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
-                if target_ms > 0:
-                    from pydub import AudioSegment as PydubSegment
-                    silence = PydubSegment.silent(
-                        duration=min(target_ms, 500), frame_rate=16000)
-                    silence.export(str(p), format="mp3")
-                    silence_count += 1
-                    print(f"     ⚠️  seg_{idx:04d}.mp3 所有引擎均失败，填充静音")
+        for item in _count_failed():
+            idx = item["idx"]
+            p = tts_dir / f"seg_{idx:04d}.mp3"
+            seg = segments[idx]
+            target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
+            if target_ms > 0:
+                from pydub import AudioSegment as PydubSegment
+                silence = PydubSegment.silent(
+                    duration=min(target_ms, 500), frame_rate=16000)
+                silence.export(str(p), format="mp3")
+                silence_count += 1
+                print(f"     ⚠️  seg_{idx:04d}.mp3 所有引擎均失败，填充静音")
         if silence_count:
             print(f"     共 {silence_count} 个片段填充静音（所有引擎均已尝试）")
+
+
+def _backup_tts(tts_dir: Path, backup_dir: Path, all_items: List[dict]):
+    """备份当前 TTS 产出到 backup_dir/"""
+    import shutil
+    backup_dir.mkdir(exist_ok=True)
+    count = 0
+    for item in all_items:
+        src = tts_dir / f"seg_{item['idx']:04d}.mp3"
+        if src.exists() and src.stat().st_size > 0:
+            shutil.copy2(str(src), str(backup_dir / src.name))
+            count += 1
+    if count:
+        print(f"     💾 已备份 {count} 个 TTS 片段到 {backup_dir.name}/")
 
 
 def _estimate_speed_ratios(

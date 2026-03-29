@@ -20,6 +20,8 @@ output/
 
 # ─── 用户配置（含 API Key 等敏感信息）───────────────
 config.json
+config.resume.json
+config.scratch.json
 
 # ─── macOS ────────────────────────────────────────
 .DS_Store

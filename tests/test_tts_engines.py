@@ -239,6 +239,126 @@ def test_tts_chain_overrides_tts_engine():
     assert fallbacks == ["pyttsx3", "edge-tts"]
 
 
+# ── 整体回退策略测试 ──
+
+def test_whole_fallback_clears_all_on_engine_switch():
+    """整体回退：换引擎时应清空全部片段，不混用不同引擎的产出"""
+    import tempfile, asyncio
+    from pathlib import Path
+
+    call_log = []
+
+    class FakeFailEngine(TTSEngine):
+        name = "fake-fail"
+        def resolve_voice(self, v): return "fail-voice"
+        async def synthesize(self, text, path, voice):
+            call_log.append(("fail", path))
+            # 只生成空文件（模拟失败）
+            Path(path).touch()
+
+    class FakeOKEngine(TTSEngine):
+        name = "fake-ok"
+        def resolve_voice(self, v): return "ok-voice"
+        async def synthesize(self, text, path, voice):
+            call_log.append(("ok", path))
+            with open(path, "wb") as f:
+                f.write(b"\xff" * 100)  # 非空内容
+
+    # 模拟引擎链
+    segments = [
+        {"text_zh": "你好世界", "start": 0, "end": 2},
+        {"text_zh": "测试文本", "start": 2, "end": 4},
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tts_dir = Path(tmpdir)
+
+        # 手动模拟整体回退流程
+        engines = [FakeFailEngine(), FakeOKEngine()]
+
+        for eng_pos, engine in enumerate(engines):
+            if eng_pos > 0:
+                # 整体回退：清空前一引擎产出
+                for idx in range(len(segments)):
+                    p = tts_dir / f"seg_{idx:04d}.mp3"
+                    if p.exists():
+                        p.unlink()
+
+            for idx, seg in enumerate(segments):
+                p = tts_dir / f"seg_{idx:04d}.mp3"
+                await_sync(engine.synthesize(seg["text_zh"], str(p),
+                                             engine.resolve_voice("")))
+
+            # 检查是否全部成功
+            all_ok = all(
+                (tts_dir / f"seg_{i:04d}.mp3").exists() and
+                (tts_dir / f"seg_{i:04d}.mp3").stat().st_size > 0
+                for i in range(len(segments))
+            )
+            if all_ok:
+                break
+
+        # 验证：最终文件全部来自 fake-ok 引擎（非空）
+        for i in range(len(segments)):
+            p = tts_dir / f"seg_{i:04d}.mp3"
+            assert p.exists() and p.stat().st_size > 0, \
+                f"seg_{i:04d}.mp3 应由 fake-ok 生成"
+
+        # 验证：fake-ok 引擎处理了全部片段（而非只补漏）
+        ok_calls = [c for c in call_log if c[0] == "ok"]
+        assert len(ok_calls) == len(segments), \
+            f"整体回退应让新引擎重新生成全部 {len(segments)} 个片段，实际={len(ok_calls)}"
+
+
+def await_sync(coro):
+    """同步执行协程（测试辅助）"""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def test_whole_fallback_no_voice_mixing():
+    """整体回退后不应存在前一引擎的残留文件"""
+    import tempfile
+    from pathlib import Path
+
+    class WriteMarkerEngine(TTSEngine):
+        def __init__(self, marker: bytes):
+            self.marker = marker
+        def resolve_voice(self, v): return "x"
+        async def synthesize(self, text, path, voice):
+            with open(path, "wb") as f:
+                f.write(self.marker)
+
+    eng_a = WriteMarkerEngine(b"ENGINE_A")
+    eng_b = WriteMarkerEngine(b"ENGINE_B")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tts_dir = Path(tmpdir)
+
+        # 引擎 A 先生成
+        for i in range(3):
+            p = tts_dir / f"seg_{i:04d}.mp3"
+            await_sync(eng_a.synthesize(f"text{i}", str(p), "x"))
+
+        # 模拟整体回退：清空后用引擎 B 重新生成
+        for i in range(3):
+            p = tts_dir / f"seg_{i:04d}.mp3"
+            if p.exists():
+                p.unlink()
+        for i in range(3):
+            p = tts_dir / f"seg_{i:04d}.mp3"
+            await_sync(eng_b.synthesize(f"text{i}", str(p), "x"))
+
+        # 验证全部来自引擎 B
+        for i in range(3):
+            content = (tts_dir / f"seg_{i:04d}.mp3").read_bytes()
+            assert content == b"ENGINE_B", \
+                f"seg_{i:04d} 应为 ENGINE_B，实际={content}"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = failed = 0

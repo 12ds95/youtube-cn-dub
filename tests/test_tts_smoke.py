@@ -228,9 +228,16 @@ def test_create_engine_and_synthesize_gtts():
 
 # ── 辅助 ──
 
-class unittest_skip(Exception):
-    """标记跳过（非失败）"""
-    pass
+try:
+    import pytest as _pytest
+    class unittest_skip(Exception):
+        """标记跳过（非失败）— pytest 环境下自动转为 pytest.skip"""
+        def __init__(self, msg=""):
+            _pytest.skip(msg)
+except ImportError:
+    class unittest_skip(Exception):
+        """标记跳过（非失败）— 独立运行时使用"""
+        pass
 
 
 if __name__ == "__main__":

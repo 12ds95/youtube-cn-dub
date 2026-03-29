@@ -277,6 +277,8 @@ bash run.sh --resume-from output/VIDEO_ID
 | `subtitle_bilingual.srt` | 中英双语字幕 |
 | `subtitle_zh.srt` / `subtitle_en.srt` | 单语字幕 |
 | `segments_cache.json` | 转录+翻译缓存（可手动编辑微调） |
+| `pipeline_YYYYMMDD_HHMMSS.log` | 执行日志（各步骤耗时 + 错误详情） |
+| `tts_failure.json` | TTS 断点恢复文件（失败时生成） |
 | `iterations/` | 迭代优化快照（`--refine` 时生成） |
 
 播放时用 VLC/IINA 等播放器打开 `final.mp4`，加载 `subtitle_bilingual.srt` 即可。
@@ -300,7 +302,8 @@ youtube-cn-dub/
 │   ├── test_translate_retry.py     # 翻译重试回退测试
 │   ├── test_translation_quality.py # 翻译质量优化测试
 │   ├── test_tts_retry.py           # TTS 重试增强测试
-│   ├── test_tts_engines.py        # TTS 可插拔引擎架构测试
+│   ├── test_tts_engines.py         # TTS 可插拔引擎架构测试
+│   ├── test_tts_smoke.py           # TTS 引擎冒烟测试（真实合成）
 │   └── test_voice_smoothing.py     # 语速平滑测试
 ├── devlog/                # 开发日志（排查记录）
 └── models/                # 模型目录（不入库）
@@ -433,6 +436,8 @@ commit message 格式：`{type}: {描述}`，type 取值：
 
 **9. 运行时依赖不只是 Python 包。** yt-dlp 需要 `yt-dlp-ejs` 包提供 JS challenge solver 脚本才能下载 YouTube 视频。裸装 `pip install yt-dlp` 不包含，必须用 `pip install "yt-dlp[default]"`。安装文档和环境检查（test.sh）应覆盖所有运行时依赖，包括非 Python 组件。
 
+**10. 错误反馈的核心是"怎么修"而不是"出错了"。** pipeline 报错后如果只打印 traceback，用户看不懂、不知道该改什么。结构化错误反馈应包含三部分：错误类型（让用户知道是什么层面的问题）、具体描述（定位具体原因）、可操作的修复建议（最好包含可直接复制的命令或配置）。同时 traceback 只写日志文件不打印到屏幕，对用户友好且不丢失调试信息。
+
 ## 已知限制
 
 1. YouTube 下载需要能访问 YouTube 的网络环境
@@ -483,18 +488,20 @@ commit message 格式：`{type}: {描述}`，type 取值：
 
 ### 🔴 高优先级 / 低难度（快速改进）
 
-- **输出日志优化**：当前 skip_steps 包含 transcribe/translate 时，日志显示 `[3/7] 语音识别 - 跳过` → `[4/7] 翻译 - 跳过` → 直接跳到 `[6/7] 生成中文配音`，中间跳过的步骤（字幕生成）没有任何提示。目标：
-  - 跳过的步骤也应打印简要说明（如 `[5/7] 生成字幕 - 跳过（已在 skip_steps 中）`）
-  - 断点恢复场景应明确标注哪些步骤从缓存恢复、哪些实际执行
-  - TTS 引擎链切换、备份、断点恢复等关键操作应有更清晰的路径提示（已完成 tts_failure.json 路径打印改进）
+- **输出日志优化**：~~当前 skip_steps 包含 transcribe/translate 时，日志显示 `[3/7] 语音识别 - 跳过` → `[4/7] 翻译 - 跳过` → 直接跳到 `[6/7] 生成中文配音`，中间跳过的步骤（字幕生成）没有任何提示。~~ 已部分解决：
+  - ✅ 每次执行生成 `pipeline_YYYYMMDD_HHMMSS.log` 日志文件，记录各步骤耗时
+  - ✅ 可预知错误给出结构化反馈（错误类型 + 问题描述 + 修复建议）
+  - ✅ skip_steps 跳过关键步骤但产出不存在时，给出可直接使用的配置修改建议
+  - 待完善：跳过的步骤应打印简要说明（如 `[5/7] 生成字幕 - 跳过（已在 skip_steps 中）`）
+  - 待完善：断点恢复场景应明确标注哪些步骤从缓存恢复、哪些实际执行
 
 ### 🟡 中优先级 / 中难度（需一定重构）
 
-- **性能监控与优化**：各模块耗时记录 + 本地 GPU 资源优化。目标：
-  - 为每个主要步骤（下载、转录、翻译、TTS、对齐、合成）记录耗时并输出到日志
-  - 生成性能报告（如 `output/VIDEO_ID/performance.json`），包含各阶段耗时、并发利用率、失败重试次数
-  - 结合本地 GPU 资源（如 Whisper large-v3 CUDA 加速、TTS 本地模型 GPU 推理）优化资源分配
-  - 支持配置 GPU 使用策略（`"gpu": "auto" / "cuda" / "cpu"`）
+- **性能监控与优化**：~~各模块耗时记录~~ + 本地 GPU 资源优化。已部分解决：
+  - ✅ PipelineLogger 为每个主要步骤记录耗时，写入日志文件
+  - 待完善：生成性能报告（如 `output/VIDEO_ID/performance.json`），包含各阶段耗时、并发利用率、失败重试次数
+  - 待完善：结合本地 GPU 资源（如 Whisper large-v3 CUDA 加速、TTS 本地模型 GPU 推理）优化资源分配
+  - 待完善：支持配置 GPU 使用策略（`"gpu": "auto" / "cuda" / "cpu"`）
 
 ### 🟢 低优先级 / 高难度（架构级重构）
 

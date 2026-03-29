@@ -41,6 +41,7 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
 import argparse
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -48,9 +49,123 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
+
+
+# ─── 日志系统 ──────────────────────────────────────────────────────
+class PipelineLogger:
+    """双输出日志：同时写屏幕和文件，自动记录各步骤耗时"""
+
+    def __init__(self, output_dir: Path = None):
+        self.step_timings = []        # [(step_name, elapsed_secs), ...]
+        self._step_start = None
+        self._step_name = None
+        self.log_path = None
+        self._file = None
+        self._t_start = time.time()
+
+        if output_dir:
+            self.setup_file(output_dir)
+
+    def setup_file(self, output_dir: Path):
+        """设置日志文件，在 output_dir 确定后调用"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = output_dir / f"pipeline_{ts}.log"
+        self._file = open(self.log_path, "w", encoding="utf-8")
+        self._file.write(f"# Pipeline 执行日志 - {datetime.now().isoformat()}\n\n")
+
+    def log(self, msg: str, also_print: bool = True):
+        """写日志（同时打印到屏幕）"""
+        if also_print:
+            print(msg)
+        if self._file:
+            self._file.write(msg + "\n")
+            self._file.flush()
+
+    def step_begin(self, name: str):
+        """标记步骤开始"""
+        self._finish_prev_step()
+        self._step_name = name
+        self._step_start = time.time()
+
+    def step_end(self):
+        """标记步骤结束"""
+        self._finish_prev_step()
+
+    def _finish_prev_step(self):
+        if self._step_name and self._step_start:
+            elapsed = time.time() - self._step_start
+            self.step_timings.append((self._step_name, elapsed))
+            self._step_name = None
+            self._step_start = None
+
+    def log_error(self, error_type: str, message: str, suggestion: str,
+                  exception: Exception = None):
+        """记录结构化错误：类型 + 详情 + 修复建议"""
+        sep = "=" * 60
+        lines = [
+            f"\n{sep}",
+            f"❌ 错误 [{error_type}]",
+            f"",
+            f"  问题: {message}",
+            f"",
+            f"  修复建议:",
+        ]
+        for line in suggestion.strip().split("\n"):
+            lines.append(f"    {line}")
+        if exception:
+            lines.append(f"")
+            lines.append(f"  异常详情: {type(exception).__name__}: {exception}")
+        lines.append(sep)
+        full_msg = "\n".join(lines)
+        self.log(full_msg)
+
+        # 写完整 traceback 到日志文件（不打印到屏幕）
+        if exception and self._file:
+            self._file.write(f"\n--- Traceback ---\n")
+            self._file.write(traceback.format_exc())
+            self._file.write(f"--- End Traceback ---\n\n")
+            self._file.flush()
+
+    def write_summary(self):
+        """写执行摘要（耗时统计）"""
+        self._finish_prev_step()
+        total = time.time() - self._t_start
+        lines = ["\n--- 各步骤耗时 ---"]
+        for name, secs in self.step_timings:
+            lines.append(f"  {name}: {secs:.1f}s")
+        lines.append(f"  总计: {total:.1f}s")
+        lines.append("--- End ---\n")
+        summary = "\n".join(lines)
+        # 耗时摘要只写文件，不打印屏幕（屏幕已有"处理完成"输出）
+        if self._file:
+            self._file.write(summary)
+            self._file.flush()
+
+    def close(self):
+        """关闭日志文件"""
+        self.write_summary()
+        if self._file:
+            self._file.close()
+            self._file = None
+
+
+# 全局 logger 实例，在 process_video 中初始化
+_logger: Optional[PipelineLogger] = None
+
+
+def _log(msg: str, also_print: bool = True):
+    """便捷日志函数"""
+    global _logger
+    if _logger:
+        _logger.log(msg, also_print)
+    elif also_print:
+        print(msg)
 
 # ─── 默认配置 ──────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
@@ -2188,6 +2303,7 @@ def merge_final_video(video_path: Path, dub_path: Path,
 # ─── 主流程 ────────────────────────────────────────────────────────
 async def process_video(config: dict):
     """端到端处理"""
+    global _logger
     t_start = time.time()
     skip = set(config.get("skip_steps", []))
     refine_enabled = config.get("refine", {}).get("enabled", False)
@@ -2211,15 +2327,28 @@ async def process_video(config: dict):
         print(f"\n{'='*60}")
         print(f"🎯 处理视频: {url}")
 
-    print(f"   输出目录: {output_dir}")
-    print(f"   翻译引擎: {config['translator']}"
-          + (f" ({config['llm']['model']})" if config['translator'] == 'llm' else ""))
-    print(f"   配音语音: {config['voice']}")
-    print(f"   Whisper:  {config['whisper_model']}")
+    # 初始化日志
+    _logger = PipelineLogger(output_dir)
+    _log(f"   输出目录: {output_dir}")
+    _log(f"   翻译引擎: {config['translator']}"
+         + (f" ({config['llm']['model']})" if config['translator'] == 'llm' else ""))
+    _log(f"   配音语音: {config['voice']}")
+    _log(f"   Whisper:  {config['whisper_model']}")
     if refine_enabled:
         rcfg = config["refine"]
-        print(f"   迭代优化: {rcfg['max_iterations']} 轮 (阈值 >{rcfg['speed_threshold']}x)")
-    print(f"{'='*60}\n")
+        _log(f"   迭代优化: {rcfg['max_iterations']} 轮 (阈值 >{rcfg['speed_threshold']}x)")
+    if skip:
+        _log(f"   跳过步骤: {', '.join(sorted(skip))}")
+    _log(f"{'='*60}\n")
+
+    # 记录完整配置到日志文件（脱敏）
+    safe_config = {k: ("***" if "key" in k.lower() else v)
+                   for k, v in config.items() if k != "llm"}
+    if "llm" in config:
+        safe_config["llm"] = {k: ("***" if "key" in k.lower() else v)
+                              for k, v in config["llm"].items()}
+    _logger.log(f"配置: {json.dumps(safe_config, ensure_ascii=False, indent=2)}",
+                also_print=False)
 
     # ── 清理迭代数据 ──
     if config.get("clean_iterations"):
@@ -2229,104 +2358,175 @@ async def process_video(config: dict):
     cache_file = output_dir / "segments_cache.json"
 
     # Step 1: 下载
+    _logger.step_begin("下载视频")
     video_path = output_dir / "original.mp4"
     title = "unknown"
     if "download" not in skip:
-        print(f"[1/{total_steps}] 下载视频")
+        _log(f"[1/{total_steps}] 下载视频")
         if config["resume_from"] and video_path.exists():
-            print(f"  ⏭  使用已有视频")
+            _log(f"  ⏭  使用已有视频")
             info_file = output_dir / "info.json"
             if info_file.exists():
                 title = json.load(open(info_file))["title"]
         else:
-            video_path, title = download_video(url, output_dir, config["browser"])
+            try:
+                video_path, title = download_video(url, output_dir, config["browser"])
+            except Exception as e:
+                _logger.log_error(
+                    "下载失败", f"无法下载视频: {url}",
+                    "1. 检查网络连接\n"
+                    "2. 确认 URL 是有效的 YouTube 链接\n"
+                    "3. 尝试: venv/bin/yt-dlp --cookies-from-browser chrome -F \"URL\" 查看可用格式\n"
+                    "4. 如果报 'n challenge' 错误: pip install -U \"yt-dlp[default]\"\n"
+                    "5. 如果视频有地区限制，尝试使用代理",
+                    exception=e)
+                _logger.close()
+                return
         config["video_title"] = title
-        print()
+        _log("")
     elif not video_path.exists():
-        print(f"[1/{total_steps}] 下载视频 - 跳过")
-        print(f"  ⚠️  视频文件不存在: {video_path}")
-        print(f"     从 skip_steps 移除 'download' 或手动放置视频文件")
-        print()
+        _log(f"[1/{total_steps}] 下载视频 - 跳过")
+        _log(f"  ⚠️  视频文件不存在: {video_path}")
+        _log(f"     从 skip_steps 移除 'download' 或手动放置视频文件")
+        _log("")
+    _logger.step_end()
 
     # Step 2: 提取音频
+    _logger.step_begin("提取音频")
     audio_path = output_dir / "audio.wav"
     if "extract" not in skip:
-        print(f"[2/{total_steps}] 提取音频")
+        _log(f"[2/{total_steps}] 提取音频")
         if not video_path.exists():
-            print(f"  ❌ 视频文件不存在，无法提取音频: {video_path}")
+            _logger.log_error(
+                "前置条件缺失", f"视频文件不存在，无法提取音频: {video_path}",
+                "1. 从 skip_steps 中移除 'download'，让 pipeline 先下载视频\n"
+                f"2. 或手动将视频文件放到: {video_path}")
+            _logger.close()
             return
-        audio_path = extract_audio(video_path, output_dir)
-        print()
+        try:
+            audio_path = extract_audio(video_path, output_dir)
+        except Exception as e:
+            _logger.log_error(
+                "音频提取失败", f"ffmpeg 提取音频失败",
+                "1. 确认 ffmpeg 已安装: which ffmpeg\n"
+                f"2. 检查视频文件是否完整: file {video_path}",
+                exception=e)
+            _logger.close()
+            return
+        _log("")
     elif not audio_path.exists():
-        print(f"[2/{total_steps}] 提取音频 - 跳过")
-        print(f"  ⚠️  音频文件不存在: {audio_path}")
-        print()
+        _log(f"[2/{total_steps}] 提取音频 - 跳过")
+        _log(f"  ⚠️  音频文件不存在: {audio_path}")
+        _log("")
+    _logger.step_end()
 
     # Step 3+4: 转录 + 翻译
-    # 优先加载缓存：只要 segments_cache.json 存在，就从中恢复 segments
-    # 避免因 skip_steps 包含 transcribe/translate 导致 segments 为空，
-    # 进而跳过下游所有步骤（TTS / 字幕 / 时间线对齐）
+    _logger.step_begin("转录+翻译")
     if cache_file.exists():
-        print(f"[3/{total_steps}] 语音识别" + (" - 跳过" if "transcribe" in skip else ""))
-        print(f"[4/{total_steps}] 翻译" + (" - 跳过" if "translate" in skip else ""))
-        print("  ⏭  使用缓存 (segments_cache.json)")
+        _log(f"[3/{total_steps}] 语音识别" + (" - 跳过" if "transcribe" in skip else ""))
+        _log(f"[4/{total_steps}] 翻译" + (" - 跳过" if "translate" in skip else ""))
+        _log("  ⏭  使用缓存 (segments_cache.json)")
         with open(cache_file, "r", encoding="utf-8") as f:
             segments = json.load(f)
-        print(f"     {len(segments)} 个片段已加载")
-        print()
+        _log(f"     {len(segments)} 个片段已加载")
+        _log("")
     else:
         if "transcribe" not in skip:
-            print(f"[3/{total_steps}] 语音识别 (Whisper)")
-            raw_segments = transcribe_audio(
-                output_dir / "audio.wav", config["whisper_model"],
-                config.get("whisper_beam_size", 5))
-            raw_segments = deduplicate_segments(raw_segments)
-            print()
+            _log(f"[3/{total_steps}] 语音识别 (Whisper)")
+            if not audio_path.exists():
+                _logger.log_error(
+                    "前置条件缺失", f"音频文件不存在: {audio_path}",
+                    "1. 从 skip_steps 中移除 'download' 和 'extract'\n"
+                    "2. 或手动准备音频文件")
+                _logger.close()
+                return
+            try:
+                raw_segments = transcribe_audio(
+                    output_dir / "audio.wav", config["whisper_model"],
+                    config.get("whisper_beam_size", 5))
+                raw_segments = deduplicate_segments(raw_segments)
+            except Exception as e:
+                _logger.log_error(
+                    "语音识别失败", f"Whisper 转录失败 (model={config['whisper_model']})",
+                    "1. 确认 faster-whisper 已安装: pip install faster-whisper\n"
+                    "2. 检查音频文件是否完整\n"
+                    "3. 尝试更小的模型: --whisper-model tiny",
+                    exception=e)
+                _logger.close()
+                return
+            _log("")
         else:
-            print(f"[3/{total_steps}] 语音识别 - 跳过")
+            _log(f"[3/{total_steps}] 语音识别 - 跳过")
             raw_segments = []
-            print()
+            _log("")
 
         if "translate" not in skip and raw_segments:
-            print(f"[4/{total_steps}] 翻译")
-            segments = translate_segments(raw_segments, config)
-            segments = deduplicate_segments(segments)
-            segments = merge_short_segments(segments)
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(segments, f, ensure_ascii=False, indent=2)
-            print()
+            _log(f"[4/{total_steps}] 翻译")
+            try:
+                segments = translate_segments(raw_segments, config)
+                segments = deduplicate_segments(segments)
+                segments = merge_short_segments(segments)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(segments, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                _logger.log_error(
+                    "翻译失败",
+                    f"翻译引擎 '{config['translator']}' 调用失败",
+                    ("1. 检查 LLM API Key 是否有效\n"
+                     f"2. 检查 API 地址是否可达: {config.get('llm', {}).get('api_url', 'N/A')}\n"
+                     "3. 检查网络连接\n"
+                     "4. 尝试切换翻译引擎: --translator google")
+                    if config['translator'] == 'llm' else
+                    ("1. 检查网络连接\n"
+                     "2. Google 翻译可能被墙，尝试: --translator llm"),
+                    exception=e)
+                _logger.close()
+                return
+            _log("")
         else:
-            print(f"[4/{total_steps}] 翻译 - 跳过")
+            _log(f"[4/{total_steps}] 翻译 - 跳过")
             segments = []
-            print()
+            _log("")
+    _logger.step_end()
 
     # ──────────── 前置条件检查 ────────────
-    # segments 为空时诊断原因并报错，避免后续步骤全部静默跳过
     if not segments:
         missing = []
+        fixes = []
         if "download" in skip and not video_path.exists():
-            missing.append(f"  - skip_steps 包含 'download' 但视频不存在: {video_path}")
+            missing.append(f"skip_steps 包含 'download' 但视频不存在: {video_path}")
         if "extract" in skip and not (output_dir / "audio.wav").exists():
-            missing.append(f"  - skip_steps 包含 'extract' 但音频不存在: {output_dir / 'audio.wav'}")
+            missing.append(f"skip_steps 包含 'extract' 但音频不存在: {output_dir / 'audio.wav'}")
         if "transcribe" in skip and not cache_file.exists():
-            missing.append(f"  - skip_steps 包含 'transcribe' 但缓存不存在: {cache_file}")
+            missing.append(f"skip_steps 包含 'transcribe' 但缓存不存在: {cache_file}")
         if "translate" in skip and not cache_file.exists():
-            missing.append(f"  - skip_steps 包含 'translate' 但缓存不存在: {cache_file}")
+            missing.append(f"skip_steps 包含 'translate' 但缓存不存在: {cache_file}")
 
         if missing:
-            print(f"\n{'='*60}")
-            print(f"❌ 错误: segments 为空，无法继续处理!")
-            print(f"   skip_steps 跳过了关键步骤，但对应的产出文件不存在:")
-            for m in missing:
-                print(m)
-            print(f"\n   解决方法:")
-            print(f"   1. 从 skip_steps 中移除已跳过的步骤，让 pipeline 重新执行")
-            print(f"   2. 或确保 {cache_file} 已存在（从之前的运行中保留）")
-            print(f"{'='*60}")
+            # 生成可直接使用的修复配置
+            fix_config = dict(config)
+            fix_config.pop("skip_steps", None)
+            fix_skip = [s for s in config.get("skip_steps", [])
+                        if s not in ("download", "extract", "transcribe", "translate")]
+            suggestion_lines = [
+                "这是配置问题: skip_steps 跳过了必要步骤但产出文件不存在。",
+                "",
+                "方案 A: 移除 skip_steps 中的这些项，让 pipeline 从头执行:",
+                f'  修改 config.json 中 "skip_steps" 为: {json.dumps(fix_skip) if fix_skip else "删除此字段"}',
+                "",
+                "方案 B: 如果你想从之前的运行恢复，确保 segments_cache.json 存在:",
+                f"  检查: ls {cache_file}",
+            ]
+            _logger.log_error(
+                "配置错误",
+                "segments 为空，skip_steps 跳过了关键步骤但产出文件不存在\n"
+                + "\n".join(f"  - {m}" for m in missing),
+                "\n".join(suggestion_lines))
+            _logger.close()
             return
         else:
-            # segments 为空但没有 skip 问题 → 可能视频确实没有人声
-            print(f"\n  ⚠️  未识别到任何语音片段，跳过后续处理\n")
+            _log(f"\n  ⚠️  未识别到任何语音片段，跳过后续处理\n")
+            _logger.close()
             return
 
     # ──────────── 分支: 标准 vs 迭代优化 ────────────
@@ -2334,15 +2534,18 @@ async def process_video(config: dict):
         # ── 迭代优化流程 (8步) ──
 
         # Step 5: 迭代优化翻译（纯文本，基于字符数估算，不需要 TTS）
+        _logger.step_begin("迭代优化")
         if "refine" not in skip:
-            print(f"[5/{total_steps}] 迭代优化翻译（字符估算）")
+            _log(f"[5/{total_steps}] 迭代优化翻译（字符估算）")
             segments = await run_refinement_loop(segments, output_dir, config)
-            print()
+            _log("")
+        _logger.step_end()
 
         # Step 6: 翻译定稿后一次性生成 TTS
+        _logger.step_begin("生成TTS")
         if "tts" not in skip:
-            print(f"[6/{total_steps}] 生成 TTS 片段")
-            print(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
+            _log(f"[6/{total_steps}] 生成 TTS 片段")
+            _log(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
             tts_dir = output_dir / "tts_segments"
             # 清除旧的 TTS 缓存（翻译已变更，旧文件内容可能不匹配）
             if tts_dir.exists():
@@ -2352,48 +2555,59 @@ async def process_video(config: dict):
                 segments, tts_dir, config["voice"],
                 config.get("tts_concurrency", 5),
                 config=config)
-            print()
+            _log("")
+        _logger.step_end()
 
         # Step 7: 字幕 + 时间线对齐
+        _logger.step_begin("字幕+对齐")
         if segments:
-            print(f"[7/{total_steps}] 生成字幕 + 时间线对齐")
+            _log(f"[7/{total_steps}] 生成字幕 + 时间线对齐")
             if "subtitle" not in skip:
                 generate_srt_files(segments, output_dir)
             dub_path = _align_tts_to_timeline(segments, output_dir)
-            print()
+            _log("")
+        _logger.step_end()
 
         # Step 8: 合成
+        _logger.step_begin("合成视频")
         dub_path = output_dir / "chinese_dub.wav"
         if "merge" not in skip and dub_path.exists():
-            print(f"[8/{total_steps}] 合成最终视频")
+            _log(f"[8/{total_steps}] 合成最终视频")
             final_path = merge_final_video(
                 video_path, dub_path, output_dir, config["volume"])
-            print()
+            _log("")
+        _logger.step_end()
     else:
         # ── 标准流程 (7步) ──
 
         # Step 5: 字幕
+        _logger.step_begin("生成字幕")
         if "subtitle" not in skip and segments:
-            print(f"[5/{total_steps}] 生成字幕")
+            _log(f"[5/{total_steps}] 生成字幕")
             srt_en, srt_zh, srt_bi = generate_srt_files(segments, output_dir)
-            print()
+            _log("")
+        _logger.step_end()
 
         # Step 6: 配音
+        _logger.step_begin("生成配音")
         if "tts" not in skip and segments:
-            print(f"[6/{total_steps}] 生成中文配音")
+            _log(f"[6/{total_steps}] 生成中文配音")
             dub_path = await generate_chinese_dub(
                 segments, output_dir, config["voice"],
                 config.get("tts_concurrency", 5),
                 config=config)
-            print()
+            _log("")
+        _logger.step_end()
 
         # Step 7: 合成
+        _logger.step_begin("合成视频")
         dub_path = output_dir / "chinese_dub.wav"
         if "merge" not in skip and dub_path.exists():
-            print(f"[7/{total_steps}] 合成最终视频")
+            _log(f"[7/{total_steps}] 合成最终视频")
             final_path = merge_final_video(
                 video_path, dub_path, output_dir, config["volume"])
-            print()
+            _log("")
+        _logger.step_end()
 
     # ── 重命名输出目录 ──
     final_dir = output_dir
@@ -2401,19 +2615,24 @@ async def process_video(config: dict):
         new_name = config["rename"]
         new_dir = output_dir.parent / new_name
         if new_dir.exists():
-            print(f"  ⚠️  目标目录已存在，跳过重命名: {new_dir}")
+            _log(f"  ⚠️  目标目录已存在，跳过重命名: {new_dir}")
         else:
             output_dir.rename(new_dir)
             final_dir = new_dir
-            print(f"  📁 已重命名: {output_dir.name} → {new_name}")
+            _log(f"  📁 已重命名: {output_dir.name} → {new_name}")
 
     elapsed = time.time() - t_start
-    print(f"\n{'='*60}")
-    print(f"🎉 处理完成! (耗时 {elapsed:.0f}s)")
-    print(f"   输出目录: {final_dir}")
-    print(f"   最终视频: {final_dir}/final.mp4")
-    print(f"   双语字幕: {final_dir}/subtitle_bilingual.srt")
-    print(f"{'='*60}")
+    _log(f"\n{'='*60}")
+    _log(f"🎉 处理完成! (耗时 {elapsed:.0f}s)")
+    _log(f"   输出目录: {final_dir}")
+    _log(f"   最终视频: {final_dir}/final.mp4")
+    _log(f"   双语字幕: {final_dir}/subtitle_bilingual.srt")
+    if _logger and _logger.log_path:
+        _log(f"   执行日志: {_logger.log_path}")
+    _log(f"{'='*60}")
+
+    if _logger:
+        _logger.close()
 
 
 def _url_hash(url: str) -> str:

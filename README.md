@@ -425,15 +425,6 @@ bash test.sh unit     # 仅单元测试
   - 配置支持多角色映射：`"speakers": {"narrator": "zh-CN-YunxiNeural", "character_a": "zh-CN-XiaoxiaoNeural"}`
   - 需要评估：speaker diarization 集成方案（pyannote-audio / Whisper 自带说话人分离）、跨引擎混用时的音质一致性、模块间数据流设计
 
-### 🔵 已记录 / 暂不实施
-
-- **多人声识别与差异化配音**：当前所有片段使用同一语音参数，无法区分不同说话人。目标：
-  - 基于 Whisper 或 speaker diarization（如 pyannote-audio）识别不同人物的声音片段
-  - 为不同说话人分配不同的语音参数（如 edge-tts 的 YunxiNeural / XiaoxiaoNeural 对应不同角色）
-  - 如果单一引擎的可选音色不够覆盖所有说话人，则沿 `tts_chain` 循环查找可用的不同音色进行生成（例如主角用 edge-tts YunxiNeural，配角用 edge-tts XiaoxiaoNeural，旁白用 siliconflow alex）
-  - 需要评估：speaker diarization 的准确率、跨引擎混用时音质一致性、config 中多角色语音映射的配置方式
-  - 可能涉及较大代码重构（segments 需携带 speaker_id，TTS 生成逻辑从单语音改为按角色分发），先记录不做
-
 ## 许可
 
 MIT

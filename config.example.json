@@ -22,9 +22,12 @@
     "temperature": 0.3
   },
 
-  "__TTS 引擎说明__": "可选: edge-tts(默认) / gtts / siliconflow / pyttsx3 / piper / sherpa-onnx / cosyvoice",
-  "tts_engine": "edge-tts",
-  "tts_fallback": ["gtts", "pyttsx3"],
+  "__TTS 引擎说明__": "7 个引擎各有独立语音配置，voice 字段仅影响 edge-tts",
+  "__TTS 引擎链__": "tts_chain 定义引擎优先级：第一个是主引擎，后面的按顺序做回退。也可用旧方式 tts_engine + tts_fallback",
+  "tts_chain": ["edge-tts", "gtts", "pyttsx3"],
+
+  "__voice 说明__": "此字段仅用于 edge-tts，其他引擎在各自配置段中设置语音",
+  "voice": "zh-CN-YunxiNeural",
 
   "siliconflow": {
     "__说明__": "硅基流动 CosyVoice2 云端推理（免费额度，中文音质最佳）。注册: https://cloud.siliconflow.cn",

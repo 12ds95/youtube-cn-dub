@@ -779,6 +779,11 @@ class TTSEngine:
     """TTS 引擎基类"""
     name = "base"
 
+    def resolve_voice(self, global_voice: str) -> str:
+        """返回本引擎实际使用的语音标识。
+        子类可覆盖；默认直接返回 global_voice（仅对 edge-tts 有意义）。"""
+        return global_voice
+
     async def synthesize(self, text: str, path: str, voice: str):
         """将 text 合成为音频文件，保存到 path"""
         raise NotImplementedError
@@ -786,11 +791,12 @@ class TTSEngine:
     async def synthesize_batch(self, items: List[dict], tts_dir: Path,
                                voice: str, concurrency: int = 5):
         """批量合成。items 是 [(idx, text_zh), ...]，默认实现逐个调用 synthesize"""
+        resolved_voice = self.resolve_voice(voice)
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _one(text, path):
             async with semaphore:
-                await self.synthesize(text, path, voice)
+                await self.synthesize(text, path, resolved_voice)
 
         tasks = []
         for item in items:
@@ -820,6 +826,10 @@ class GTTSEngine(TTSEngine):
     """gTTS: Google Translate TTS（免费，无需 API key）"""
     name = "gtts"
 
+    def resolve_voice(self, global_voice: str) -> str:
+        """gTTS 使用语言代码 zh-cn，忽略全局 edge-tts voice"""
+        return "zh-cn"
+
     async def synthesize(self, text: str, path: str, voice: str):
         from gtts import gTTS
         loop = asyncio.get_event_loop()
@@ -836,9 +846,13 @@ class PiperTTSEngine(TTSEngine):
     def __init__(self, model_path: str = None):
         self.model_path = model_path
 
+    def resolve_voice(self, global_voice: str) -> str:
+        """Piper 使用本地模型路径，忽略全局 edge-tts voice"""
+        return self.model_path or "zh_CN-huayan-medium"
+
     async def synthesize(self, text: str, path: str, voice: str):
         loop = asyncio.get_event_loop()
-        model = self.model_path or voice
+        model = voice  # 已由 resolve_voice 转为模型路径
         def _gen():
             import subprocess
             proc = subprocess.run(
@@ -856,6 +870,10 @@ class SherpaOnnxEngine(TTSEngine):
 
     def __init__(self, model_config: dict = None):
         self.model_config = model_config or {}
+
+    def resolve_voice(self, global_voice: str) -> str:
+        """sherpa-onnx 使用 speaker_id，忽略全局 edge-tts voice"""
+        return str(self.model_config.get("speaker_id", 0))
 
     async def synthesize(self, text: str, path: str, voice: str):
         loop = asyncio.get_event_loop()
@@ -906,11 +924,15 @@ class CosyVoiceEngine(TTSEngine):
             self._model = CosyVoice(self.model_path or "CosyVoice-300M")
         return self._model
 
+    def resolve_voice(self, global_voice: str) -> str:
+        """CosyVoice 使用中文语音角色名，忽略全局 edge-tts voice"""
+        return "中文女"
+
     async def synthesize(self, text: str, path: str, voice: str):
         loop = asyncio.get_event_loop()
         def _gen():
             model = self._load_model()
-            output = model.inference_sft(text, voice or "中文女")
+            output = model.inference_sft(text, voice)  # 已由 resolve_voice 转换
             import torchaudio
             torchaudio.save(path.replace(".mp3", ".wav"),
                             output["tts_speech"], 22050)
@@ -936,17 +958,19 @@ class SiliconFlowTTSEngine(TTSEngine):
     def __init__(self, api_key: str = None, model: str = None, voice_id: str = None):
         self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY", "")
         self.model = model or "FunAudioLLM/CosyVoice2-0.5B"
-        self.voice_id = voice_id  # 如 "FunAudioLLM/CosyVoice2-0.5B:alex"
+        self.voice_id = voice_id or "FunAudioLLM/CosyVoice2-0.5B:alex"
+
+    def resolve_voice(self, global_voice: str) -> str:
+        """SiliconFlow 使用自己的 voice_id，忽略全局 edge-tts voice"""
+        return self.voice_id
 
     async def synthesize(self, text: str, path: str, voice: str):
         import httpx
         url = "https://api.siliconflow.cn/v1/audio/speech"
-        # voice 优先级：引擎配置 > 全局 voice 参数 > 默认
-        actual_voice = self.voice_id or voice or "FunAudioLLM/CosyVoice2-0.5B:alex"
         payload = {
             "model": self.model,
             "input": text,
-            "voice": actual_voice,
+            "voice": voice,  # 已经由 resolve_voice 转换
             "response_format": "mp3",
         }
         headers = {
@@ -972,6 +996,10 @@ class Pyttsx3Engine(TTSEngine):
     def __init__(self, voice_name: str = None, rate: int = None):
         self.voice_name = voice_name  # 如 "Ting-Ting", "Mei-Jia"
         self.rate = rate or 180  # 默认语速
+
+    def resolve_voice(self, global_voice: str) -> str:
+        """pyttsx3 使用系统语音名，忽略全局 edge-tts voice"""
+        return self.voice_name or "auto"
 
     async def synthesize(self, text: str, path: str, voice: str):
         loop = asyncio.get_event_loop()
@@ -1063,17 +1091,34 @@ async def _generate_tts_segments(
     voice: str = "zh-CN-YunxiNeural", concurrency: int = 5,
     config: dict = None,
 ):
-    """阶段 A: 生成 TTS .mp3 文件（支持多引擎 + fallback）"""
+    """阶段 A: 生成 TTS .mp3 文件（支持多引擎 + fallback）
+    
+    引擎链优先级：
+      1. tts_chain: ["siliconflow", "edge-tts", "gtts", "pyttsx3"]  ← 完全自定义顺序
+      2. tts_engine + tts_fallback: 主引擎 + 回退列表（兼容旧配置）
+    """
     tts_dir.mkdir(exist_ok=True)
     config = config or {}
 
-    engine = _create_tts_engine(config)
-    fallback_names = config.get("tts_fallback", [])
-    if isinstance(fallback_names, str):
-        fallback_names = [fallback_names]
+    # ── 解析引擎链 ──
+    tts_chain = config.get("tts_chain", None)
+    if tts_chain:
+        # 新方式：用户完全自定义引擎顺序
+        if isinstance(tts_chain, str):
+            tts_chain = [tts_chain]
+        primary_name = tts_chain[0]
+        fallback_names = tts_chain[1:]
+        # 覆盖 config 的 tts_engine 以便 _create_tts_engine 正确工作
+        engine = _create_tts_engine({**config, "tts_engine": primary_name})
+    else:
+        # 兼容旧方式：tts_engine + tts_fallback
+        engine = _create_tts_engine(config)
+        fallback_names = config.get("tts_fallback", [])
+        if isinstance(fallback_names, str):
+            fallback_names = [fallback_names]
 
-    print(f"     TTS 引擎: {engine.name}" +
-          (f" (fallback: {', '.join(fallback_names)})" if fallback_names else ""))
+    chain_desc = " → ".join([engine.name] + list(fallback_names))
+    print(f"     TTS 引擎链: {chain_desc}")
 
     # 收集需要生成的片段
     pending = []
@@ -1125,7 +1170,8 @@ async def _generate_tts_segments(
             if p.exists():
                 p.unlink()
             try:
-                await retry_engine.synthesize(item["text_zh"], str(p), voice)
+                resolved = retry_engine.resolve_voice(voice)
+                await retry_engine.synthesize(item["text_zh"], str(p), resolved)
             except Exception:
                 # 写入空文件以便下一轮检测
                 p.touch()

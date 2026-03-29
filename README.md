@@ -58,15 +58,15 @@ bash run.sh --config config.json
 ### 常用参数
 
 ```bash
-# 选择中文语音
+# 选择中文语音（仅影响 edge-tts 引擎）
 --voice zh-CN-YunxiNeural        # 男声（默认）
 --voice zh-CN-XiaoxiaoNeural     # 女声
 --voice zh-CN-YunyangNeural      # 男声（播报风格）
 
 # Whisper 模型（精度 vs 速度）
---whisper-model tiny              # 最快，精度一般
---whisper-model small             # 推荐（默认）
---whisper-model medium            # 最精确，较慢
+--whisper-model tiny              # 最快，精度一般（~75MB）
+--whisper-model small             # 推荐（默认，~500MB）
+--whisper-model medium            # 最精确，较慢（~1.5GB）
 
 # 原声背景音量（0.0=静音，1.0=原始）
 --volume 0.2
@@ -75,9 +75,26 @@ bash run.sh --config config.json
 --rename "线性代数精讲"
 ```
 
+## 配置文件详解
+
+所有配置项都可以在 `config.json` 中设置。复制 `config.example.json` 为 `config.json` 后按需修改，所有字段均为可选，未设置的使用默认值。配置优先级：命令行参数 > config.json > 默认值。
+
+### 基础参数
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `url` | string | null | YouTube 视频 URL（与 `resume_from` 二选一） |
+| `output` | string | `"output"` | 输出根目录，每个视频存入 `output/<video_id>/` |
+| `voice` | string | `"zh-CN-YunxiNeural"` | edge-tts 语音（仅影响 edge-tts 引擎，其他引擎有各自配置） |
+| `whisper_model` | string | `"small"` | Whisper 模型：`tiny` / `small` / `medium` |
+| `volume` | float | `0.15` | 原声背景音量混入比例：0.0=静音，1.0=原始音量 |
+| `browser` | string | `"chrome"` | yt-dlp 读取 cookies 的浏览器：chrome / firefox / edge / safari |
+| `rename` | string | null | 处理完成后重命名输出目录 |
+| `resume_from` | string | null | 从已有输出目录断点续跑（如 `"output/f09d1957a98"`） |
+
 ### LLM 翻译配置
 
-支持所有 OpenAI 兼容 API。在 `config.json` 中配置：
+支持所有 OpenAI 兼容 API（DeepSeek、Qwen、Moonshot、GPT 等）。当 `translator` 设为 `"llm"` 或 `refine.enabled` 为 true 时需要配置。LLM 翻译失败会自动降级为 Google Translate（回退链：LLM 批量 → LLM 逐条重试 → Google → 保留原文）。
 
 ```json
 {
@@ -93,23 +110,47 @@ bash run.sh --config config.json
 }
 ```
 
-`style` 字段可选，设置后会影响翻译风格。常用值：`"口语化"`、`"正式"`、`"学术"`。留空则使用默认风格。
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `llm.api_url` | string | `"https://api.deepseek.com/v1"` | API 端点 URL |
+| `llm.api_key` | string | `""` | API 密钥（也可用 `--llm-api-key` 命令行传入） |
+| `llm.model` | string | `"deepseek-chat"` | 模型名称 |
+| `llm.system_prompt` | string | *(内置翻译 prompt)* | 翻译 system prompt（一般无需修改） |
+| `llm.batch_size` | int | `15` | 每批翻译的句子数（过大可能导致对齐问题） |
+| `llm.temperature` | float | `0.3` | 生成温度：0.0=确定性，1.0=多样性 |
+| `llm.style` | string | `""` | 翻译风格：`""` / `"口语化"` / `"正式"` / `"学术"` |
 
-命令行参数可覆盖配置文件中的值。如果 LLM 调用失败，会自动降级为 Google Translate。
+### TTS 配音引擎
 
-### TTS 引擎配置
-
-支持 7 个 TTS 引擎，可在 `config.json` 中通过 `tts_chain` 自定义引擎优先级。单引擎失败时整体回退到下一个引擎重新生成全部片段，保证语音一致。
+支持 7 个 TTS 引擎，通过 `tts_chain` 定义引擎优先级链。单引擎失败时整体回退到下一个引擎重新生成全部片段，保证语音一致性。远程引擎自动阶梯降并发重试（正常→半→1，连续 3 轮无改善才放弃），本地引擎失败即放弃。切换引擎前自动备份到 `tts_backup_{engine}/`，支持从 `tts_failure.json` 断点恢复。
 
 | 引擎 | 类型 | 中文质量 | 需要 | 说明 |
 |------|------|---------|------|------|
-| `edge-tts` | 在线免费 | 优秀 | 网络 | 默认引擎，微软免费 API，6 个中文音色 |
-| `siliconflow` | 在线免费 | 最佳 | API Key | 硅基流动 CosyVoice2，注册送额度 |
-| `gtts` | 在线免费 | 良好 | 网络 | Google Translate TTS，单音色 |
-| `pyttsx3` | 离线免费 | 一般 | 无 | 系统自带 TTS，零依赖终极兜底 |
-| `piper` | 离线免费 | 良好 | 下载模型(~70MB) | ONNX 推理，CPU 友好 |
-| `sherpa-onnx` | 离线免费 | 良好 | 下载模型(~110MB) | MeloTTS 中英混合模型，CPU 友好 |
+| `edge-tts` | 远程免费 | 优秀 | 网络 | 默认引擎，微软免费 API，6+ 中文音色 |
+| `siliconflow` | 远程免费 | 最佳 | API Key | 硅基流动 CosyVoice2，注册送额度 |
+| `gtts` | 远程免费 | 良好 | 网络 | Google Translate TTS，单音色 |
+| `pyttsx3` | 本地离线 | 一般 | 无 | 系统自带 TTS，零依赖终极兜底 |
+| `piper` | 本地离线 | 良好 | 下载模型(~70MB) | ONNX 推理，CPU 友好 |
+| `sherpa-onnx` | 本地离线 | 良好 | 下载模型(~110MB) | MeloTTS 中英混合模型，CPU 友好 |
 | `cosyvoice` | 本地部署 | 最佳 | GPU | 阿里开源，支持声音克隆 |
+
+每个引擎有独立的语音配置（通过 `resolve_voice()` 方法），`voice` 字段仅影响 edge-tts，其他引擎会忽略它并使用各自的配置。
+
+**`tts_chain` 推荐配置：**
+
+```bash
+# 纯在线（最省事，默认推荐）
+"tts_chain": ["edge-tts", "gtts", "pyttsx3"]
+
+# 在线优先 + 离线兜底
+"tts_chain": ["edge-tts", "gtts", "piper", "pyttsx3"]
+
+# 最佳音质优先（需 SiliconFlow API Key）
+"tts_chain": ["siliconflow", "edge-tts", "pyttsx3"]
+
+# 纯离线（完全无需网络，需先下载模型）
+"tts_chain": ["piper", "sherpa-onnx", "pyttsx3"]
+```
 
 **edge-tts 可选中文语音**（`voice` 字段，仅影响 edge-tts）：
 
@@ -122,14 +163,7 @@ bash run.sh --config config.json
 | `zh-CN-XiaoyiNeural` | 女 | 活泼 |
 | `zh-CN-YunxiaNeural` | 男 | 偏年轻 |
 
-配置示例（`tts_chain` 定义引擎优先级，第一个是主引擎，后面的按顺序整体回退）：
-
-```json
-{
-  "tts_chain": ["edge-tts", "gtts", "pyttsx3"],
-  "voice": "zh-CN-YunxiNeural"
-}
-```
+**各引擎专属配置：**
 
 使用 SiliconFlow CosyVoice2（注册 https://cloud.siliconflow.cn 获取免费 API Key）：
 
@@ -144,7 +178,13 @@ bash run.sh --config config.json
 }
 ```
 
-使用本地离线引擎（需先下载模型，见下方）：
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `siliconflow.api_key` | `""` | 硅基流动 API Key |
+| `siliconflow.model` | `"FunAudioLLM/CosyVoice2-0.5B"` | 模型 ID |
+| `siliconflow.voice` | `"...CosyVoice2-0.5B:alex"` | 音色：alex / benjamin / charles / cosmo |
+
+使用本地离线引擎（需先下载模型）：
 
 ```json
 {
@@ -158,11 +198,42 @@ bash run.sh --config config.json
 }
 ```
 
-`pyttsx3` 离线兜底需 macOS 中文语音包（系统设置 → 辅助功能 → 朗读内容 → 管理声音 → 下载 Ting-Ting）。
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `piper.model_path` | null | Piper 模型路径（`bash download_model.sh piper` 下载） |
+| `sherpa_onnx.model` | `""` | sherpa-onnx 模型文件路径 |
+| `sherpa_onnx.lexicon` | `""` | 词典文件路径 |
+| `sherpa_onnx.tokens` | `""` | tokens 文件路径 |
+| `sherpa_onnx.dict_dir` | `""` | 词典目录（可选） |
+| `sherpa_onnx.speaker_id` | `0` | 说话人 ID（多人模型时选择） |
+| `cosyvoice.model_path` | null | CosyVoice 模型路径（需 GPU） |
+
+`pyttsx3` 离线兜底需 macOS 中文语音包（系统设置 → 辅助功能 → 朗读内容 → 管理声音 → 下载 Ting-Ting）：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `pyttsx3.voice_name` | null | 系统语音名：`"Ting-Ting"` / `"Mei-Jia"` / null=自动查找中文 |
+| `pyttsx3.rate` | `180` | 语速 (words per minute) |
+
+### 性能选项
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `tts_concurrency` | int | `5` | TTS 并发数（远程引擎失败时自动阶梯降并发） |
+| `whisper_beam_size` | int | `5` | Whisper beam search 大小（越大越精确但越慢） |
+| `skip_steps` | list | `[]` | 跳过指定步骤：`download` / `transcribe` / `translate` / `subtitle` / `tts` / `merge` |
 
 ### 迭代优化
 
-当中文翻译比英文原文长时，TTS 配音需要加速播放以匹配时间线。迭代优化功能会自动检测加速过大的片段，调用 LLM 精简翻译后重新生成：
+当中文翻译比英文原文长时，TTS 配音需要加速播放以匹配时间线。迭代优化功能会自动检测加速过大的片段，调用 LLM 精简翻译后重新生成。需要配置 `llm.api_key`。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `refine.enabled` | bool | `false` | 是否启用迭代优化 |
+| `refine.max_iterations` | int | `5` | 单次运行最大迭代轮次（收敛后 early stop） |
+| `refine.speed_threshold` | float | `1.25` | 加速倍率阈值：>1.25x 即触发精简（1.0=原速，1.5x 已很明显） |
+| `refine.resume_iteration` | int | null | 从第 N 轮迭代恢复（大循环断点续跑） |
+| `clean_iterations` | bool | `false` | 清理 `iterations/` 目录后重新优化 |
 
 ```bash
 # LLM 翻译 + 3 轮迭代优化

@@ -11,26 +11,26 @@ import inspect
 
 
 def test_retry_has_multiple_rounds():
-    """_generate_tts_segments 应有多轮重试（而非单轮）"""
-    from pipeline import _generate_tts_segments
-    source = inspect.getsource(_generate_tts_segments)
-    assert 'max_retry_rounds' in source, \
-        "_generate_tts_segments 应包含 max_retry_rounds 多轮重试"
+    """智能重试应支持多轮重试（远程引擎连续无改善才放弃）"""
+    from pipeline import _smart_retry_engine
+    source = inspect.getsource(_smart_retry_engine)
+    assert 'no_improve_count' in source or 'retry_round' in source, \
+        "_smart_retry_engine 应包含多轮重试逻辑"
 
 
 def test_retry_has_lower_concurrency():
-    """重试时应降低并发数"""
-    from pipeline import _generate_tts_segments
-    source = inspect.getsource(_generate_tts_segments)
-    # 重试时用独立的 semaphore，并发更低
-    assert 'retry_sem' in source or 'Semaphore(2)' in source, \
+    """远程引擎重试时应降低并发数"""
+    from pipeline import _smart_retry_engine
+    source = inspect.getsource(_smart_retry_engine)
+    # 远程引擎: 阶梯降并发 → concurrency // 2 → 1
+    assert 'concurrency // 2' in source or 'retry_c = 1' in source, \
         "重试时应使用更低的并发限制"
 
 
 def test_retry_has_backoff():
     """重试间应有递增间隔（backoff）"""
-    from pipeline import _generate_tts_segments
-    source = inspect.getsource(_generate_tts_segments)
+    from pipeline import _smart_retry_engine
+    source = inspect.getsource(_smart_retry_engine)
     assert 'sleep' in source, "重试间应有 sleep 间隔"
 
 

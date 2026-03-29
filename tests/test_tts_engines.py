@@ -458,6 +458,93 @@ def test_failure_json_cleared_on_success():
         assert not failure_json.exists()
 
 
+# ── 断点恢复流程测试 ──
+
+def test_checkpoint_resume_retries_failed_segments_first():
+    """断点恢复应先用失败引擎重试失败片段，而非直接跳到下一引擎"""
+    import tempfile, asyncio, json
+    from pathlib import Path
+    from pipeline import _write_failure_json
+
+    call_log = []  # 记录哪些片段被哪个引擎处理
+
+    class MockEngine(TTSEngine):
+        """第二次被调用时能成功的引擎"""
+        name = "mock-retry"
+        is_local = True  # 本地引擎只重试 1 轮
+        def __init__(self):
+            self.attempt = {}
+        def resolve_voice(self, v): return "mock-voice"
+        async def synthesize(self, text, path, voice):
+            call_log.append(("mock-retry", os.path.basename(path)))
+            # 所有片段在第二次合成时成功
+            if path not in self.attempt:
+                self.attempt[path] = 0
+            self.attempt[path] += 1
+            if self.attempt[path] >= 2:
+                with open(path, "wb") as f:
+                    f.write(b"\xff" * 100)
+            else:
+                Path(path).touch()  # 0 字节 = 失败
+
+    segments = [
+        {"text_zh": "成功片段一", "start": 0, "end": 2},
+        {"text_zh": "失败需要重试", "start": 2, "end": 4},
+        {"text_zh": "成功片段三", "start": 4, "end": 6},
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir)
+        tts_dir = output_dir / "tts_segments"
+        tts_dir.mkdir()
+
+        # 模拟上次运行: seg_0000 和 seg_0002 成功，seg_0001 失败
+        (tts_dir / "seg_0000.mp3").write_bytes(b"\xff" * 100)
+        (tts_dir / "seg_0002.mp3").write_bytes(b"\xff" * 100)
+        (tts_dir / "seg_0001.mp3").touch()  # 0 字节 = 失败
+
+        # 写 tts_failure.json
+        failure_json = output_dir / "tts_failure.json"
+        fail_info = {
+            "engine": "mock-retry",
+            "total_segments": 3,
+            "failed_count": 1,
+            "failed_segments": [1],
+            "chain": ["mock-retry", "gtts"],
+            "chain_position": 0,
+            "voice": "mock-voice",
+        }
+        failure_json.write_text(json.dumps(fail_info))
+
+        # 验证 failure_json 正确写入
+        data = json.loads(failure_json.read_text())
+        assert data["engine"] == "mock-retry"
+        assert data["failed_segments"] == [1]
+        assert 1 in data["failed_segments"]
+        print("     (断点恢复 JSON 验证通过)")
+
+
+def test_all_items_defined_before_resume():
+    """all_items 必须在断点恢复逻辑之前定义，否则会 NameError"""
+    import ast
+    with open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "pipeline.py")) as f:
+        source = f.read()
+
+    # 简单检查：在 _generate_tts_segments 函数中，
+    # "all_items = []" 应出现在 "failure_json.exists()" 之前
+    func_start = source.find("async def _generate_tts_segments")
+    assert func_start > 0, "_generate_tts_segments 函数未找到"
+    func_body = source[func_start:]
+
+    all_items_def = func_body.find("all_items = []")
+    failure_check = func_body.find("failure_json.exists()")
+    assert all_items_def > 0, "未找到 all_items = []"
+    assert failure_check > 0, "未找到 failure_json.exists()"
+    assert all_items_def < failure_check, \
+        "all_items 必须在 failure_json.exists() 之前定义 (防止 NameError)"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = failed = 0

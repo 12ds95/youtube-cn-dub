@@ -54,49 +54,91 @@ from typing import List, Tuple, Optional, Dict, Any
 
 # ─── 默认配置 ──────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
-    "url": None,
-    "output": "output",
-    "voice": "zh-CN-YunxiNeural",
-    "whisper_model": "small",
-    "volume": 0.15,
-    "browser": "chrome",
-    "rename": None,
-    "resume_from": None,
+    # ── 基础参数 ──
+    "url": None,                     # YouTube 视频 URL（与 resume_from 二选一）
+    "output": "output",              # 输出根目录，每个视频存入 output/<video_id>/
+    "voice": "zh-CN-YunxiNeural",    # edge-tts 语音（仅影响 edge-tts 引擎，其他引擎有各自配置）
+                                     # 可选: YunxiNeural(默认男) / YunjianNeural(硬朗男) /
+                                     #        YunyangNeural(播音男) / XiaoxiaoNeural(温柔女) /
+                                     #        XiaoyiNeural(活泼女) / YunxiaNeural(年轻男)
+    "whisper_model": "small",        # Whisper 语音识别模型: tiny(75MB快) / small(500MB 推荐) / medium(1.5GB 精确)
+    "volume": 0.15,                  # 原声背景音量混入比例: 0.0=静音 / 0.15=默认 / 1.0=原始音量
+    "browser": "chrome",             # yt-dlp 读取 cookies 的浏览器: chrome / firefox / edge / safari
+    "rename": None,                  # 处理完成后重命名输出目录（如 "线性代数精讲"）
+    "resume_from": None,             # 从已有输出目录断点续跑（如 "output/f09d1957a98"）
 
-    # 翻译引擎: "google" 或 "llm"
-    "translator": "google",
-    # LLM 翻译配置（当 translator="llm" 时生效）
-    "llm": {
-        "api_url": "https://api.deepseek.com/v1",
-        "api_key": "",
-        "model": "deepseek-chat",
-        "system_prompt": (
+    # ── 翻译引擎 ──
+    "translator": "google",          # 翻译引擎: "google"(免费) 或 "llm"(质量更好，需 API Key)
+    "llm": {                         # LLM 翻译配置（translator="llm" 或 refine.enabled=true 时生效）
+                                     # 支持所有 OpenAI 兼容 API: DeepSeek / Qwen / Moonshot / GPT 等
+        "api_url": "https://api.deepseek.com/v1",  # API 端点 URL
+        "api_key": "",               # API 密钥（也可用 --llm-api-key 命令行传入）
+        "model": "deepseek-chat",    # 模型名称
+        "system_prompt": (           # 翻译 system prompt（一般无需修改）
             "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。"
             "要求：1)翻译准确流畅，符合中文表达习惯；"
             "2)保持技术术语的专业性；"
             "3)翻译要适合做视频配音朗读，语句通顺自然；"
             "4)只输出翻译结果，不要解释。"
         ),
-        "batch_size": 15,
-        "temperature": 0.3,
-        "style": "",  # 翻译风格: "" (默认), "口语化", "正式", "学术" 等
+        "batch_size": 15,            # 每批翻译的句子数（过大可能导致对齐问题）
+        "temperature": 0.3,          # 生成温度: 0.0=确定性 / 0.3=推荐 / 1.0=多样性
+        "style": "",                 # 翻译风格: ""(默认) / "口语化" / "正式" / "学术" 等
     },
 
-    # 性能选项
-    "tts_concurrency": 5,        # TTS 并发数
-    "whisper_beam_size": 5,      # Whisper beam search 大小
-    "skip_steps": [],            # 跳过的步骤: ["download","transcribe","translate","subtitle","tts","merge"]
+    # ── TTS 配音引擎 ──
+    #   tts_chain: 引擎优先级链（推荐方式），第一个为主引擎，后面按顺序整体回退
+    #   也可用旧方式: tts_engine(主) + tts_fallback(回退列表)
+    #   各引擎有独立语音配置（voice 字段仅影响 edge-tts），详见各引擎 resolve_voice()
+    #   引擎分类:
+    #     远程: edge-tts(免费), gtts(免费), siliconflow(免费额度)
+    #     本地: pyttsx3(零依赖), piper(需下载~70MB), sherpa-onnx(需下载~110MB), cosyvoice(需GPU)
+    "tts_chain": None,               # 引擎优先链: 如 ["edge-tts", "gtts", "pyttsx3"]
+                                     # 为 null 时使用 tts_engine + tts_fallback 组合
+    "tts_engine": "edge-tts",        # 主 TTS 引擎（tts_chain 为空时生效）
+    "tts_fallback": [],              # 回退引擎列表（tts_chain 为空时生效）
 
-    # 迭代优化（翻译过长时自动精简）
-    # 小循环（自动）：测量→精简→重TTS→再测量→仍超速则继续精简，直到收敛
-    # 大循环（人工）：人工审听后决定是否再跑一轮，用 --resume-iteration 断点续跑
+    # 各 TTS 引擎专属配置（仅使用对应引擎时需要）
+    "siliconflow": {                 # 硅基流动 CosyVoice2（注册 https://cloud.siliconflow.cn 送额度）
+        "api_key": "",               # 硅基流动 API Key
+        "model": "FunAudioLLM/CosyVoice2-0.5B",   # 模型 ID
+        "voice": "FunAudioLLM/CosyVoice2-0.5B:alex",  # 音色: alex / benjamin / charles / cosmo
+    },
+    "pyttsx3": {                     # 系统自带 TTS（完全离线，macOS=NSSpeech / Windows=SAPI5）
+                                     # macOS 需先下载中文语音: 系统设置 → 辅助功能 → 朗读内容 → 管理声音
+        "voice_name": None,          # 系统语音名: "Ting-Ting"(普通话女) / "Mei-Jia"(台湾女) / null=自动查找中文
+        "rate": 180,                 # 语速 (words per minute)
+    },
+    "piper": {                       # Piper 本地 ONNX TTS（需 bash download_model.sh piper 下载模型）
+        "model_path": None,          # 模型路径: 如 "models/piper/zh_CN-huayan-medium.onnx"
+    },
+    "sherpa_onnx": {                 # sherpa-onnx MeloTTS（需 bash download_model.sh sherpa 下载模型）
+        "model": "",                 # 模型文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/model.onnx"
+        "lexicon": "",               # 词典文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/lexicon.txt"
+        "tokens": "",                # tokens 文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/tokens.txt"
+        "dict_dir": "",              # 词典目录（可选）
+        "speaker_id": 0,             # 说话人 ID（多人模型时选择）
+    },
+    "cosyvoice": {                   # CosyVoice 阿里开源 TTS（需 GPU + 本地部署）
+        "model_path": None,          # 模型路径: 如 "CosyVoice-300M"
+    },
+
+    # ── 性能选项 ──
+    "tts_concurrency": 5,            # TTS 并发数（远程引擎失败时会自动阶梯降并发）
+    "whisper_beam_size": 5,          # Whisper beam search 大小（越大越精确但越慢）
+    "skip_steps": [],                # 跳过指定步骤: ["download","transcribe","translate","subtitle","tts","merge"]
+
+    # ── 迭代优化（翻译过长时自动精简）──
+    #   小循环（自动）：字符估算语速 → LLM 精简过长翻译 → 再估算 → 仍超速则继续精简，直到收敛
+    #   大循环（人工）：人工审听后决定是否再跑一轮，用 --resume-iteration 断点续跑
+    #   需要 LLM API（同 translator="llm" 的配置）
     "refine": {
-        "enabled": False,          # 是否启用
-        "max_iterations": 5,       # 小循环最大迭代轮次
-        "speed_threshold": 1.25,   # 加速倍率阈值（>1.25x 即触发精简，1.5x 已很明显）
-        "resume_iteration": None,  # 从第 N 轮迭代恢复（大循环断点续跑）
+        "enabled": False,            # 是否启用迭代优化
+        "max_iterations": 5,         # 单次运行最大迭代轮次（收敛后 early stop）
+        "speed_threshold": 1.25,     # 加速倍率阈值: >1.25x 即触发精简（1.0=原速, 1.5x 已很明显）
+        "resume_iteration": None,    # 从第 N 轮迭代恢复（大循环断点续跑）
     },
-    "clean_iterations": False,     # 清理迭代中间数据
+    "clean_iterations": False,       # 清理迭代中间数据（iterations/ 目录）后重新优化
 }
 
 
@@ -1128,27 +1170,7 @@ async def _generate_tts_segments(
     if not chain_names:
         chain_names = ["edge-tts"]
 
-    # ── 断点恢复：跳过上次已失败的引擎 ──
-    start_idx = 0
-    if failure_json.exists():
-        try:
-            with open(failure_json) as f:
-                prev = json.load(f)
-            failed_engine = prev.get("engine")
-            if failed_engine in chain_names:
-                skip_to = chain_names.index(failed_engine) + 1
-                if skip_to < len(chain_names):
-                    start_idx = skip_to
-                    print(f"     📋 检测到上次失败记录 (引擎={failed_engine},"
-                          f" 失败={len(prev.get('failed_segments',[]))}个)，"
-                          f"从 [{chain_names[start_idx]}] 继续")
-        except Exception:
-            pass
-
-    chain_desc = " → ".join(chain_names[start_idx:])
-    print(f"     TTS 引擎链: {chain_desc}")
-
-    # 收集所有需要合成的片段
+    # 收集所有需要合成的片段（必须在断点恢复前构建，resume 逻辑依赖 all_items）
     all_items = []
     for idx, seg in enumerate(segments):
         text_zh = seg.get("text_zh", seg.get("text", ""))
@@ -1158,6 +1180,30 @@ async def _generate_tts_segments(
     if not all_items:
         print(f"     无需生成 TTS 片段")
         return
+
+    # ── 断点恢复：先用上次失败引擎重试失败片段 ──
+    start_idx = 0
+    resume_retry_only = False  # True=仅重试失败片段，不全量生成
+    resume_items = None
+    if failure_json.exists():
+        try:
+            with open(failure_json) as f:
+                prev = json.load(f)
+            failed_engine = prev.get("engine")
+            failed_segs = set(prev.get("failed_segments", []))
+            if failed_engine in chain_names and failed_segs:
+                start_idx = chain_names.index(failed_engine)
+                resume_retry_only = True
+                # 只重试上次记录的失败片段
+                resume_items = [item for item in all_items
+                                if item["idx"] in failed_segs]
+                print(f"     📋 断点恢复: 上次 [{failed_engine}] 有"
+                      f" {len(resume_items)} 个片段失败，先重试这些片段...")
+        except Exception:
+            pass
+
+    chain_desc = " → ".join(chain_names[start_idx:])
+    print(f"     TTS 引擎链: {chain_desc}")
 
     # 检查是否已有完整缓存
     cached_count = sum(1 for item in all_items
@@ -1186,17 +1232,65 @@ async def _generate_tts_segments(
         engine = _create_tts_engine({**config, "tts_engine": eng_name})
         resolved_voice = engine.resolve_voice(voice)
 
-        if eng_pos > start_idx or (start_idx > 0 and eng_pos == start_idx):
-            # 整体回退：备份 → 清空
-            backup_dir = tts_dir.parent / f"tts_backup_{chain_names[max(0,eng_pos-1)]}"
-            if eng_pos > start_idx:
-                # 有上一个引擎的产出需要备份
-                _backup_tts(tts_dir, backup_dir, all_items)
-                print(f"     🔄 整体回退到 [{engine.name}]"
-                      f"（上轮备份在 {backup_dir.name}/）")
+        # ── 断点恢复首轮：仅重试上次失败的片段 ──
+        if resume_retry_only and eng_pos == start_idx and resume_items:
+            print(f"     [{engine.name}] 断点重试 {len(resume_items)} 个失败片段"
+                  f" (voice={resolved_voice})...")
+            # 清掉失败片段的残留（0字节或静音占位）
+            for item in resume_items:
+                p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+                if p.exists():
+                    p.unlink()
+            await engine.synthesize_batch(resume_items, tts_dir, voice, concurrency)
+
+            # 对失败片段做智能重试
+            def _count_resume_failed():
+                return [item for item in resume_items
+                        if not (tts_dir / f"seg_{item['idx']:04d}.mp3").exists()
+                        or (tts_dir / f"seg_{item['idx']:04d}.mp3").stat().st_size == 0]
+            await _smart_retry_engine(engine, _count_resume_failed, tts_dir,
+                                      voice, concurrency)
+
+            # 检查断点重试结果（用 _count_failed 检查全量，而非仅 resume 片段）
+            still_failed_resume = _count_resume_failed()
+            overall_failed = _count_failed()
+            if not overall_failed:
+                success_engine = engine.name
+                print(f"     ✅ [{engine.name}] 断点重试成功，"
+                      f"全部 {len(all_items)} 个片段完整")
+                if failure_json.exists():
+                    failure_json.unlink()
+                break
+            elif not still_failed_resume and overall_failed:
+                # resume 片段全成功，但有其他片段缺失 → 走正常全量补齐
+                print(f"     [{engine.name}] 断点重试片段已恢复，"
+                      f"但仍有 {len(overall_failed)} 个其他片段缺失，继续补齐...")
+                resume_retry_only = False
+                # 不 continue，直接往下走正常全量流程
             else:
-                # 断点恢复：清空残留（上次失败引擎的碎片）
-                print(f"     🔄 断点恢复: 清空残留，用 [{engine.name}] 全量重新生成...")
+                print(f"     [{engine.name}] 断点重试后仍有"
+                      f" {len(still_failed_resume)} 个片段失败，"
+                      f"继续下一个引擎...")
+                resume_retry_only = False  # 后续走正常全量流程
+                # 不 continue —— 下面的 eng_pos > start_idx 判断会处理整体回退
+                eng_pos_next = eng_pos + 1
+                if eng_pos_next >= len(chain_names):
+                    # 写失败 JSON 并退出循环
+                    _write_failure_json(failure_json, engine, all_items,
+                                        still_failed_resume, chain_names,
+                                        eng_pos, resolved_voice)
+                    print(f"     ❌ [{engine.name}] 仍有"
+                          f" {len(still_failed_resume)} 个片段失败"
+                          f"，引擎链已用尽  (详见 {failure_json.name})")
+                continue
+
+        if eng_pos > start_idx or (resume_retry_only is False and eng_pos == start_idx and eng_pos > 0):
+            # 整体回退：备份 → 清空
+            prev_eng = chain_names[eng_pos - 1] if eng_pos > 0 else "unknown"
+            backup_dir = tts_dir.parent / f"tts_backup_{prev_eng}"
+            _backup_tts(tts_dir, backup_dir, all_items)
+            print(f"     🔄 整体回退到 [{engine.name}]"
+                  f"（上轮备份在 {backup_dir.name}/）")
             for item in all_items:
                 p = tts_dir / f"seg_{item['idx']:04d}.mp3"
                 if p.exists():
@@ -1212,60 +1306,8 @@ async def _generate_tts_segments(
             await engine.synthesize_batch(pending, tts_dir, voice, concurrency)
 
         # ── 智能重试 ──
-        # 远程引擎：逐步降并发，到 1 后持续重试，连续 3 轮无改善才放弃
-        # 本地引擎：失败就是真失败，不需要多轮重试
-        if engine.is_local:
-            # 本地引擎：1 轮低并发重试即可
-            failed = _count_failed()
-            if failed:
-                print(f"     [{engine.name}] 本地引擎重试: {len(failed)} 个失败片段...")
-                for item in failed:
-                    p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-                    if p.exists():
-                        p.unlink()
-                await engine.synthesize_batch(failed, tts_dir, voice, 1)
-        else:
-            # 远程引擎：阶梯式降并发 + 并发=1 后持续重试
-            no_improve_count = 0
-            prev_fail_count = len(_count_failed())
-            retry_round = 0
-
-            while True:
-                failed = _count_failed()
-                if not failed:
-                    break
-
-                cur_fail_count = len(failed)
-
-                # 阶梯降并发: 正常→半→1
-                if retry_round == 0:
-                    retry_c = max(1, concurrency // 2)
-                else:
-                    retry_c = 1
-
-                # 并发=1 阶段：检查是否有改善
-                if retry_c == 1 and retry_round > 0:
-                    if cur_fail_count >= prev_fail_count:
-                        no_improve_count += 1
-                    else:
-                        no_improve_count = 0  # 有改善，重置计数
-                    if no_improve_count >= 3:
-                        print(f"     [{engine.name}] 连续 3 轮无改善"
-                              f" (仍有 {cur_fail_count} 个失败)，放弃当前引擎")
-                        break
-
-                prev_fail_count = cur_fail_count
-                retry_round += 1
-                print(f"     [{engine.name}] 重试第{retry_round}轮:"
-                      f" {cur_fail_count} 个失败, 并发={retry_c}"
-                      + (f", 无改善={no_improve_count}/3" if retry_c == 1 and retry_round > 1 else "")
-                      + "...")
-                await asyncio.sleep(2 * min(retry_round, 5))
-                for item in failed:
-                    p = tts_dir / f"seg_{item['idx']:04d}.mp3"
-                    if p.exists():
-                        p.unlink()
-                await engine.synthesize_batch(failed, tts_dir, voice, retry_c)
+        await _smart_retry_engine(engine, _count_failed, tts_dir, voice,
+                                  concurrency)
 
         # 检查最终结果
         final_failed = _count_failed()
@@ -1277,20 +1319,9 @@ async def _generate_tts_segments(
                 failure_json.unlink()
             break
         else:
-            # 写失败状态 JSON（用于断点恢复）
-            fail_info = {
-                "engine": engine.name,
-                "total_segments": len(all_items),
-                "failed_count": len(final_failed),
-                "failed_segments": [item["idx"] for item in final_failed],
-                "chain": chain_names,
-                "chain_position": eng_pos,
-                "voice": resolved_voice,
-                "timestamp": __import__("datetime").datetime.now().isoformat(),
-            }
-            with open(failure_json, "w", encoding="utf-8") as f:
-                json.dump(fail_info, f, ensure_ascii=False, indent=2)
-
+            _write_failure_json(failure_json, engine, all_items,
+                                final_failed, chain_names, eng_pos,
+                                resolved_voice)
             is_last = eng_pos >= len(chain_names) - 1
             print(f"     ❌ [{engine.name}] 仍有 {len(final_failed)} 个片段失败"
                   + (f"，尝试下一个引擎..." if not is_last else "，引擎链已用尽")
@@ -1327,6 +1358,80 @@ def _backup_tts(tts_dir: Path, backup_dir: Path, all_items: List[dict]):
             count += 1
     if count:
         print(f"     💾 已备份 {count} 个 TTS 片段到 {backup_dir.name}/")
+
+
+async def _smart_retry_engine(engine, count_failed_fn, tts_dir, voice,
+                               concurrency):
+    """单引擎内智能重试。
+    远程引擎: 阶梯降并发(正常→半→1)，并发=1后持续重试，连续3轮无改善才放弃
+    本地引擎: 失败即真失败，1轮重试即可
+    """
+    if engine.is_local:
+        failed = count_failed_fn()
+        if failed:
+            print(f"     [{engine.name}] 本地引擎重试: {len(failed)} 个失败片段...")
+            for item in failed:
+                p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+                if p.exists():
+                    p.unlink()
+            await engine.synthesize_batch(failed, tts_dir, voice, 1)
+    else:
+        no_improve_count = 0
+        prev_fail_count = len(count_failed_fn())
+        retry_round = 0
+
+        while True:
+            failed = count_failed_fn()
+            if not failed:
+                break
+            cur_fail_count = len(failed)
+
+            if retry_round == 0:
+                retry_c = max(1, concurrency // 2)
+            else:
+                retry_c = 1
+
+            if retry_c == 1 and retry_round > 0:
+                if cur_fail_count >= prev_fail_count:
+                    no_improve_count += 1
+                else:
+                    no_improve_count = 0
+                if no_improve_count >= 3:
+                    print(f"     [{engine.name}] 连续 3 轮无改善"
+                          f" (仍有 {cur_fail_count} 个失败)，放弃当前引擎")
+                    break
+
+            prev_fail_count = cur_fail_count
+            retry_round += 1
+            print(f"     [{engine.name}] 重试第{retry_round}轮:"
+                  f" {cur_fail_count} 个失败, 并发={retry_c}"
+                  + (f", 无改善={no_improve_count}/3"
+                     if retry_c == 1 and retry_round > 1 else "")
+                  + "...")
+            await asyncio.sleep(2 * min(retry_round, 5))
+            for item in failed:
+                p = tts_dir / f"seg_{item['idx']:04d}.mp3"
+                if p.exists():
+                    p.unlink()
+            await engine.synthesize_batch(failed, tts_dir, voice, retry_c)
+
+
+def _write_failure_json(failure_json, engine, all_items, failed_items,
+                        chain_names, eng_pos, resolved_voice):
+    """写入 tts_failure.json 供断点恢复"""
+    import datetime
+    fail_info = {
+        "engine": engine.name,
+        "total_segments": len(all_items),
+        "failed_count": len(failed_items),
+        "failed_segments": [item["idx"] for item in failed_items],
+        "chain": chain_names,
+        "chain_position": eng_pos,
+        "voice": resolved_voice,
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+    with open(failure_json, "w", encoding="utf-8") as f:
+        json.dump(fail_info, f, ensure_ascii=False, indent=2)
 
 
 def _estimate_speed_ratios(
@@ -1536,11 +1641,13 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
 async def generate_chinese_dub(
     segments: List[dict], output_dir: Path,
     voice: str = "zh-CN-YunxiNeural", concurrency: int = 5,
+    config: dict = None,
 ) -> Path:
     """生成中文配音 (A→C 全流程，向后兼容)"""
     print(f"  🗣  生成配音 (voice={voice}, 并发={concurrency})...")
     tts_dir = output_dir / "tts_segments"
-    await _generate_tts_segments(segments, tts_dir, voice, concurrency)
+    await _generate_tts_segments(segments, tts_dir, voice, concurrency,
+                                 config=config)
     return _align_tts_to_timeline(segments, output_dir)
 
 
@@ -2146,7 +2253,8 @@ async def process_video(config: dict):
                     f.unlink()
             await _generate_tts_segments(
                 segments, tts_dir, config["voice"],
-                config.get("tts_concurrency", 5))
+                config.get("tts_concurrency", 5),
+                config=config)
             print()
 
         # Step 7: 字幕 + 时间线对齐
@@ -2178,7 +2286,8 @@ async def process_video(config: dict):
             print(f"[6/{total_steps}] 生成中文配音")
             dub_path = await generate_chinese_dub(
                 segments, output_dir, config["voice"],
-                config.get("tts_concurrency", 5))
+                config.get("tts_concurrency", 5),
+                config=config)
             print()
 
         # Step 7: 合成

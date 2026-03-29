@@ -179,6 +179,8 @@ DEFAULT_CONFIG = {
     "whisper_model": "small",        # Whisper 语音识别模型: tiny(75MB快) / small(500MB 推荐) / medium(1.5GB 精确)
     "volume": 0.15,                  # 原声背景音量混入比例: 0.0=静音 / 0.15=默认 / 1.0=原始音量
     "browser": "chrome",             # yt-dlp 读取 cookies 的浏览器: chrome / firefox / edge / safari
+    "download_quality": "best",      # 下载画质: "best"(原始最高质量) / "1080p" / "720p" / "480p"
+                                     # best 会下载源视频最高分辨率+最高帧率(如 1440p60/1080p60)
     "rename": None,                  # 处理完成后重命名输出目录（如 "线性代数精讲"）
     "resume_from": None,             # 从已有输出目录断点续跑（如 "output/f09d1957a98"）
 
@@ -420,8 +422,11 @@ def check_dependencies(config: dict):
 
 
 # ─── Step 1: 下载视频 ──────────────────────────────────────────────
-def download_video(url: str, output_dir: Path, browser: str = "chrome") -> Tuple[Path, str]:
-    """使用 yt-dlp 下载视频"""
+def download_video(url: str, output_dir: Path, browser: str = "chrome",
+                   download_quality: str = "best") -> Tuple[Path, str]:
+    """使用 yt-dlp 下载视频
+    download_quality: "best"(最高画质+帧率) / "1080p" / "720p" / "480p"
+    """
     import yt_dlp
 
     video_path = output_dir / "original.mp4"
@@ -439,8 +444,20 @@ def download_video(url: str, output_dir: Path, browser: str = "chrome") -> Tuple
     print(f"  📥 下载视频: {url}")
     _ensure_node_in_path()
 
+    # 根据 download_quality 构建 format 选择器
+    # "best" → 不限分辨率，优先最高帧率+最高画质
+    # "1080p"/"720p"/"480p" → 限高但优先最高帧率
+    quality = download_quality.lower().strip()
+    if quality == "best":
+        fmt = "bestvideo+bestaudio/best"
+        print(f"  🎬 画质: 最高可用 (不限分辨率/帧率)")
+    else:
+        height = int(quality.replace("p", "")) if quality.replace("p", "").isdigit() else 720
+        fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+        print(f"  🎬 画质: ≤{height}p (最高帧率)")
+
     ydl_opts = {
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "format": fmt,
         "outtmpl": str(output_dir / "original.%(ext)s"),
         "quiet": False,
         "no_warnings": True,
@@ -459,9 +476,15 @@ def download_video(url: str, output_dir: Path, browser: str = "chrome") -> Tuple
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = info.get("title", "unknown")
+            # 提取实际选中的视频格式信息（帧率、分辨率）
+            req_fmts = info.get("requested_formats", [])
+            vid_fmt = next((f for f in req_fmts if f.get("vcodec", "none") != "none"), {})
             with open(output_dir / "info.json", "w", encoding="utf-8") as f:
                 json.dump({"title": title, "id": info.get("id", ""),
-                           "url": url, "duration": info.get("duration", 0)},
+                           "url": url, "duration": info.get("duration", 0),
+                           "fps": vid_fmt.get("fps") or info.get("fps"),
+                           "resolution": vid_fmt.get("resolution") or info.get("resolution"),
+                           },
                           f, ensure_ascii=False, indent=2)
     except Exception as e:
         if "Postprocessing" not in str(e):
@@ -684,6 +707,161 @@ def _translate_google(segments: List[dict], batch_size: int = 20) -> List[dict]:
     return result
 
 
+def _detect_translation_style(segments: List[dict], video_title: str,
+                               endpoint: str, headers: dict, model: str,
+                               temperature: float) -> str:
+    """扫描完整视频内容后，识别主题和翻译风格，返回追加到 system_prompt 的指导规则。
+
+    策略：把全部英文原文拼接后送给 LLM 做一次完整扫描（专用轮次），而非只看开头。
+    - 如果总文本 < 8000 字符，直接全量发送
+    - 如果过长，均匀采样（头部 30% + 中部 40% + 尾部 30%），保证覆盖视频各阶段
+    这样即使开头是广告/赞助商口播/无关寒暄，也不会误判整体主题。
+    """
+    import httpx
+
+    if not segments:
+        return ""
+
+    # ── 构建完整文本，必要时均匀采样 ──
+    all_texts = [s["text"] for s in segments if s.get("text", "").strip()]
+    full_text = "\n".join(all_texts)
+
+    MAX_CHARS = 8000  # LLM 上下文窗口预算（留足空间给 prompt + response）
+    if len(full_text) > MAX_CHARS:
+        # 均匀采样：头部 30% + 中部 40% + 尾部 30%
+        n = len(all_texts)
+        head_end = int(n * 0.3)
+        mid_start = int(n * 0.3)
+        mid_end = int(n * 0.7)
+        tail_start = int(n * 0.7)
+
+        head = all_texts[:head_end]
+        mid = all_texts[mid_start:mid_end]
+        tail = all_texts[tail_start:]
+
+        # 在各段之间加标记，让 LLM 知道这是采样
+        sample_parts = []
+        sample_parts.append(f"=== 视频前段 (第1~{head_end}段，共{n}段) ===")
+        sample_parts.append("\n".join(head))
+        sample_parts.append(f"\n=== 视频中段 (第{mid_start+1}~{mid_end}段) ===")
+        sample_parts.append("\n".join(mid))
+        sample_parts.append(f"\n=== 视频后段 (第{tail_start+1}~{n}段) ===")
+        sample_parts.append("\n".join(tail))
+        sample_text = "\n".join(sample_parts)
+
+        # 如果还是太长，按比例截断每部分
+        if len(sample_text) > MAX_CHARS:
+            budget_per_part = MAX_CHARS // 3
+            head_text = "\n".join(head)[:budget_per_part]
+            mid_text = "\n".join(mid)[:budget_per_part]
+            tail_text = "\n".join(tail)[:budget_per_part]
+            sample_text = (
+                f"=== 视频前段 ===\n{head_text}\n"
+                f"=== 视频中段 ===\n{mid_text}\n"
+                f"=== 视频后段 ===\n{tail_text}"
+            )
+        content_desc = f"均匀采样 {n} 段（头/中/尾各约 30%/40%/30%）"
+    else:
+        sample_text = full_text
+        content_desc = f"完整内容 {len(all_texts)} 段"
+
+    print(f"     🔍 主题识别中（{content_desc}）...")
+
+    detect_prompt = f"""你是翻译领域专家。请仔细阅读以下视频的完整英文内容，分析其核心主题、专业领域和翻译注意事项。
+
+注意：
+- 视频开头可能有广告、赞助商口播、寒暄等与主题无关的内容，请忽略这些，聚焦于视频的核心主题
+- 请综合头、中、尾部内容做整体判断，不要只看开头
+
+视频标题: {video_title or '(无标题)'}
+
+英文原文:
+{sample_text}
+
+请用以下JSON格式返回（只返回JSON，不要其他内容）:
+{{
+  "topic": "视频核心主题（如: 线性代数/量子力学/React前端开发/宏观经济学/日常Vlog 等，尽量具体）",
+  "style": "建议的翻译风格（如: 学术严谨/口语化教学/新闻播报/技术文档/轻松聊天）",
+  "term_rules": [
+    "列出本视频中出现的专业术语翻译规则，每条格式: 英文 → 中文",
+    "只列出真正在原文中出现过的术语，不要凭空臆造"
+  ],
+  "warnings": [
+    "列出本视频翻译中需要特别注意的陷阱",
+    "如: 某个常见词在本视频的专业语境中有特殊含义",
+    "如: 容易被误译的符号、缩写、双关语等"
+  ]
+}}"""
+
+    try:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "你是翻译领域专家。请基于视频完整内容做全局分析，不要仅凭开头几段下结论。"},
+                {"role": "user", "content": detect_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1500,
+        }
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(endpoint, json=payload, headers=headers)
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+        # 提取 JSON（LLM 可能在外面包了 ```json ... ```）
+        json_match = re.search(r'\{[\s\S]*\}', raw)
+        if not json_match:
+            print(f"     ⚠️  主题识别返回格式异常，使用通用规则")
+            return _default_translation_rules()
+        detected = json.loads(json_match.group())
+
+        # 构建追加到 system_prompt 的风格指导
+        guide_parts = []
+        topic = detected.get("topic", "")
+        style = detected.get("style", "")
+        if topic:
+            guide_parts.append(f"\n本视频主题: {topic}")
+        if style:
+            guide_parts.append(f"翻译风格: {style}")
+
+        # 术语规则
+        term_rules = detected.get("term_rules", [])
+        if term_rules:
+            guide_parts.append("专业术语翻译规则（必须遵守）:")
+            for rule in term_rules[:15]:  # 限制不超过15条
+                guide_parts.append(f"  - {rule}")
+
+        # 翻译陷阱警告
+        warnings = detected.get("warnings", [])
+        if warnings:
+            guide_parts.append("翻译注意事项:")
+            for w in warnings[:8]:
+                guide_parts.append(f"  - {w}")
+
+        # 始终注入的通用保护规则
+        guide_parts.append(_default_translation_rules())
+
+        result = "\n".join(guide_parts)
+        print(f"     ✅ 主题: {topic} | 风格: {style} | 术语规则: {len(term_rules)} 条")
+        return result
+
+    except Exception as e:
+        print(f"     ⚠️  主题识别失败 ({e})，使用通用翻译规则")
+        return _default_translation_rules()
+
+
+def _default_translation_rules() -> str:
+    """通用翻译保护规则，无论主题识别是否成功都会注入"""
+    return (
+        "\n通用翻译规则（始终遵守）:"
+        "\n  - 数学符号（i, e, π, θ 等）在数学/科学语境中保持为专业术语，不可翻译为日常用语（如 i→'我'）"
+        "\n  - 负号'-'在数学/科学语境中必须翻译为'负'，不可省略（字幕'-3'应读作'负三'）"
+        "\n  - 英文倒装句（there be, 状语前置等）翻译时需调整为中文习惯语序"
+        "\n  - 翻译结果用于语音配音朗读，需通顺自然，适合听觉理解"
+        "\n  - 前后文语义连贯，避免相邻段之间出现语义断裂或内容重复"
+    )
+
+
 def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = "") -> List[dict]:
     """LLM 大模型翻译引擎 (OpenAI 兼容 API)"""
     import httpx
@@ -714,6 +892,16 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
+    # ── 翻译前: 自动识别主题和翻译风格 ──
+    # 用视频标题 + 前几段内容让 LLM 判断专业领域，注入术语保护规则
+    if not style:
+        topic_guide = _detect_translation_style(
+            segments, video_title, endpoint, headers, model, temperature
+        )
+        if topic_guide:
+            system_prompt += f"\n{topic_guide}"
+            print(f"     📋 自动识别翻译风格已注入")
 
     result = []
     prev_context = None
@@ -1684,7 +1872,16 @@ def _measure_speed_ratios(
 
 
 def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
-    """阶段 C: atempo 调速 + 叠加拼接 → chinese_dub.wav"""
+    """阶段 C: atempo 调速 + 叠加拼接 → chinese_dub.wav
+
+    语速策略:
+      1. 收集每段 TTS 时长 / 目标时长 = raw_ratio
+      2. 计算全局中位数基线，各段按 40% 向基线混合
+      3. 指数平滑（α=0.3）消除相邻段跳变
+      4. 钳制到 [SPEED_MIN, SPEED_MAX] 区间，保证听感自然
+      5. 超出区间的片段：过短用静音居中填充，过长截断
+    断点恢复: 调速后的 seg_XXXX_adj.wav 会被缓存，重跑时自动跳过
+    """
     from pydub import AudioSegment as PydubSegment
 
     tts_dir = output_dir / "tts_segments"
@@ -1692,9 +1889,13 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
     original_audio = PydubSegment.from_wav(str(audio_path))
     total_ms = len(original_audio)
 
-    print(f"     时间线对齐中...")
+    # ── 语速目标区间 ──
+    SPEED_MIN = 0.95   # 低于此值用静音填充而非极端降速
+    SPEED_MAX = 1.25   # 高于此值截断而非极端加速（听起来太快）
+
+    print(f"     时间线对齐中 (目标语速区间: {SPEED_MIN:.2f}x ~ {SPEED_MAX:.2f}x)...")
     final_audio = PydubSegment.silent(duration=total_ms, frame_rate=16000)
-    stats = {"adjusted": 0, "skipped": 0, "padded": 0}
+    stats = {"adjusted": 0, "skipped": 0, "padded": 0, "clamped_fast": 0, "clamped_slow": 0}
 
     # First pass: collect all raw speed ratios
     raw_ratios = []
@@ -1735,7 +1936,42 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
                 smoothed_ratios[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
             prev_valid = smoothed_ratios[i]
 
-    print(f"     全局语速基线: {median_ratio:.2f}x (混合权重={BLEND_WEIGHT}, 平滑系数={SMOOTH_ALPHA})")
+    # 钳制到目标区间 [SPEED_MIN, SPEED_MAX]
+    clamped_ratios = []
+    for r in smoothed_ratios:
+        if r is None:
+            clamped_ratios.append(None)
+        else:
+            clamped_ratios.append(max(SPEED_MIN, min(SPEED_MAX, r)))
+
+    # 统计钳制情况
+    for i, (sm, cl) in enumerate(zip(smoothed_ratios, clamped_ratios)):
+        if sm is not None and cl is not None:
+            if sm > SPEED_MAX:
+                stats["clamped_fast"] += 1
+            elif sm < SPEED_MIN:
+                stats["clamped_slow"] += 1
+
+    # 计算钳制后的实际平均语速
+    clamped_valid = [r for r in clamped_ratios if r is not None]
+    avg_speed = sum(clamped_valid) / max(1, len(clamped_valid))
+    print(f"     全局语速基线: {median_ratio:.2f}x → 钳制后平均: {avg_speed:.2f}x"
+          f" (混合={BLEND_WEIGHT}, 平滑={SMOOTH_ALPHA})")
+    if stats["clamped_fast"] or stats["clamped_slow"]:
+        print(f"     钳制: {stats['clamped_fast']} 段过快被限速,"
+              f" {stats['clamped_slow']} 段过慢被提速")
+
+    # ── 保存调速报告（断点恢复时可查看） ──
+    speed_report = {
+        "median_ratio": round(median_ratio, 4),
+        "avg_clamped": round(avg_speed, 4),
+        "speed_range": [SPEED_MIN, SPEED_MAX],
+        "total_segments": len(segments),
+        "clamped_fast": stats["clamped_fast"],
+        "clamped_slow": stats["clamped_slow"],
+    }
+    with open(output_dir / "speed_report.json", "w", encoding="utf-8") as f:
+        json.dump(speed_report, f, ensure_ascii=False, indent=2)
 
     for idx, seg in enumerate(segments):
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
@@ -1751,16 +1987,16 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
             stats["skipped"] += 1
             continue
 
-        speed_ratio = smoothed_ratios[idx] if smoothed_ratios[idx] is not None else (len(tts_audio) / target_dur)
+        speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else (len(tts_audio) / target_dur)
+        raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
 
-        # 对于过短片段 (ratio < 0.7)：不做极端降速，改用静音填充居中放置
-        if speed_ratio < 0.7 and len(tts_audio) > 0:
-            # 轻微降速到 0.85x 左右使节奏更自然，剩余用静音填充
-            mild_ratio = max(speed_ratio, 0.85)
-            if mild_ratio < 0.98:
+        # 对于 TTS 远短于目标时长的片段：用钳制后的 ratio 调速 + 静音居中填充
+        if raw_ratio < SPEED_MIN and len(tts_audio) > 0:
+            # 用 speed_ratio（已钳制到 SPEED_MIN）做轻微降速
+            if speed_ratio < 0.98:
                 adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
                 if not adjusted.exists():
-                    filt = _build_atempo_filter(mild_ratio)
+                    filt = _build_atempo_filter(speed_ratio)
                     try:
                         subprocess.run([
                             "ffmpeg", "-i", str(tts_path), "-filter:a", filt,
@@ -1801,7 +2037,9 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
 
     dub_path = output_dir / "chinese_dub.wav"
     final_audio.export(str(dub_path), format="wav")
-    print(f"  ✅ 配音完成 (调速:{stats['adjusted']}, 静音填充:{stats['padded']}, 跳过:{stats['skipped']}, 总:{len(segments)})")
+    print(f"  ✅ 配音完成 (调速:{stats['adjusted']}, 填充:{stats['padded']},"
+          f" 限速:{stats['clamped_fast']}, 提速:{stats['clamped_slow']},"
+          f" 跳过:{stats['skipped']}, 总:{len(segments)})")
     return dub_path
 
 
@@ -2370,7 +2608,9 @@ async def process_video(config: dict):
                 title = json.load(open(info_file))["title"]
         else:
             try:
-                video_path, title = download_video(url, output_dir, config["browser"])
+                video_path, title = download_video(
+                    url, output_dir, config["browser"],
+                    config.get("download_quality", "best"))
             except Exception as e:
                 _logger.log_error(
                     "下载失败", f"无法下载视频: {url}",

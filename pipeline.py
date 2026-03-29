@@ -937,22 +937,35 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             "max_tokens": 4096,
         }
 
-        try:
-            with httpx.Client(timeout=60.0) as client:
-                resp = client.post(endpoint, json=payload, headers=headers)
-                resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"].strip()
+        # ── 批量翻译请求（带重试） ──
+        translations = None
+        batch_max_retries = 2  # 批量请求最多重试 2 次
+        for batch_attempt in range(batch_max_retries + 1):
+            try:
+                with httpx.Client(timeout=60.0) as client:
+                    resp = client.post(endpoint, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"]["content"].strip()
 
-            # 解析返回的编号格式
-            translations = _parse_numbered_translations(content, len(batch))
-            # 对齐保证：验证解析结果数量是否匹配
-            if len([t for t in translations if t.strip()]) < len(batch) * 0.7:
-                print(f"     ⚠️  LLM 批次对齐失败 ({len(translations)} vs {len(batch)})，降级逐条翻译")
-                translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
-        except Exception as e:
-            print(f"     ⚠️  LLM 批次 {batch_idx+1} 失败: {e}")
-            # 降级：逐条翻译
-            translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
+                # 解析返回的编号格式
+                translations = _parse_numbered_translations(content, len(batch))
+                # 对齐保证：验证解析结果数量是否匹配
+                if len([t for t in translations if t.strip()]) < len(batch) * 0.7:
+                    if batch_attempt < batch_max_retries:
+                        print(f"     ⚠️  LLM 批次对齐失败 ({len([t for t in translations if t.strip()])} vs {len(batch)})，"
+                              f"重试 {batch_attempt+1}/{batch_max_retries}...")
+                        time.sleep(2 * (batch_attempt + 1))
+                        continue
+                    print(f"     ⚠️  LLM 批次对齐仍失败，降级逐条翻译")
+                    translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
+                break  # 成功则退出重试循环
+            except Exception as e:
+                if batch_attempt < batch_max_retries:
+                    print(f"     ⚠️  LLM 批次 {batch_idx+1} 请求失败: {e}，重试 {batch_attempt+1}/{batch_max_retries}...")
+                    time.sleep(2 * (batch_attempt + 1))
+                else:
+                    print(f"     ⚠️  LLM 批次 {batch_idx+1} 重试耗尽: {e}，降级逐条翻译")
+                    translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
 
         batch_results = []
         failed_indices = []  # 记录翻译失败的段（需要回退 Google）
@@ -972,26 +985,43 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 "text_en": seg["text"], "text_zh": text_zh or seg["text"],
             })
 
-        # 对失败的段进行 Google Translate 回退
+        # 对失败的段：先用 LLM 逐条重试，仍失败才回退 Google
         if failed_indices:
-            print(f"     ⚠️  {len(failed_indices)} 段 LLM 翻译失败，回退 Google Translate")
-            try:
-                from deep_translator import GoogleTranslator
-                gt = GoogleTranslator(source="en", target="zh-CN")
-                for j in failed_indices:
-                    seg = batch[j]
-                    try:
-                        gt_zh = gt.translate(seg["text"])
-                        if gt_zh and len(gt_zh.strip()) >= 2:
-                            batch_results[j]["text_zh"] = gt_zh.strip()
-                            print(f"       ✅ Google 翻译成功: \"{seg['text'][:30]}\"")
-                        else:
-                            print(f"       ⚠️  Google 翻译也为空，保留原文: \"{seg['text'][:30]}\"")
-                    except Exception as e:
-                        print(f"       ⚠️  Google 翻译失败 ({e})，保留原文: \"{seg['text'][:30]}\"")
-                    time.sleep(0.3)
-            except ImportError:
-                print(f"       ⚠️  deep_translator 未安装，无法回退 Google 翻译")
+            # ── 第一层兜底：LLM 逐条重试（3次） ──
+            print(f"     ⚠️  {len(failed_indices)} 段批量解析失败，LLM 逐条重试中...")
+            retry_batch = [batch[j] for j in failed_indices]
+            retry_results = _translate_llm_single(
+                retry_batch, endpoint, headers, model, system_prompt, temperature
+            )
+            still_failed = []
+            for k, j in enumerate(failed_indices):
+                zh = retry_results[k]
+                if zh and len(zh.strip()) >= 2:
+                    batch_results[j]["text_zh"] = zh.strip()
+                    print(f"       ✅ LLM 逐条重试成功: \"{batch[j]['text'][:30]}\"")
+                else:
+                    still_failed.append(j)
+
+            # ── 第二层兜底：Google Translate（仅 LLM 逐条也失败的段） ──
+            if still_failed:
+                print(f"     ⚠️  {len(still_failed)} 段 LLM 逐条重试仍失败，回退 Google Translate")
+                try:
+                    from deep_translator import GoogleTranslator
+                    gt = GoogleTranslator(source="en", target="zh-CN")
+                    for j in still_failed:
+                        seg = batch[j]
+                        try:
+                            gt_zh = gt.translate(seg["text"])
+                            if gt_zh and len(gt_zh.strip()) >= 2:
+                                batch_results[j]["text_zh"] = gt_zh.strip()
+                                print(f"       ✅ Google 翻译成功: \"{seg['text'][:30]}\"")
+                            else:
+                                print(f"       ⚠️  Google 翻译也为空，保留原文: \"{seg['text'][:30]}\"")
+                        except Exception as e:
+                            print(f"       ⚠️  Google 翻译失败 ({e})，保留原文: \"{seg['text'][:30]}\"")
+                        time.sleep(0.3)
+                except ImportError:
+                    print(f"       ⚠️  deep_translator 未安装，无法回退 Google 翻译")
 
         for br in batch_results:
             result.append(br)

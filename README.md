@@ -399,7 +399,33 @@ bash test.sh unit     # 仅单元测试
   - 采纳 LLM 结果前自动检测与相邻段的字符重叠率（`_is_duplicate_of_neighbors`，阈值 60%），重复内容不予采纳
   - 转录和翻译后各调用 `deduplicate_segments()` 去重，清理完全相同或子串包含的连续重复片段
 
-## TODO（待规划）
+## TODO（按难度 / 优先级排序）
+
+### 🔴 高优先级 / 低难度（快速改进）
+
+- **输出日志优化**：当前 skip_steps 包含 transcribe/translate 时，日志显示 `[3/7] 语音识别 - 跳过` → `[4/7] 翻译 - 跳过` → 直接跳到 `[6/7] 生成中文配音`，中间跳过的步骤（字幕生成）没有任何提示。目标：
+  - 跳过的步骤也应打印简要说明（如 `[5/7] 生成字幕 - 跳过（已在 skip_steps 中）`）
+  - 断点恢复场景应明确标注哪些步骤从缓存恢复、哪些实际执行
+  - TTS 引擎链切换、备份、断点恢复等关键操作应有更清晰的路径提示（已完成 tts_failure.json 路径打印改进）
+
+### 🟡 中优先级 / 中难度（需一定重构）
+
+- **性能监控与优化**：各模块耗时记录 + 本地 GPU 资源优化。目标：
+  - 为每个主要步骤（下载、转录、翻译、TTS、对齐、合成）记录耗时并输出到日志
+  - 生成性能报告（如 `output/VIDEO_ID/performance.json`），包含各阶段耗时、并发利用率、失败重试次数
+  - 结合本地 GPU 资源（如 Whisper large-v3 CUDA 加速、TTS 本地模型 GPU 推理）优化资源分配
+  - 支持配置 GPU 使用策略（`"gpu": "auto" / "cuda" / "cpu"`）
+
+### 🟢 低优先级 / 高难度（架构级重构）
+
+- **代码模块化重构 + 多角色预留**：当前 pipeline.py 单文件过大（2300+ 行），不利于迭代和多人协作。目标：
+  - 按功能拆分为独立模块：`pipeline/` 目录包含 `download.py`、`transcribe.py`、`translate.py`、`tts/`（引擎抽象层）、`subtitle.py`、`merge.py`、`refine.py` 等
+  - 保持现有 API 向后兼容，主入口仍为 `pipeline.py`（改为导入各模块）
+  - 预留多角色支持：segments 数据结构增加 `speaker_id` 字段，TTS 引擎接口支持按角色分发（`synthesize(text, path, voice, speaker_id=None)`）
+  - 配置支持多角色映射：`"speakers": {"narrator": "zh-CN-YunxiNeural", "character_a": "zh-CN-XiaoxiaoNeural"}`
+  - 需要评估：speaker diarization 集成方案（pyannote-audio / Whisper 自带说话人分离）、跨引擎混用时的音质一致性、模块间数据流设计
+
+### 🔵 已记录 / 暂不实施
 
 - **多人声识别与差异化配音**：当前所有片段使用同一语音参数，无法区分不同说话人。目标：
   - 基于 Whisper 或 speaker diarization（如 pyannote-audio）识别不同人物的声音片段

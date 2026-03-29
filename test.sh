@@ -41,7 +41,7 @@ run_smoke() {
     # 2. Python 依赖
     echo ""
     echo "[2/5] Python 依赖"
-    for mod in faster_whisper edge_tts deep_translator pydub yt_dlp httpx gtts pyttsx3 piper sherpa_onnx; do
+    for mod in faster_whisper edge_tts deep_translator pydub yt_dlp yt_dlp_ejs httpx gtts pyttsx3 piper sherpa_onnx; do
         if "$VENV_PYTHON" -c "import $mod" 2>/dev/null; then
             ver=$("$VENV_PYTHON" -c "import $mod; print(getattr($mod, '__version__', 'ok'))" 2>/dev/null || echo "ok")
             pass_test "$mod ($ver)"

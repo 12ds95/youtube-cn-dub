@@ -2732,7 +2732,19 @@ async def process_video(config: dict):
             raw_segments = []
             _log("")
 
-        if "translate" not in skip and raw_segments:
+        if "translate" not in skip:
+            if not raw_segments:
+                # transcribe 被跳过且没有缓存 → 翻译没有输入数据
+                _logger.log_error(
+                    "前置条件缺失",
+                    "翻译需要转录结果，但 transcribe 被跳过且 segments_cache.json 不存在",
+                    "skip_steps 包含 'transcribe' 时，必须已有之前运行产生的 segments_cache.json。\n\n"
+                    "方案 A: 从 skip_steps 中移除 'transcribe'，让 pipeline 先做语音识别:\n"
+                    f'  修改 config 中 "skip_steps" 为: {json.dumps([s for s in config.get("skip_steps", []) if s != "transcribe"])}\n\n'
+                    "方案 B: 如果之前已运行过转录+翻译，确认 segments_cache.json 存在:\n"
+                    f"  检查: ls {cache_file}")
+                _logger.close()
+                return
             _log(f"[4/{total_steps}] 翻译")
             try:
                 segments = translate_segments(raw_segments, config)

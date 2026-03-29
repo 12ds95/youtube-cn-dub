@@ -41,7 +41,7 @@ run_smoke() {
     # 2. Python 依赖
     echo ""
     echo "[2/5] Python 依赖"
-    for mod in faster_whisper edge_tts deep_translator pydub yt_dlp httpx; do
+    for mod in faster_whisper edge_tts deep_translator pydub yt_dlp httpx gtts pyttsx3 piper sherpa_onnx; do
         if "$VENV_PYTHON" -c "import $mod" 2>/dev/null; then
             ver=$("$VENV_PYTHON" -c "import $mod; print(getattr($mod, '__version__', 'ok'))" 2>/dev/null || echo "ok")
             pass_test "$mod ($ver)"
@@ -107,6 +107,20 @@ asyncio.run(test())
         pass_test "本地 Whisper 模型: $MODELS"
     else
         warn_test "无本地 Whisper 模型，首次运行将自动下载（或运行 bash download_model.sh small）"
+    fi
+
+    # Piper 模型
+    if [ -f "$SCRIPT_DIR/models/piper/zh_CN-huayan-medium.onnx" ]; then
+        pass_test "Piper 中文模型: zh_CN-huayan-medium.onnx"
+    else
+        warn_test "Piper 模型未下载（可选，运行 bash download_model.sh piper）"
+    fi
+
+    # sherpa-onnx 模型
+    if [ -f "$SCRIPT_DIR/models/sherpa-onnx/vits-melo-tts-zh_en/model.onnx" ]; then
+        pass_test "sherpa-onnx 中文模型: vits-melo-tts-zh_en"
+    else
+        warn_test "sherpa-onnx 模型未下载（可选，运行 bash download_model.sh sherpa）"
     fi
 
     # 5. 配置文件

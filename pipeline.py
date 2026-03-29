@@ -900,9 +900,13 @@ class PiperTTSEngine(TTSEngine):
         loop = asyncio.get_event_loop()
         model = voice  # 已由 resolve_voice 转为模型路径
         def _gen():
-            import subprocess
+            import subprocess, shutil
+            # 优先从当前 Python 所在的 venv/bin 找 piper，其次 PATH
+            piper_bin = os.path.join(os.path.dirname(sys.executable), "piper")
+            if not os.path.isfile(piper_bin):
+                piper_bin = shutil.which("piper") or "piper"
             proc = subprocess.run(
-                ["piper", "--model", model, "--output_file", path],
+                [piper_bin, "--model", model, "--output_file", path],
                 input=text, capture_output=True, text=True, timeout=30,
             )
             if proc.returncode != 0:

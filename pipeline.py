@@ -2694,6 +2694,7 @@ async def process_video(config: dict):
 
     # Step 3+4: 转录 + 翻译
     _logger.step_begin("转录+翻译")
+    transcribe_cache = output_dir / "transcribe_cache.json"  # 转录中间结果（纯英文）
     if cache_file.exists():
         _log(f"[3/{total_steps}] 语音识别" + (" - 跳过" if "transcribe" in skip else ""))
         _log(f"[4/{total_steps}] 翻译" + (" - 跳过" if "translate" in skip else ""))
@@ -2703,6 +2704,7 @@ async def process_video(config: dict):
         _log(f"     {len(segments)} 个片段已加载")
         _log("")
     else:
+        raw_segments = []
         if "transcribe" not in skip:
             _log(f"[3/{total_steps}] 语音识别 (Whisper)")
             if not audio_path.exists():
@@ -2717,6 +2719,10 @@ async def process_video(config: dict):
                     output_dir / "audio.wav", config["whisper_model"],
                     config.get("whisper_beam_size", 5))
                 raw_segments = deduplicate_segments(raw_segments)
+                # ── 保存转录中间结果（支持单独跳过 transcribe） ──
+                with open(transcribe_cache, "w", encoding="utf-8") as f:
+                    json.dump(raw_segments, f, ensure_ascii=False, indent=2)
+                _log(f"     转录缓存已保存: {transcribe_cache}")
             except Exception as e:
                 _logger.log_error(
                     "语音识别失败", f"Whisper 转录失败 (model={config['whisper_model']})",
@@ -2729,20 +2735,30 @@ async def process_video(config: dict):
             _log("")
         else:
             _log(f"[3/{total_steps}] 语音识别 - 跳过")
-            raw_segments = []
+            # ── 从转录缓存加载（支持单独跳过 transcribe） ──
+            if transcribe_cache.exists():
+                with open(transcribe_cache, "r", encoding="utf-8") as f:
+                    raw_segments = json.load(f)
+                _log(f"  ⏭  使用转录缓存 ({len(raw_segments)} 段)")
+            else:
+                _logger.log_error(
+                    "前置条件缺失",
+                    f"transcribe 被跳过但转录缓存不存在: {transcribe_cache}",
+                    "skip_steps 包含 'transcribe' 时，需要之前运行产生的转录缓存文件。\n\n"
+                    "方案 A: 从 skip_steps 中移除 'transcribe'，让 pipeline 执行 Whisper 转录:\n"
+                    f'  修改 config 中 "skip_steps" 为: {json.dumps([s for s in config.get("skip_steps", []) if s != "transcribe"])}\n\n'
+                    "方案 B: 确认之前运行已完成转录:\n"
+                    f"  检查: ls {transcribe_cache}")
+                _logger.close()
+                return
             _log("")
 
         if "translate" not in skip:
             if not raw_segments:
-                # transcribe 被跳过且没有缓存 → 翻译没有输入数据
                 _logger.log_error(
                     "前置条件缺失",
-                    "翻译需要转录结果，但 transcribe 被跳过且 segments_cache.json 不存在",
-                    "skip_steps 包含 'transcribe' 时，必须已有之前运行产生的 segments_cache.json。\n\n"
-                    "方案 A: 从 skip_steps 中移除 'transcribe'，让 pipeline 先做语音识别:\n"
-                    f'  修改 config 中 "skip_steps" 为: {json.dumps([s for s in config.get("skip_steps", []) if s != "transcribe"])}\n\n'
-                    "方案 B: 如果之前已运行过转录+翻译，确认 segments_cache.json 存在:\n"
-                    f"  检查: ls {cache_file}")
+                    "翻译需要转录结果，但转录数据为空",
+                    "检查 Whisper 是否正确识别了语音内容，或手动检查音频文件")
                 _logger.close()
                 return
             _log(f"[4/{total_steps}] 翻译")
@@ -2781,10 +2797,10 @@ async def process_video(config: dict):
             missing.append(f"skip_steps 包含 'download' 但视频不存在: {video_path}")
         if "extract" in skip and not (output_dir / "audio.wav").exists():
             missing.append(f"skip_steps 包含 'extract' 但音频不存在: {output_dir / 'audio.wav'}")
-        if "transcribe" in skip and not cache_file.exists():
-            missing.append(f"skip_steps 包含 'transcribe' 但缓存不存在: {cache_file}")
+        if "transcribe" in skip and not cache_file.exists() and not transcribe_cache.exists():
+            missing.append(f"skip_steps 包含 'transcribe' 但转录缓存不存在: {transcribe_cache}")
         if "translate" in skip and not cache_file.exists():
-            missing.append(f"skip_steps 包含 'translate' 但缓存不存在: {cache_file}")
+            missing.append(f"skip_steps 包含 'translate' 但翻译缓存不存在: {cache_file}")
 
         if missing:
             # 生成可直接使用的修复配置
@@ -2827,10 +2843,10 @@ async def process_video(config: dict):
 
         # Step 6: 翻译定稿后一次性生成 TTS
         _logger.step_begin("生成TTS")
+        tts_dir = output_dir / "tts_segments"
         if "tts" not in skip:
             _log(f"[6/{total_steps}] 生成 TTS 片段")
             _log(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
-            tts_dir = output_dir / "tts_segments"
             # 清除旧的 TTS 缓存（翻译已变更，旧文件内容可能不匹配）
             if tts_dir.exists():
                 for f in tts_dir.iterdir():
@@ -2839,6 +2855,20 @@ async def process_video(config: dict):
                 segments, tts_dir, config["voice"],
                 config.get("tts_concurrency", 5),
                 config=config)
+            _log("")
+        else:
+            _log(f"[6/{total_steps}] 生成 TTS - 跳过")
+            tts_files = list(tts_dir.glob("seg_*.mp3")) if tts_dir.exists() else []
+            if not tts_files:
+                _logger.log_error(
+                    "前置条件缺失",
+                    f"tts 被跳过但 TTS 片段不存在: {tts_dir}",
+                    "skip_steps 包含 'tts' 时，需要之前运行已生成 TTS 音频片段。\n\n"
+                    f"方案: 从 skip_steps 中移除 'tts':\n"
+                    f'  修改 config 中 "skip_steps" 为: {json.dumps([s for s in config.get("skip_steps", []) if s != "tts"])}')
+                _logger.close()
+                return
+            _log(f"  ⏭  使用已有 TTS 片段 ({len(tts_files)} 个)")
             _log("")
         _logger.step_end()
 
@@ -2855,10 +2885,21 @@ async def process_video(config: dict):
         # Step 8: 合成
         _logger.step_begin("合成视频")
         dub_path = output_dir / "chinese_dub.wav"
-        if "merge" not in skip and dub_path.exists():
+        if "merge" not in skip:
+            if not dub_path.exists():
+                _logger.log_error(
+                    "前置条件缺失",
+                    f"配音文件不存在: {dub_path}",
+                    "合成视频需要 chinese_dub.wav，但该文件未生成。\n"
+                    "确认 tts 步骤未被跳过，或之前运行已生成该文件。")
+                _logger.close()
+                return
             _log(f"[8/{total_steps}] 合成最终视频")
             final_path = merge_final_video(
                 video_path, dub_path, output_dir, config["volume"])
+            _log("")
+        else:
+            _log(f"[8/{total_steps}] 合成视频 - 跳过")
             _log("")
         _logger.step_end()
     else:
@@ -2881,15 +2922,41 @@ async def process_video(config: dict):
                 config.get("tts_concurrency", 5),
                 config=config)
             _log("")
+        elif "tts" in skip:
+            _log(f"[6/{total_steps}] 生成配音 - 跳过")
+            tts_dir = output_dir / "tts_segments"
+            tts_files = list(tts_dir.glob("seg_*.mp3")) if tts_dir.exists() else []
+            if not tts_files:
+                _logger.log_error(
+                    "前置条件缺失",
+                    f"tts 被跳过但 TTS 片段不存在: {tts_dir}",
+                    "skip_steps 包含 'tts' 时，需要之前运行已生成 TTS 音频片段。\n\n"
+                    f"方案: 从 skip_steps 中移除 'tts':\n"
+                    f'  修改 config 中 "skip_steps" 为: {json.dumps([s for s in config.get("skip_steps", []) if s != "tts"])}')
+                _logger.close()
+                return
+            _log(f"  ⏭  使用已有 TTS 片段 ({len(tts_files)} 个)")
+            _log("")
         _logger.step_end()
 
         # Step 7: 合成
         _logger.step_begin("合成视频")
         dub_path = output_dir / "chinese_dub.wav"
-        if "merge" not in skip and dub_path.exists():
+        if "merge" not in skip:
+            if not dub_path.exists():
+                _logger.log_error(
+                    "前置条件缺失",
+                    f"配音文件不存在: {dub_path}",
+                    "合成视频需要 chinese_dub.wav，但该文件未生成。\n"
+                    "确认 tts 步骤未被跳过，或之前运行已生成该文件。")
+                _logger.close()
+                return
             _log(f"[7/{total_steps}] 合成最终视频")
             final_path = merge_final_video(
                 video_path, dub_path, output_dir, config["volume"])
+            _log("")
+        else:
+            _log(f"[7/{total_steps}] 合成视频 - 跳过")
             _log("")
         _logger.step_end()
 

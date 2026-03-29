@@ -286,6 +286,7 @@ bash run.sh --resume-from output/VIDEO_ID
 | `subtitle_bilingual.srt` | 中英双语字幕 |
 | `subtitle_zh.srt` / `subtitle_en.srt` | 单语字幕 |
 | `segments_cache.json` | 转录+翻译缓存（可手动编辑微调） |
+| `transcribe_cache.json` | 转录中间结果缓存（纯英文，支持单独跳过 transcribe） |
 | `speed_report.json` | 语速调整统计（中位数、钳制数等） |
 | `pipeline_YYYYMMDD_HHMMSS.log` | 执行日志（各步骤耗时 + 错误详情） |
 | `tts_failure.json` | TTS 断点恢复文件（失败时生成） |

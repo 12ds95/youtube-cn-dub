@@ -495,7 +495,18 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - 待完善：跳过的步骤应打印简要说明（如 `[5/7] 生成字幕 - 跳过（已在 skip_steps 中）`）
   - 待完善：断点恢复场景应明确标注哪些步骤从缓存恢复、哪些实际执行
 
+- **字幕输出模式可选**：当前只生成外挂字幕（`.srt`），最终视频不内嵌字幕。目标：
+  - 新增配置项 `subtitle_mode`，支持三种模式：`"external"`（仅外挂 `.srt`，默认）、`"embedded"`（仅内嵌到视频）、`"both"`（同时生成外挂和内嵌两个版本）
+  - 内嵌字幕使用 ffmpeg `-vf subtitles=xxx.srt` 或 `-c:s mov_text` 软字幕
+  - 输出文件命名：`final.mp4`（外挂）、`final_subtitled.mp4`（内嵌）
+
 ### 🟡 中优先级 / 中难度（需一定重构）
+
+- **人声与背景音分离**：当前混音直接对原始音频整体降低音量（`volume` 参数），人声和背景音（环境音、BGM）不区分，导致背景音也被压低。目标：
+  - 引入音频分离模型（如 [demucs](https://github.com/facebookresearch/demucs)）将原始音频拆分为人声轨（vocals）和伴奏轨（accompaniment/other）
+  - 合成阶段：人声轨大幅降低或静音（被中文配音替代），伴奏轨保持原始音量
+  - 新增配置项：`"audio_separation": { "enabled": true, "vocal_volume": 0.0, "bgm_volume": 1.0 }`
+  - 需评估：demucs 模型大小（~300MB）、CPU 推理耗时（预计 1-2 分钟/5分钟视频）、是否需要 GPU 加速
 
 - **性能监控与优化**：~~各模块耗时记录~~ + 本地 GPU 资源优化。已部分解决：
   - ✅ PipelineLogger 为每个主要步骤记录耗时，写入日志文件

@@ -556,12 +556,15 @@ def extract_audio(video_path: Path, output_dir: Path) -> Path:
 
 
 # ─── Step 2.5: 人声/背景音分离 ─────────────────────────────────────
-def separate_audio(audio_path: Path, output_dir: Path,
+def separate_audio(video_path: Path, output_dir: Path,
                    config: dict = None) -> dict:
-    """使用 demucs 将音频分离为人声和伴奏
+    """使用 demucs 将原始音频分离为人声和伴奏
+
+    关键：直接从 original.mp4 提取 44.1kHz 立体声音频给 demucs，
+    而不是用 audio.wav（16kHz 单声道，为 Whisper 优化，分离效果极差）。
 
     Args:
-        audio_path: 输入音频路径 (audio.wav)
+        video_path: 原始视频路径 (original.mp4)
         output_dir: 视频输出目录
         config: audio_separation 配置
 
@@ -590,17 +593,29 @@ def separate_audio(audio_path: Path, output_dir: Path,
     # 确定推理设备
     import torch
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  🎛  音频分离中 (model={model_name}, device={device})...")
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device_str = device
+    print(f"  🎛  音频分离中 (model={model_name}, device={device_str})...")
+
+    # Step 1: 从原始视频提取高品质音频（44.1kHz 立体声）
+    # audio.wav 是 16kHz 单声道（Whisper 专用），不适合音频分离
+    hq_audio = output_dir / "audio_hq.wav"
+    if not hq_audio.exists():
+        print(f"     提取高品质音频 (44.1kHz stereo)...")
+        subprocess.run([
+            "ffmpeg", "-i", str(video_path),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            str(hq_audio), "-y"
+        ], capture_output=True, check=True)
 
     t0 = time.time()
 
-    # demucs 输出到临时目录，再提取需要的轨道
-    separator = demucs.api.Separator(model=model_name, device=device)
-    _, separated = separator.separate_audio_file(audio_path)
+    # Step 2: demucs 分离
+    separator = demucs.api.Separator(model=model_name, device=device_str)
+    _, separated = separator.separate_audio_file(hq_audio)
 
-    # demucs htdemucs 输出 4 轨: drums, bass, other, vocals
-    # 我们需要: vocals (人声) 和 drums+bass+other (伴奏/背景音)
+    # separated 是 dict: {"vocals": Tensor, "drums": Tensor, "bass": Tensor, "other": Tensor}
     import torchaudio
 
     vocals = separated["vocals"]
@@ -613,6 +628,9 @@ def separate_audio(audio_path: Path, output_dir: Path,
     # 保存为 WAV
     torchaudio.save(str(vocals_path), vocals.cpu(), sample_rate)
     torchaudio.save(str(accomp_path), accompaniment.cpu(), sample_rate)
+
+    # 清理高品质中间文件（分离结果已保存，不再需要）
+    hq_audio.unlink(missing_ok=True)
 
     elapsed = time.time() - t0
     print(f"  ✅ 音频分离完成 ({elapsed:.1f}s)")
@@ -3095,16 +3113,16 @@ async def process_video(config: dict):
         step_n = _next_step()
         if "separate" not in skip:
             _log(f"[{step_n}/{total_steps}] 人声/背景音分离")
-            if not audio_path.exists():
+            if not video_path.exists():
                 _logger.log_error(
                     "前置条件缺失",
-                    f"音频文件不存在，无法进行分离: {audio_path}",
-                    "确保 extract 步骤已执行或音频文件已存在")
+                    f"视频文件不存在，无法进行音频分离: {video_path}",
+                    "确保 download 步骤已执行或视频文件已存在")
                 _logger.close()
                 return
             try:
                 sep_result = separate_audio(
-                    audio_path, output_dir,
+                    video_path, output_dir,
                     config.get("audio_separation", {}))
             except Exception as e:
                 _logger.log_error(

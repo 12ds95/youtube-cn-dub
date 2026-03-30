@@ -45,16 +45,16 @@ def test_separate_audio_cache_hit():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
-        audio_path = output_dir / "audio.wav"
+        video_path = output_dir / "original.mp4"
         vocals = output_dir / "audio_vocals.wav"
         accomp = output_dir / "audio_accompaniment.wav"
 
         # 创建假文件
-        audio_path.write_bytes(b"fake audio")
+        video_path.write_bytes(b"fake video")
         vocals.write_bytes(b"fake vocals")
         accomp.write_bytes(b"fake accompaniment")
 
-        result = separate_audio(audio_path, output_dir)
+        result = separate_audio(video_path, output_dir)
         assert result["vocals"] == vocals
         assert result["accompaniment"] == accomp
 
@@ -65,13 +65,13 @@ def test_separate_audio_no_cache():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir)
-        audio_path = output_dir / "audio.wav"
-        audio_path.write_bytes(b"fake audio")
+        video_path = output_dir / "original.mp4"
+        video_path.write_bytes(b"fake video")
 
         # Mock demucs 未安装
         with patch.dict("sys.modules", {"demucs": None, "demucs.api": None}):
             try:
-                separate_audio(audio_path, output_dir)
+                separate_audio(video_path, output_dir)
                 assert False, "应该抛出 RuntimeError"
             except (RuntimeError, ImportError):
                 pass  # 预期行为

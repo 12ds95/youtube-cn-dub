@@ -1531,10 +1531,18 @@ async def _generate_tts_segments(
 
     # 收集所有需要合成的片段（必须在断点恢复前构建，resume 逻辑依赖 all_items）
     all_items = []
+    skipped_placeholder = 0
     for idx, seg in enumerate(segments):
         text_zh = seg.get("text_zh", seg.get("text", ""))
         if len(text_zh.strip()) >= 2:
+            # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
+            if not re.search(r'[\u4e00-\u9fff\u3400-\u4dbfa-zA-Z0-9]', text_zh):
+                skipped_placeholder += 1
+                continue
             all_items.append({"idx": idx, "text_zh": text_zh})
+    if skipped_placeholder:
+        print(f"     ⚠️  跳过 {skipped_placeholder} 个无可发音内容的片段"
+              f"（纯标点/占位符如 '---'）")
 
     if not all_items:
         print(f"     无需生成 TTS 片段")
@@ -3107,9 +3115,13 @@ async def process_video(config: dict):
             _log(f"[6/{total_steps}] 生成 TTS 片段")
             _log(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
             # 清除旧的 TTS 缓存（翻译已变更，旧文件内容可能不匹配）
-            if tts_dir.exists():
+            # 但如果存在 tts_failure.json（断点恢复场景），保留已有文件，只重试失败片段
+            failure_json_path = output_dir / "tts_failure.json"
+            if tts_dir.exists() and not failure_json_path.exists():
                 for f in tts_dir.iterdir():
                     f.unlink()
+            elif failure_json_path.exists():
+                _log(f"  📋 检测到断点恢复文件，保留已有 TTS 缓存")
             await _generate_tts_segments(
                 segments, tts_dir, config["voice"],
                 config.get("tts_concurrency", 5),

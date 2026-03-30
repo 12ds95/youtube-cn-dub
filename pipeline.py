@@ -2396,6 +2396,27 @@ def _char_overlap_ratio(s1: str, s2: str) -> float:
     return common / shorter if shorter > 0 else 0.0
 
 
+def _check_refine_fidelity(original_zh: str, candidate_zh: str,
+                            min_overlap: float = 0.25) -> bool:
+    """检查精简候选是否保持了与原文的语义忠实度。
+
+    通过字符重叠率判断：合法精简应与原文共享关键字符，
+    而错误的跨段污染则几乎没有重叠。
+
+    Args:
+        original_zh: 原始中文翻译
+        candidate_zh: 精简候选
+        min_overlap: 最低字符重叠率阈值（默认 0.25）
+
+    Returns:
+        True 表示候选通过忠实度检查
+    """
+    if not original_zh or not candidate_zh:
+        return False
+    overlap = _char_overlap_ratio(original_zh, candidate_zh)
+    return overlap >= min_overlap
+
+
 def _refine_with_llm(
     segments: List[dict], overfast_items: List[dict], llm_config: dict,
 ) -> List[dict]:
@@ -2405,6 +2426,8 @@ def _refine_with_llm(
       1. 上下文只传截断摘要（30字）+ 明确标注"仅供参考，不要重复"
       2. 每段生成 3 个梯度候选（轻度/中度/大幅精简）
       3. 用 jieba 分词估算每个候选的朗读时长，选最接近目标的
+      4. 语义忠实度检查：排除与原文字符重叠率过低的候选
+      5. 小批次处理（默认 5）：减少 LLM 跨段内容混淆
     """
     import httpx
     import copy
@@ -2415,7 +2438,8 @@ def _refine_with_llm(
     api_key = llm_config["api_key"]
     model = llm_config["model"]
     temperature = llm_config.get("temperature", 0.3)
-    batch_size = llm_config.get("batch_size", 15)
+    # 精简专用小批次，避免 LLM 在大批量中混淆不同段落内容
+    batch_size = min(llm_config.get("batch_size", 15), 5)
 
     endpoint = (api_url if "/chat/completions" in api_url
                 else f"{api_url}/chat/completions")
@@ -2435,9 +2459,11 @@ def _refine_with_llm(
         "  [短] 大幅精简（约缩短 45%）：只保留最核心语义\n\n"
         "规则：\n"
         "1) 必须忠实翻译英文原文，不得偏离原文含义\n"
-        "2) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
-        "3) 适合配音朗读，语句自然\n"
-        "4) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
+        "2) 每个 [编号] 的精简版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
+        "3) 精简是缩短同一句话，不是替换成其他句子——精简结果必须与当前翻译含义一致\n"
+        "4) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
+        "5) 适合配音朗读，语句自然\n"
+        "6) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
     )
 
     for i in range(0, len(overfast_items), batch_size):
@@ -2561,14 +2587,15 @@ def _select_best_candidate(
     candidates: List[str], target_ms: int, original_zh: str,
     idx: int, segments: List[dict],
 ) -> str:
-    """从多个精简候选中选最接近目标时长的，同时排除与邻段重复的。
+    """从多个精简候选中选最接近目标时长的，同时排除不合格候选。
 
     选择策略：
       1. 排除与相邻段重复的候选
       2. 排除比原文更长的候选
-      3. 用 jieba 分词估算每个候选的朗读时长
-      4. 选时长最接近 target_ms 且不超出的
-      5. 都超出则选最短的
+      3. 排除与原文语义忠实度过低的候选（防止跨段内容污染）
+      4. 用 jieba 分词估算每个候选的朗读时长
+      5. 选时长最接近 target_ms 且不超出的
+      6. 都超出则选最短的
     """
     if not candidates:
         return ""
@@ -2589,6 +2616,9 @@ def _select_best_candidate(
             continue
         # 排除与邻段重复的
         if _is_duplicate_of_neighbors(cand, idx, segments):
+            continue
+        # 排除与原文语义忠实度过低的候选（防止 LLM 跨段内容混淆）
+        if not _check_refine_fidelity(original_zh, cand):
             continue
         valid.append(cand)
 

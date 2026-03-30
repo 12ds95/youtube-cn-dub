@@ -8,7 +8,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline import _is_duplicate_of_neighbors, _char_overlap_ratio, deduplicate_segments
+from pipeline import (_is_duplicate_of_neighbors, _char_overlap_ratio,
+                      deduplicate_segments, _check_refine_fidelity)
 
 
 # ─── 邻段重复检测测试 ───────────────────────────────────────────
@@ -168,6 +169,53 @@ def test_dedup_no_false_positive():
     print("  ✅ test_dedup_no_false_positive")
 
 
+# ─── 语义忠实度检查测试 ──────────────────────────────────────────
+
+def test_fidelity_blocks_cross_contamination():
+    """
+    复现 kCc8FmEb1nY 实际 bug：
+    idx 15 "树叶飘落" 被替换为 "莎士比亚全集"——完全不同的内容。
+    忠实度检查应拒绝这种跨段内容污染。
+    """
+    original = "紧接着，一个令人震惊的转折——一片树叶，从公园里的树上飘落了。"
+    bad_candidate = "本质上，就是莎士比亚全集的合并文本。"
+    assert _check_refine_fidelity(original, bad_candidate) is False
+    print("  ✅ test_fidelity_blocks_cross_contamination")
+
+
+def test_fidelity_blocks_cascade_shift():
+    """
+    复现 kCc8FmEb1nY 实际 bug：
+    idx 1120 的内容被错位为 idx 1116 的精简结果。
+    忠实度检查应拒绝这种批次对齐错位。
+    """
+    original = "而这些超大规模模型在微调阶段其实非常样本高效——所以这一步居然真的奏效了"
+    shifted = "比如问题在上、答案在下；他们手头有大量这类样本"
+    assert _check_refine_fidelity(original, shifted) is False
+    print("  ✅ test_fidelity_blocks_cascade_shift")
+
+
+def test_fidelity_allows_legitimate_simplification():
+    """
+    正常精简应通过忠实度检查。
+    复现 d4EgbgTm0Bg 的正常变更。
+    """
+    original = "球面被推离原位"
+    simplified = "球面被移位"
+    assert _check_refine_fidelity(original, simplified) is True
+    print("  ✅ test_fidelity_allows_legitimate_simplification")
+
+
+def test_fidelity_allows_heavy_simplification():
+    """
+    即使大幅精简（删除大量修饰词），只要保留核心内容字符，也应放行。
+    """
+    original = "所以我这里设置了随机数种子——这样你后面自己复现时，看到的随机数序列会和我这里完全一致。"
+    heavy_simplified = "我设了随机种子，确保你复现时序列完全一致。"
+    assert _check_refine_fidelity(original, heavy_simplified) is True
+    print("  ✅ test_fidelity_allows_heavy_simplification")
+
+
 if __name__ == "__main__":
     print("邻段重复检测测试:")
     test_exact_duplicate_neighbor()
@@ -186,5 +234,11 @@ if __name__ == "__main__":
     test_dedup_exact_consecutive()
     test_dedup_substring_consecutive()
     test_dedup_no_false_positive()
+    print()
+    print("语义忠实度检查测试:")
+    test_fidelity_blocks_cross_contamination()
+    test_fidelity_blocks_cascade_shift()
+    test_fidelity_allows_legitimate_simplification()
+    test_fidelity_allows_heavy_simplification()
     print()
     print("  全部通过")

@@ -584,7 +584,8 @@ def separate_audio(video_path: Path, output_dir: Path,
     device = config.get("device", "auto")
 
     try:
-        import demucs.api
+        from demucs.pretrained import get_model
+        from demucs.separate import load_track, apply_model, save_audio
     except ImportError:
         raise RuntimeError(
             "demucs 未安装。请运行: pip install demucs\n"
@@ -612,22 +613,28 @@ def separate_audio(video_path: Path, output_dir: Path,
     t0 = time.time()
 
     # Step 2: demucs 分离
-    separator = demucs.api.Separator(model=model_name, device=device_str)
-    _, separated = separator.separate_audio_file(hq_audio)
+    from demucs.pretrained import SOURCES
+    model = get_model(model_name)
+    device_obj = torch.device(device_str)
+    model.to(device_obj)
+    model.eval()
 
-    # separated 是 dict: {"vocals": Tensor, "drums": Tensor, "bass": Tensor, "other": Tensor}
-    import torchaudio
+    wav = load_track(hq_audio, model.audio_channels, model.samplerate)
+    wav = wav.to(device_obj)
 
-    vocals = separated["vocals"]
-    # 合并非人声轨道为伴奏
-    non_vocal_keys = [k for k in separated.keys() if k != "vocals"]
-    accompaniment = sum(separated[k] for k in non_vocal_keys)
+    with torch.no_grad():
+        sources = apply_model(model, wav.unsqueeze(0), device=device_obj,
+                              shifts=1, split=True, overlap=0.25,
+                              progress=False)[0]
 
-    sample_rate = separator.samplerate
+    # htdemucs 输出 4 轨: drums, bass, other, vocals
+    src_map = {name: s for name, s in zip(SOURCES, sources)}
+    vocals = src_map["vocals"]
+    accompaniment = sum(s for name, s in src_map.items() if name != "vocals")
 
     # 保存为 WAV
-    torchaudio.save(str(vocals_path), vocals.cpu(), sample_rate)
-    torchaudio.save(str(accomp_path), accompaniment.cpu(), sample_rate)
+    save_audio(vocals.cpu(), vocals_path, model.samplerate)
+    save_audio(accompaniment.cpu(), accomp_path, model.samplerate)
 
     # 清理高品质中间文件（分离结果已保存，不再需要）
     hq_audio.unlink(missing_ok=True)

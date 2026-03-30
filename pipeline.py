@@ -403,12 +403,16 @@ def _ensure_node_in_path():
 
 
 def check_dependencies(config: dict):
-    """检查必要工具"""
+    """检查必要工具
+
+    注意: 使用 importlib.util.find_spec 而非 __import__ 检查 Python 模块，
+    避免实际加载模块。因为 CTranslate2（faster-whisper 后端）与 PyTorch（demucs）
+    在同一进程中先后加载会导致 segfault。
+    """
+    import importlib.util
     missing = []
     for mod in ["faster_whisper", "edge_tts", "deep_translator", "pydub"]:
-        try:
-            __import__(mod)
-        except ImportError:
+        if importlib.util.find_spec(mod) is None:
             missing.append(mod.replace("_", "-"))
     for cmd in ["ffmpeg", "ffprobe"]:
         if not shutil.which(cmd):

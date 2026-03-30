@@ -1825,9 +1825,20 @@ def _estimate_speed_ratios(
     segments: List[dict], threshold: float = 1.5,
     ms_per_zh_char: float = 250.0, ms_per_en_char: float = 100.0,
 ) -> List[dict]:
-    """基于字符数估算语速比（不需要 TTS 文件），用于迭代优化阶段。
-    中文字符 ~250ms/字, 英文/数字 ~100ms/字 (基于 edge-tts zh-CN-YunxiNeural 实测)
+    """基于分词的语速估算（不需要 TTS 文件），用于迭代优化阶段。
+
+    改进:
+      - 用 jieba 分词后按词粒度估算（双字词~400ms, 单字词~250ms, 三字词~550ms）
+      - 比按字符数估算更接近实际发音时长
+      - jieba 不可用时降级到字符级估算
     """
+    # 尝试加载 jieba
+    try:
+        import jieba
+        _use_jieba = True
+    except ImportError:
+        _use_jieba = False
+
     results = []
     underslow_threshold = 0.7
     for idx, seg in enumerate(segments):
@@ -1842,11 +1853,17 @@ def _estimate_speed_ratios(
                 "text_zh": text_zh,
             })
             continue
-        # 分别计算中文和非中文字符的估算时长
-        zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
-        other_chars = sum(1 for c in text_zh if c.isalnum() and not ('\u4e00' <= c <= '\u9fff'))
-        estimated_ms = zh_chars * ms_per_zh_char + other_chars * ms_per_en_char
-        # 标点和空格约占 10% 额外时间（停顿）
+
+        if _use_jieba:
+            # 分词级估算：按词长分配时长（更接近实际发音）
+            estimated_ms = _estimate_duration_jieba(text_zh)
+        else:
+            # 降级：字符级估算
+            zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
+            other_chars = sum(1 for c in text_zh if c.isalnum() and not ('\u4e00' <= c <= '\u9fff'))
+            estimated_ms = zh_chars * ms_per_zh_char + other_chars * ms_per_en_char
+
+        # 标点和停顿约占 10% 额外时间
         estimated_ms *= 1.1
         ratio = estimated_ms / target_ms
         if ratio > threshold:
@@ -1863,6 +1880,47 @@ def _estimate_speed_ratios(
             "status": status,
         })
     return results
+
+
+def _estimate_duration_jieba(text_zh: str) -> float:
+    """用 jieba 分词后按词粒度估算朗读时长（毫秒）。
+
+    经验值（基于 edge-tts zh-CN-YunxiNeural 实测）：
+      单字词（如"的""是"）: ~200ms
+      双字词（如"今天""学习"）: ~380ms
+      三字词（如"计算机""互联网"）: ~530ms
+      四字及以上（如"人工智能"）: ~150ms/字
+      英文/数字: ~100ms/字符
+    """
+    import jieba
+    import unicodedata
+
+    words = jieba.lcut(text_zh)
+    total_ms = 0.0
+    for word in words:
+        # 跳过纯标点/空白
+        meaningful = [c for c in word if not unicodedata.category(c).startswith(('P', 'Z', 'C'))]
+        if not meaningful:
+            total_ms += 50  # 标点停顿
+            continue
+
+        zh_count = sum(1 for c in meaningful if '\u4e00' <= c <= '\u9fff')
+        other_count = len(meaningful) - zh_count
+
+        if zh_count > 0:
+            # 中文词：按词长分配
+            if zh_count == 1:
+                total_ms += 200
+            elif zh_count == 2:
+                total_ms += 380
+            elif zh_count == 3:
+                total_ms += 530
+            else:
+                total_ms += zh_count * 150
+        if other_count > 0:
+            total_ms += other_count * 100  # 英文/数字
+
+    return total_ms
 
 
 def _measure_speed_ratios(
@@ -2341,7 +2399,13 @@ def _char_overlap_ratio(s1: str, s2: str) -> float:
 def _refine_with_llm(
     segments: List[dict], overfast_items: List[dict], llm_config: dict,
 ) -> List[dict]:
-    """使用 LLM 精简过长的翻译（带上下文感知）"""
+    """使用 LLM 精简过长的翻译（多候选 + 分词估算选优）
+
+    改进:
+      1. 上下文只传截断摘要（30字）+ 明确标注"仅供参考，不要重复"
+      2. 每段生成 3 个梯度候选（轻度/中度/大幅精简）
+      3. 用 jieba 分词估算每个候选的朗读时长，选最接近目标的
+    """
     import httpx
     import copy
 
@@ -2360,15 +2424,20 @@ def _refine_with_llm(
         "Content-Type": "application/json",
     }
 
+    CONTEXT_TRUNCATE = 30  # 上下文截断长度
+
     system_prompt = (
         "你是专业的英中翻译优化器。以下中文翻译将用于视频配音，"
         "但当前翻译朗读时间超出原始时间窗口，需要精简。\n"
-        "要求：\n"
-        "1) 保持核心语义不变，用更简洁的中文表达\n"
-        "2) 必须忠实翻译当前英文原文，不得偏离原文含义\n"
-        "3) 严禁与上文或下文重复——精简后的译文不能和相邻段落说同样的话\n"
-        "4) 适合配音朗读，语句自然\n"
-        "5) 只输出精简后的翻译，保持 [编号] 格式，一行一句"
+        "为每段生成 3 个精简版本：\n"
+        "  [轻] 轻度精简（约缩短 15%）：去除冗余修饰，保留完整信息\n"
+        "  [中] 中度精简（约缩短 30%）：简化句式，保留核心信息\n"
+        "  [短] 大幅精简（约缩短 45%）：只保留最核心语义\n\n"
+        "规则：\n"
+        "1) 必须忠实翻译英文原文，不得偏离原文含义\n"
+        "2) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
+        "3) 适合配音朗读，语句自然\n"
+        "4) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
     )
 
     for i in range(0, len(overfast_items), batch_size):
@@ -2378,21 +2447,25 @@ def _refine_with_llm(
             idx = item["idx"]
             ratio = item["speed_ratio"]
             reduction = int((1 - 1.0 / ratio) * 100)
-            prev_zh = segments[idx - 1]["text_zh"] if idx > 0 else "(开头)"
-            next_zh = (segments[idx + 1]["text_zh"]
-                       if idx < len(segments) - 1 else "(结尾)")
+            # 上下文只取截断摘要，明确标注仅供参考
+            prev_zh = segments[idx - 1]["text_zh"][:CONTEXT_TRUNCATE] if idx > 0 else ""
+            next_zh = (segments[idx + 1]["text_zh"][:CONTEXT_TRUNCATE]
+                       if idx < len(segments) - 1 else "")
+            context_hint = ""
+            if prev_zh:
+                context_hint += f"  上文摘要（仅供避免重复，不要从中取内容）: {prev_zh}...\n"
+            if next_zh:
+                context_hint += f"  下文摘要（仅供避免重复，不要从中取内容）: {next_zh}..."
             lines.append(
                 f"[{j+1}]\n"
                 f"  英文: {item['text_en']}\n"
                 f"  当前翻译: {item['text_zh']}\n"
                 f"  需缩短约 {reduction}% (当前需 {ratio:.1f}x 加速)\n"
-                f"  上文: {prev_zh}\n"
-                f"  下文: {next_zh}"
+                + (context_hint if context_hint else "")
             )
 
         user_msg = (
-            f"请精简以下 {len(batch)} 段翻译。"
-            f"每段用 [编号] 格式输出精简后的译文，一行一句：\n\n"
+            f"请为以下 {len(batch)} 段翻译各生成 [轻]/[中]/[短] 三个精简版本：\n\n"
             + "\n\n".join(lines)
         )
 
@@ -2412,22 +2485,143 @@ def _refine_with_llm(
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"].strip()
 
-            translations = _parse_numbered_translations(content, len(batch))
-            for item, new_zh in zip(batch, translations):
-                if new_zh and new_zh.strip():
-                    # 安全网：去除可能的 [N] 前缀
-                    clean_zh = _strip_numbered_prefix(new_zh) if re.match(r"^\[\d+\]", new_zh) else new_zh
-                    # 只有确实变短了才采纳
-                    if len(clean_zh) < len(item["text_zh"]):
-                        # 检查是否与相邻段重复
-                        if _is_duplicate_of_neighbors(clean_zh, item["idx"], refined):
-                            print(f"       ⚠️  #{item['idx']} 精简结果与相邻段重复，跳过")
-                            continue
-                        refined[item["idx"]]["text_zh"] = clean_zh
+            # 解析多候选结果
+            candidates_per_item = _parse_multi_candidates(content, len(batch))
+
+            for item, candidates in zip(batch, candidates_per_item):
+                idx = item["idx"]
+                target_ms = int((segments[idx]["end"] - segments[idx]["start"]) * 1000)
+
+                # 从候选中选最接近目标时长的
+                best_zh = _select_best_candidate(
+                    candidates, target_ms, item["text_zh"], idx, refined)
+
+                if best_zh and len(best_zh) < len(item["text_zh"]):
+                    refined[idx]["text_zh"] = best_zh
         except Exception as e:
             print(f"     ⚠️  LLM 精简批次 {i//batch_size+1} 失败: {e}")
 
     return refined
+
+
+def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]]:
+    """解析 LLM 多候选精简结果。
+
+    预期格式：
+      [1]
+      [轻] xxx
+      [中] xxx
+      [短] xxx
+      [2]
+      ...
+
+    返回: [[候选1, 候选2, 候选3], [候选1, ...], ...]
+    """
+    results = []
+    current_candidates = []
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        # 新段落标记 [N]
+        if re.match(r"^\[(\d+)\]$", line) or re.match(r"^(\d+)\.", line):
+            if current_candidates:
+                results.append(current_candidates)
+            current_candidates = []
+            continue
+
+        # 匹配 [轻]/[中]/[短] 标签
+        tag_match = re.match(r"^\[([轻中短])\]\s*(.+)$", line)
+        if tag_match:
+            text = tag_match.group(2).strip()
+            # 清理可能的 think block 残留
+            text = _strip_think_block(text) if '<think>' in text else text
+            if text:
+                current_candidates.append(text)
+            continue
+
+        # 降级：没有标签的行，可能是单候选格式
+        clean = _strip_numbered_prefix(line) if re.match(r"^\[\d+\]", line) else line
+        if clean and len(clean) >= 2:
+            current_candidates.append(clean)
+
+    if current_candidates:
+        results.append(current_candidates)
+
+    # 补齐不足的
+    while len(results) < expected_count:
+        results.append([])
+
+    return results[:expected_count]
+
+
+def _select_best_candidate(
+    candidates: List[str], target_ms: int, original_zh: str,
+    idx: int, segments: List[dict],
+) -> str:
+    """从多个精简候选中选最接近目标时长的，同时排除与邻段重复的。
+
+    选择策略：
+      1. 排除与相邻段重复的候选
+      2. 排除比原文更长的候选
+      3. 用 jieba 分词估算每个候选的朗读时长
+      4. 选时长最接近 target_ms 且不超出的
+      5. 都超出则选最短的
+    """
+    if not candidates:
+        return ""
+
+    try:
+        _use_jieba = True
+        import jieba  # noqa: F401
+    except ImportError:
+        _use_jieba = False
+
+    valid = []
+    for cand in candidates:
+        if not cand or len(cand.strip()) < 2:
+            continue
+        cand = cand.strip()
+        # 排除比原文更长的
+        if len(cand) >= len(original_zh):
+            continue
+        # 排除与邻段重复的
+        if _is_duplicate_of_neighbors(cand, idx, segments):
+            continue
+        valid.append(cand)
+
+    if not valid:
+        return ""
+
+    if _use_jieba:
+        # 分词估算时长，选最接近目标的
+        scored = []
+        for cand in valid:
+            est_ms = _estimate_duration_jieba(cand) * 1.1  # 含停顿
+            diff = abs(est_ms - target_ms)
+            over = est_ms > target_ms  # 是否超出目标
+            scored.append((cand, est_ms, diff, over))
+
+        # 优先选不超出的；都超出选最接近的
+        not_over = [s for s in scored if not s[3]]
+        if not_over:
+            # 不超出目标的里面，选最接近的
+            best = min(not_over, key=lambda s: s[2])
+        else:
+            # 都超出了，选最短的
+            best = min(scored, key=lambda s: s[1])
+        return best[0]
+    else:
+        # 降级：选字符长度最接近 target 的（粗估 250ms/字）
+        scored = []
+        for cand in valid:
+            zh_chars = sum(1 for c in cand if '\u4e00' <= c <= '\u9fff')
+            est_ms = zh_chars * 250 * 1.1
+            diff = abs(est_ms - target_ms)
+            scored.append((cand, diff))
+        return min(scored, key=lambda s: s[1])[0]
 
 
 def _expand_with_llm(

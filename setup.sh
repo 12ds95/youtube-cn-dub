@@ -77,6 +77,7 @@ PACKAGES=(
     "pydub"
     "yt-dlp"
     "httpx"
+    "demucs"
 )
 
 for pkg in "${PACKAGES[@]}"; do

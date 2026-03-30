@@ -240,12 +240,21 @@ DEFAULT_CONFIG = {
         "model_path": None,          # 模型路径: 如 "CosyVoice-300M"
     },
 
+    # ── 人声/背景音分离 ──
+    "audio_separation": {
+        "enabled": False,            # 是否启用音频分离（需要 demucs: pip install demucs）
+        "model": "htdemucs",         # demucs 模型: htdemucs(默认,快速) / htdemucs_ft(精度更高,更慢)
+        "vocal_volume": 0.0,         # 原始人声音量: 0.0=静音(被中文配音替代) / 0.1=保留一点原声
+        "bgm_volume": 1.0,           # 背景音/伴奏音量: 1.0=原始音量 / 0.5=减半
+        "device": "auto",            # 推理设备: auto(自动检测GPU) / cpu / cuda
+    },
+
     # ── 性能选项 ──
     "tts_concurrency": 5,            # TTS 并发数（远程引擎失败时会自动阶梯降并发）
     "whisper_beam_size": 5,          # Whisper beam search 大小（越大越精确但越慢）
     "skip_steps": [],                # 跳过指定步骤（按执行顺序）:
-                                     #   标准流程(7步): download / extract / transcribe / translate / subtitle / tts / merge
-                                     #   迭代流程(8步): download / extract / transcribe / translate / refine / tts / subtitle / merge
+                                     #   标准流程(7/8步): download / extract / separate / transcribe / translate / subtitle / tts / merge
+                                     #   迭代流程(8/9步): download / extract / separate / transcribe / translate / refine / tts / subtitle / merge
 
     # ── 迭代优化（翻译过长时自动精简）──
     #   小循环（自动）：字符估算语速 → LLM 精简过长翻译 → 再估算 → 仍超速则继续精简，直到收敛
@@ -544,6 +553,72 @@ def extract_audio(video_path: Path, output_dir: Path) -> Path:
     ], capture_output=True, check=True)
     print(f"  ✅ 音频提取完成")
     return audio_path
+
+
+# ─── Step 2.5: 人声/背景音分离 ─────────────────────────────────────
+def separate_audio(audio_path: Path, output_dir: Path,
+                   config: dict = None) -> dict:
+    """使用 demucs 将音频分离为人声和伴奏
+
+    Args:
+        audio_path: 输入音频路径 (audio.wav)
+        output_dir: 视频输出目录
+        config: audio_separation 配置
+
+    Returns:
+        dict: {"vocals": Path, "accompaniment": Path} 分离后的文件路径
+    """
+    config = config or {}
+    vocals_path = output_dir / "audio_vocals.wav"
+    accomp_path = output_dir / "audio_accompaniment.wav"
+
+    # 缓存检查: 两个文件都存在则跳过
+    if vocals_path.exists() and accomp_path.exists():
+        print(f"  ⏭  音频分离结果已缓存，跳过")
+        return {"vocals": vocals_path, "accompaniment": accomp_path}
+
+    model_name = config.get("model", "htdemucs")
+    device = config.get("device", "auto")
+
+    try:
+        import demucs.api
+    except ImportError:
+        raise RuntimeError(
+            "demucs 未安装。请运行: pip install demucs\n"
+            "或在 config.json 中关闭音频分离: \"audio_separation\": {\"enabled\": false}")
+
+    # 确定推理设备
+    import torch
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"  🎛  音频分离中 (model={model_name}, device={device})...")
+
+    t0 = time.time()
+
+    # demucs 输出到临时目录，再提取需要的轨道
+    separator = demucs.api.Separator(model=model_name, device=device)
+    _, separated = separator.separate_audio_file(audio_path)
+
+    # demucs htdemucs 输出 4 轨: drums, bass, other, vocals
+    # 我们需要: vocals (人声) 和 drums+bass+other (伴奏/背景音)
+    import torchaudio
+
+    vocals = separated["vocals"]
+    # 合并非人声轨道为伴奏
+    non_vocal_keys = [k for k in separated.keys() if k != "vocals"]
+    accompaniment = sum(separated[k] for k in non_vocal_keys)
+
+    sample_rate = separator.samplerate
+
+    # 保存为 WAV
+    torchaudio.save(str(vocals_path), vocals.cpu(), sample_rate)
+    torchaudio.save(str(accomp_path), accompaniment.cpu(), sample_rate)
+
+    elapsed = time.time() - t0
+    print(f"  ✅ 音频分离完成 ({elapsed:.1f}s)")
+    print(f"     人声: {vocals_path.name}, 伴奏: {accomp_path.name}")
+
+    return {"vocals": vocals_path, "accompaniment": accomp_path}
 
 
 # ─── Step 3: 语音识别 ──────────────────────────────────────────────
@@ -2820,19 +2895,58 @@ def clean_iterations(output_dir: Path):
 
 # ─── Step 7: 合成视频 ─────────────────────────────────────────────
 def merge_final_video(video_path: Path, dub_path: Path,
-                      output_dir: Path, volume: float = 0.15) -> Path:
+                      output_dir: Path, volume: float = 0.15,
+                      audio_sep_config: dict = None) -> Path:
+    """合成最终视频
+
+    当 audio_sep_config 启用时，使用分离后的人声/伴奏轨独立混音；
+    否则回退到原始音频整体降音量的方式。
+    """
     print(f"  🎬 合成最终视频...")
     final_path = output_dir / "final.mp4"
-    subprocess.run([
-        "ffmpeg",
-        "-i", str(video_path), "-i", str(dub_path),
-        "-filter_complex",
-        f"[0:a]volume={volume}[bg];[1:a]aresample=44100[dub];"
-        f"[bg][dub]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        str(final_path), "-y"
-    ], capture_output=True, check=True)
+
+    sep_cfg = audio_sep_config or {}
+    vocals_path = output_dir / "audio_vocals.wav"
+    accomp_path = output_dir / "audio_accompaniment.wav"
+    use_separation = (sep_cfg.get("enabled", False)
+                      and vocals_path.exists()
+                      and accomp_path.exists())
+
+    if use_separation:
+        vocal_vol = sep_cfg.get("vocal_volume", 0.0)
+        bgm_vol = sep_cfg.get("bgm_volume", 1.0)
+        print(f"  🎛  使用人声/伴奏分离混音 (vocal={vocal_vol}, bgm={bgm_vol})")
+        # 输入: 0=video, 1=vocals, 2=accompaniment, 3=dub
+        subprocess.run([
+            "ffmpeg",
+            "-i", str(video_path),
+            "-i", str(vocals_path),
+            "-i", str(accomp_path),
+            "-i", str(dub_path),
+            "-filter_complex",
+            f"[1:a]volume={vocal_vol},aresample=44100[voc];"
+            f"[2:a]volume={bgm_vol},aresample=44100[bgm];"
+            f"[3:a]aresample=44100[dub];"
+            f"[voc][bgm][dub]amix=inputs=3:duration=first"
+            f":dropout_transition=2[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            str(final_path), "-y"
+        ], capture_output=True, check=True)
+    else:
+        if sep_cfg.get("enabled", False):
+            print(f"  ⚠️  音频分离已启用但分离文件不存在，回退到整体降音量模式")
+        subprocess.run([
+            "ffmpeg",
+            "-i", str(video_path), "-i", str(dub_path),
+            "-filter_complex",
+            f"[0:a]volume={volume}[bg];[1:a]aresample=44100[dub];"
+            f"[bg][dub]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            str(final_path), "-y"
+        ], capture_output=True, check=True)
+
     print(f"  ✅ 最终视频: {final_path}")
     return final_path
 
@@ -2844,7 +2958,13 @@ async def process_video(config: dict):
     t_start = time.time()
     skip = set(config.get("skip_steps", []))
     refine_enabled = config.get("refine", {}).get("enabled", False)
-    total_steps = 8 if refine_enabled else 7
+    sep_enabled = config.get("audio_separation", {}).get("enabled", False)
+    base_steps = 7
+    if refine_enabled:
+        base_steps += 1
+    if sep_enabled:
+        base_steps += 1
+    total_steps = base_steps
 
     # 确定输出目录
     if config["resume_from"]:
@@ -2894,12 +3014,21 @@ async def process_video(config: dict):
 
     cache_file = output_dir / "segments_cache.json"
 
+    # ── 步骤计数器（因为 separate 步骤可选，后续编号动态偏移）──
+    _step = 0
+
+    def _next_step():
+        nonlocal _step
+        _step += 1
+        return _step
+
     # Step 1: 下载
     _logger.step_begin("下载视频")
     video_path = output_dir / "original.mp4"
     title = "unknown"
+    step_n = _next_step()
     if "download" not in skip:
-        _log(f"[1/{total_steps}] 下载视频")
+        _log(f"[{step_n}/{total_steps}] 下载视频")
         if config["resume_from"] and video_path.exists():
             _log(f"  ⏭  使用已有视频")
             info_file = output_dir / "info.json"
@@ -2924,7 +3053,7 @@ async def process_video(config: dict):
         config["video_title"] = title
         _log("")
     elif not video_path.exists():
-        _log(f"[1/{total_steps}] 下载视频 - 跳过")
+        _log(f"[{step_n}/{total_steps}] 下载视频 - 跳过")
         _log(f"  ⚠️  视频文件不存在: {video_path}")
         _log(f"     从 skip_steps 移除 'download' 或手动放置视频文件")
         _log("")
@@ -2933,8 +3062,9 @@ async def process_video(config: dict):
     # Step 2: 提取音频
     _logger.step_begin("提取音频")
     audio_path = output_dir / "audio.wav"
+    step_n = _next_step()
     if "extract" not in skip:
-        _log(f"[2/{total_steps}] 提取音频")
+        _log(f"[{step_n}/{total_steps}] 提取音频")
         if not video_path.exists():
             _logger.log_error(
                 "前置条件缺失", f"视频文件不存在，无法提取音频: {video_path}",
@@ -2954,17 +3084,59 @@ async def process_video(config: dict):
             return
         _log("")
     elif not audio_path.exists():
-        _log(f"[2/{total_steps}] 提取音频 - 跳过")
+        _log(f"[{step_n}/{total_steps}] 提取音频 - 跳过")
         _log(f"  ⚠️  音频文件不存在: {audio_path}")
         _log("")
     _logger.step_end()
 
+    # Step 2.5: 音频分离（可选）
+    if sep_enabled:
+        _logger.step_begin("音频分离")
+        step_n = _next_step()
+        if "separate" not in skip:
+            _log(f"[{step_n}/{total_steps}] 人声/背景音分离")
+            if not audio_path.exists():
+                _logger.log_error(
+                    "前置条件缺失",
+                    f"音频文件不存在，无法进行分离: {audio_path}",
+                    "确保 extract 步骤已执行或音频文件已存在")
+                _logger.close()
+                return
+            try:
+                sep_result = separate_audio(
+                    audio_path, output_dir,
+                    config.get("audio_separation", {}))
+            except Exception as e:
+                _logger.log_error(
+                    "音频分离失败",
+                    f"demucs 分离失败",
+                    "1. 确认 demucs 已安装: pip install demucs\n"
+                    "2. 首次运行需下载模型（~300MB），确保网络畅通\n"
+                    "3. 如 GPU 内存不足，可设置 \"device\": \"cpu\"\n"
+                    "4. 关闭此功能: \"audio_separation\": {\"enabled\": false}",
+                    exception=e)
+                _logger.close()
+                return
+            _log("")
+        else:
+            _log(f"[{step_n}/{total_steps}] 音频分离 - 跳过")
+            vocals_path = output_dir / "audio_vocals.wav"
+            accomp_path = output_dir / "audio_accompaniment.wav"
+            if not vocals_path.exists() or not accomp_path.exists():
+                _log(f"  ⚠️  分离文件不存在，合成阶段将回退到整体降音量模式")
+            else:
+                _log(f"  ⏭  使用已有分离结果")
+            _log("")
+        _logger.step_end()
+
     # Step 3+4: 转录 + 翻译
     _logger.step_begin("转录+翻译")
     transcribe_cache = output_dir / "transcribe_cache.json"  # 转录中间结果（纯英文）
+    step_transcribe = _next_step()
+    step_translate = _next_step()
     if cache_file.exists():
-        _log(f"[3/{total_steps}] 语音识别" + (" - 跳过" if "transcribe" in skip else ""))
-        _log(f"[4/{total_steps}] 翻译" + (" - 跳过" if "translate" in skip else ""))
+        _log(f"[{step_transcribe}/{total_steps}] 语音识别" + (" - 跳过" if "transcribe" in skip else ""))
+        _log(f"[{step_translate}/{total_steps}] 翻译" + (" - 跳过" if "translate" in skip else ""))
         _log("  ⏭  使用缓存 (segments_cache.json)")
         with open(cache_file, "r", encoding="utf-8") as f:
             segments = json.load(f)
@@ -2973,7 +3145,7 @@ async def process_video(config: dict):
     else:
         raw_segments = []
         if "transcribe" not in skip:
-            _log(f"[3/{total_steps}] 语音识别 (Whisper)")
+            _log(f"[{step_transcribe}/{total_steps}] 语音识别 (Whisper)")
             if not audio_path.exists():
                 _logger.log_error(
                     "前置条件缺失", f"音频文件不存在: {audio_path}",
@@ -3001,7 +3173,7 @@ async def process_video(config: dict):
                 return
             _log("")
         else:
-            _log(f"[3/{total_steps}] 语音识别 - 跳过")
+            _log(f"[{step_transcribe}/{total_steps}] 语音识别 - 跳过")
             # ── 从转录缓存加载（支持单独跳过 transcribe） ──
             if transcribe_cache.exists():
                 with open(transcribe_cache, "r", encoding="utf-8") as f:
@@ -3028,7 +3200,7 @@ async def process_video(config: dict):
                     "检查 Whisper 是否正确识别了语音内容，或手动检查音频文件")
                 _logger.close()
                 return
-            _log(f"[4/{total_steps}] 翻译")
+            _log(f"[{step_translate}/{total_steps}] 翻译")
             try:
                 segments = translate_segments(raw_segments, config)
                 segments = deduplicate_segments(segments)
@@ -3051,7 +3223,7 @@ async def process_video(config: dict):
                 return
             _log("")
         else:
-            _log(f"[4/{total_steps}] 翻译 - 跳过")
+            _log(f"[{step_translate}/{total_steps}] 翻译 - 跳过")
             segments = []
             _log("")
     _logger.step_end()
@@ -3098,21 +3270,23 @@ async def process_video(config: dict):
 
     # ──────────── 分支: 标准 vs 迭代优化 ────────────
     if refine_enabled and segments:
-        # ── 迭代优化流程 (8步) ──
+        # ── 迭代优化流程 ──
 
-        # Step 5: 迭代优化翻译（纯文本，基于字符数估算，不需要 TTS）
+        # 迭代优化翻译（纯文本，基于字符数估算，不需要 TTS）
         _logger.step_begin("迭代优化")
+        step_n = _next_step()
         if "refine" not in skip:
-            _log(f"[5/{total_steps}] 迭代优化翻译（字符估算）")
+            _log(f"[{step_n}/{total_steps}] 迭代优化翻译（字符估算）")
             segments = await run_refinement_loop(segments, output_dir, config)
             _log("")
         _logger.step_end()
 
-        # Step 6: 翻译定稿后一次性生成 TTS
+        # 翻译定稿后一次性生成 TTS
         _logger.step_begin("生成TTS")
         tts_dir = output_dir / "tts_segments"
+        step_n = _next_step()
         if "tts" not in skip:
-            _log(f"[6/{total_steps}] 生成 TTS 片段")
+            _log(f"[{step_n}/{total_steps}] 生成 TTS 片段")
             _log(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
             # 清除旧的 TTS 缓存（翻译已变更，旧文件内容可能不匹配）
             # 但如果存在 tts_failure.json（断点恢复场景），保留已有文件，只重试失败片段
@@ -3128,7 +3302,7 @@ async def process_video(config: dict):
                 config=config)
             _log("")
         else:
-            _log(f"[6/{total_steps}] 生成 TTS - 跳过")
+            _log(f"[{step_n}/{total_steps}] 生成 TTS - 跳过")
             tts_files = list(tts_dir.glob("seg_*.mp3")) if tts_dir.exists() else []
             if not tts_files:
                 _logger.log_error(
@@ -3143,19 +3317,21 @@ async def process_video(config: dict):
             _log("")
         _logger.step_end()
 
-        # Step 7: 字幕 + 时间线对齐
+        # 字幕 + 时间线对齐
         _logger.step_begin("字幕+对齐")
+        step_n = _next_step()
         if segments:
-            _log(f"[7/{total_steps}] 生成字幕 + 时间线对齐")
+            _log(f"[{step_n}/{total_steps}] 生成字幕 + 时间线对齐")
             if "subtitle" not in skip:
                 generate_srt_files(segments, output_dir)
             dub_path = _align_tts_to_timeline(segments, output_dir)
             _log("")
         _logger.step_end()
 
-        # Step 8: 合成
+        # 合成
         _logger.step_begin("合成视频")
         dub_path = output_dir / "chinese_dub.wav"
+        step_n = _next_step()
         if "merge" not in skip:
             if not dub_path.exists():
                 _logger.log_error(
@@ -3165,36 +3341,39 @@ async def process_video(config: dict):
                     "确认 tts 步骤未被跳过，或之前运行已生成该文件。")
                 _logger.close()
                 return
-            _log(f"[8/{total_steps}] 合成最终视频")
+            _log(f"[{step_n}/{total_steps}] 合成最终视频")
             final_path = merge_final_video(
-                video_path, dub_path, output_dir, config["volume"])
+                video_path, dub_path, output_dir, config["volume"],
+                audio_sep_config=config.get("audio_separation"))
             _log("")
         else:
-            _log(f"[8/{total_steps}] 合成视频 - 跳过")
+            _log(f"[{step_n}/{total_steps}] 合成视频 - 跳过")
             _log("")
         _logger.step_end()
     else:
-        # ── 标准流程 (7步) ──
+        # ── 标准流程 ──
 
-        # Step 5: 字幕
+        # 字幕
         _logger.step_begin("生成字幕")
+        step_n = _next_step()
         if "subtitle" not in skip and segments:
-            _log(f"[5/{total_steps}] 生成字幕")
+            _log(f"[{step_n}/{total_steps}] 生成字幕")
             srt_en, srt_zh, srt_bi = generate_srt_files(segments, output_dir)
             _log("")
         _logger.step_end()
 
-        # Step 6: 配音
+        # 配音
         _logger.step_begin("生成配音")
+        step_n = _next_step()
         if "tts" not in skip and segments:
-            _log(f"[6/{total_steps}] 生成中文配音")
+            _log(f"[{step_n}/{total_steps}] 生成中文配音")
             dub_path = await generate_chinese_dub(
                 segments, output_dir, config["voice"],
                 config.get("tts_concurrency", 5),
                 config=config)
             _log("")
         elif "tts" in skip:
-            _log(f"[6/{total_steps}] 生成配音 - 跳过")
+            _log(f"[{step_n}/{total_steps}] 生成配音 - 跳过")
             tts_dir = output_dir / "tts_segments"
             tts_files = list(tts_dir.glob("seg_*.mp3")) if tts_dir.exists() else []
             if not tts_files:
@@ -3210,9 +3389,10 @@ async def process_video(config: dict):
             _log("")
         _logger.step_end()
 
-        # Step 7: 合成
+        # 合成
         _logger.step_begin("合成视频")
         dub_path = output_dir / "chinese_dub.wav"
+        step_n = _next_step()
         if "merge" not in skip:
             if not dub_path.exists():
                 _logger.log_error(
@@ -3222,12 +3402,13 @@ async def process_video(config: dict):
                     "确认 tts 步骤未被跳过，或之前运行已生成该文件。")
                 _logger.close()
                 return
-            _log(f"[7/{total_steps}] 合成最终视频")
+            _log(f"[{step_n}/{total_steps}] 合成最终视频")
             final_path = merge_final_video(
-                video_path, dub_path, output_dir, config["volume"])
+                video_path, dub_path, output_dir, config["volume"],
+                audio_sep_config=config.get("audio_separation"))
             _log("")
         else:
-            _log(f"[7/{total_steps}] 合成视频 - 跳过")
+            _log(f"[{step_n}/{total_steps}] 合成视频 - 跳过")
             _log("")
         _logger.step_end()
 

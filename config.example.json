@@ -96,10 +96,20 @@
     "model_path": "CosyVoice-300M"
   },
 
+  "__=== 人声/背景音分离 ===__": "",
+  "audio_separation": {
+    "__说明__": "使用 demucs 分离人声和伴奏，合成时独立控制音量。首次运行需下载模型(~300MB)。安装: pip install demucs",
+    "enabled": false,
+    "model": "htdemucs",
+    "vocal_volume": 0.0,
+    "bgm_volume": 1.0,
+    "device": "auto"
+  },
+
   "__=== 性能选项 ===__": "",
   "tts_concurrency": 5,
   "whisper_beam_size": 5,
-  "__skip_steps 说明__": "按执行顺序: download / extract / transcribe / translate / refine / tts / subtitle / merge",
+  "__skip_steps 说明__": "按执行顺序: download / extract / separate / transcribe / translate / refine / tts / subtitle / merge",
   "skip_steps": [],
 
   "__=== 迭代优化 ===__": "",

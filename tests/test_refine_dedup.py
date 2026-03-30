@@ -9,7 +9,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline import (_is_duplicate_of_neighbors, _char_overlap_ratio,
-                      deduplicate_segments, _check_refine_fidelity)
+                      deduplicate_segments, _check_refine_fidelity,
+                      _clean_refine_artifacts, _parse_multi_candidates)
 
 
 # ─── 邻段重复检测测试 ───────────────────────────────────────────
@@ -216,6 +217,65 @@ def test_fidelity_allows_heavy_simplification():
     print("  ✅ test_fidelity_allows_heavy_simplification")
 
 
+# ─── 标签清理测试 ─────────────────────────────────────────────────
+
+def test_clean_markdown_bold_tag():
+    """清理 **[轻]** 格式"""
+    assert _clean_refine_artifacts("**[轻]** 从1字符到块大小") == "从1字符到块大小"
+    print("  ✅ test_clean_markdown_bold_tag")
+
+
+def test_clean_bullet_tag():
+    """清理 - [中] 格式"""
+    assert _clean_refine_artifacts("- [中] 希望变换器熟悉所有上下文") == "希望变换器熟悉所有上下文"
+    print("  ✅ test_clean_bullet_tag")
+
+
+def test_clean_plain_tag():
+    """清理 [短] 格式"""
+    assert _clean_refine_artifacts("[短] 线性模型") == "线性模型"
+    print("  ✅ test_clean_plain_tag")
+
+
+def test_clean_system_echo():
+    """LLM 回显系统指令应返回空"""
+    text = "以下为每段翻译的三个精简版本（[轻]/[中]/[短]），严格遵循："
+    assert _clean_refine_artifacts(text) == ""
+    print("  ✅ test_clean_system_echo")
+
+
+def test_clean_normal_text_untouched():
+    """正常翻译文本不应被修改"""
+    text = "这是一段正常的翻译文本。"
+    assert _clean_refine_artifacts(text) == text
+    print("  ✅ test_clean_normal_text_untouched")
+
+
+def test_parse_candidates_with_markdown_tags():
+    """
+    复现 kCc8FmEb1nY 实际 bug：LLM 用 markdown 格式输出候选。
+    解析后候选中不应包含 [轻]/[中]/[短] 标签。
+    """
+    content = """[1]
+**[轻]** 从1字符到块大小——希望变换器习惯所有上下文长度。
+**[中]** 从1到块大小——让变换器习惯各种长度。
+**[短]** 习惯各种上下文长度。
+
+[2]
+- [轻] 现在开始喂数据进网络——先从最简单的模型入手。
+- [中] 开始喂数据——先用最简单模型。
+- [短] 喂数据，最简模型。"""
+    results = _parse_multi_candidates(content, 2)
+    assert len(results) == 2
+    for group in results:
+        for cand in group:
+            assert "[轻]" not in cand, f"候选中残留标签: {cand}"
+            assert "[中]" not in cand, f"候选中残留标签: {cand}"
+            assert "[短]" not in cand, f"候选中残留标签: {cand}"
+            assert "**" not in cand, f"候选中残留 markdown: {cand}"
+    print("  ✅ test_parse_candidates_with_markdown_tags")
+
+
 if __name__ == "__main__":
     print("邻段重复检测测试:")
     test_exact_duplicate_neighbor()
@@ -240,5 +300,13 @@ if __name__ == "__main__":
     test_fidelity_blocks_cascade_shift()
     test_fidelity_allows_legitimate_simplification()
     test_fidelity_allows_heavy_simplification()
+    print()
+    print("标签清理测试:")
+    test_clean_markdown_bold_tag()
+    test_clean_bullet_tag()
+    test_clean_plain_tag()
+    test_clean_system_echo()
+    test_clean_normal_text_untouched()
+    test_parse_candidates_with_markdown_tags()
     print()
     print("  全部通过")

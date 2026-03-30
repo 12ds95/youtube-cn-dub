@@ -2530,6 +2530,25 @@ def _refine_with_llm(
     return refined
 
 
+def _clean_refine_artifacts(text: str) -> str:
+    """清理翻译文本中残留的 refine 格式标签。
+
+    处理 LLM 输出中可能泄漏的标签格式：
+      **[轻]** xxx → xxx
+      - [中] xxx   → xxx
+      [短] xxx     → xxx
+    以及 LLM 回显的系统指令文本。
+    """
+    if not text:
+        return text
+    # 去除行首的 markdown/列表标记 + [轻]/[中]/[短] 标签
+    text = re.sub(r"^[-*]*\s*\*{0,2}\[([轻中短])\]\*{0,2}\s*", "", text.strip())
+    # 如果整行都是系统指令回显（如"以下为每段翻译的三个精简版本..."），返回空
+    if re.search(r"[轻中短].*[/／].*[轻中短]", text):
+        return ""
+    return text.strip()
+
+
 def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]]:
     """解析 LLM 多候选精简结果。
 
@@ -2541,6 +2560,10 @@ def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]
       [2]
       ...
 
+    也兼容 LLM 的非标准变体：
+      **[轻]** xxx  (markdown 加粗)
+      - [轻] xxx    (列表符号)
+
     返回: [[候选1, 候选2, 候选3], [候选1, ...], ...]
     """
     results = []
@@ -2551,25 +2574,34 @@ def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]
         if not line:
             continue
 
-        # 新段落标记 [N]
-        if re.match(r"^\[(\d+)\]$", line) or re.match(r"^(\d+)\.", line):
+        # 跳过 LLM 回显系统指令的行（如 "以下为每段翻译的三个精简版本..."）
+        if re.search(r"[轻中短].*[/／].*[轻中短]", line):
+            continue
+
+        # 新段落标记 [N] 或 **[N]**
+        if re.match(r"^\*{0,2}\[(\d+)\]\*{0,2}$", line) or re.match(r"^(\d+)\.", line):
             if current_candidates:
                 results.append(current_candidates)
             current_candidates = []
             continue
 
-        # 匹配 [轻]/[中]/[短] 标签
-        tag_match = re.match(r"^\[([轻中短])\]\s*(.+)$", line)
+        # 匹配 [轻]/[中]/[短] 标签，兼容 markdown 和列表前缀
+        # 覆盖: [轻] xxx, **[轻]** xxx, - [轻] xxx, * [轻] xxx
+        tag_match = re.match(
+            r"^[-*]*\s*\*{0,2}\[([轻中短])\]\*{0,2}\s*(.+)$", line)
         if tag_match:
             text = tag_match.group(2).strip()
             # 清理可能的 think block 残留
             text = _strip_think_block(text) if '<think>' in text else text
+            # 最终清理残留标签
+            text = _clean_refine_artifacts(text)
             if text:
                 current_candidates.append(text)
             continue
 
         # 降级：没有标签的行，可能是单候选格式
         clean = _strip_numbered_prefix(line) if re.match(r"^\[\d+\]", line) else line
+        clean = _clean_refine_artifacts(clean)
         if clean and len(clean) >= 2:
             current_candidates.append(clean)
 
@@ -2610,7 +2642,10 @@ def _select_best_candidate(
     for cand in candidates:
         if not cand or len(cand.strip()) < 2:
             continue
-        cand = cand.strip()
+        # 清理残留的 refine 格式标签
+        cand = _clean_refine_artifacts(cand)
+        if not cand or len(cand) < 2:
+            continue
         # 排除比原文更长的
         if len(cand) >= len(original_zh):
             continue

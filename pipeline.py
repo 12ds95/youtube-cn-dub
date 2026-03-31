@@ -38,12 +38,17 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
             └── ...
 """
 
+# CTranslate2 (faster-whisper) 和 PyTorch (demucs/numpy) 各自链接了一份
+# libiomp5 (OpenMP)，同一进程中加载两份会触发 SIGABRT。
+# 必须在任何 import 之前设置此环境变量。
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import asyncio
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import subprocess

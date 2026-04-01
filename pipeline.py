@@ -43,7 +43,6 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
 # 必须在任何 import 之前设置此环境变量。
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import argparse
 import asyncio
@@ -570,8 +569,8 @@ def separate_audio(video_path: Path, output_dir: Path,
                    config: dict = None) -> dict:
     """使用 demucs 将原始音频分离为人声和伴奏
 
-    关键：直接从 original.mp4 提取 44.1kHz 立体声音频给 demucs，
-    而不是用 audio.wav（16kHz 单声道，为 Whisper 优化，分离效果极差）。
+    通过子进程运行 demucs，避免 PyTorch 的 libiomp5 与主进程中
+    ctranslate2 (faster-whisper) 的 libiomp5 冲突导致死锁。
 
     Args:
         video_path: 原始视频路径 (original.mp4)
@@ -593,24 +592,7 @@ def separate_audio(video_path: Path, output_dir: Path,
     model_name = config.get("model", "htdemucs")
     device = config.get("device", "auto")
 
-    try:
-        from demucs.pretrained import get_model
-        from demucs.separate import load_track, apply_model, save_audio
-    except ImportError:
-        raise RuntimeError(
-            "demucs 未安装。请运行: pip install demucs\n"
-            "或在 config.json 中关闭音频分离: \"audio_separation\": {\"enabled\": false}")
-
-    # 确定推理设备
-    import torch
-    if device == "auto":
-        device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device_str = device
-    print(f"  🎛  音频分离中 (model={model_name}, device={device_str})...")
-
     # Step 1: 从原始视频提取高品质音频（44.1kHz 立体声）
-    # audio.wav 是 16kHz 单声道（Whisper 专用），不适合音频分离
     hq_audio = output_dir / "audio_hq.wav"
     if not hq_audio.exists():
         print(f"     提取高品质音频 (44.1kHz stereo)...")
@@ -620,33 +602,59 @@ def separate_audio(video_path: Path, output_dir: Path,
             str(hq_audio), "-y"
         ], capture_output=True, check=True)
 
+    print(f"  🎛  音频分离中 (model={model_name}, device={device})...")
+    print(f"     (子进程运行 demucs，避免 libiomp5 冲突)")
     t0 = time.time()
 
-    # Step 2: demucs 分离
-    from demucs.pretrained import SOURCES
-    model = get_model(model_name)
-    device_obj = torch.device(device_str)
-    model.to(device_obj)
-    model.eval()
+    # Step 2: 在子进程中运行 demucs，避免与 ctranslate2 的 libiomp5 死锁
+    demucs_script = f'''
+import torch
+from demucs.pretrained import get_model, SOURCES
+from demucs.separate import load_track, apply_model, save_audio
+from pathlib import Path
 
-    wav = load_track(hq_audio, model.audio_channels, model.samplerate)
-    wav = wav.to(device_obj)
+model_name = {model_name!r}
+device_cfg = {device!r}
+hq_audio = Path({str(hq_audio)!r})
+vocals_path = Path({str(vocals_path)!r})
+accomp_path = Path({str(accomp_path)!r})
 
-    with torch.no_grad():
-        sources = apply_model(model, wav.unsqueeze(0), device=device_obj,
-                              shifts=1, split=True, overlap=0.25,
-                              progress=False)[0]
+if device_cfg == "auto":
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+else:
+    device_str = device_cfg
 
-    # htdemucs 输出 4 轨: drums, bass, other, vocals
-    src_map = {name: s for name, s in zip(SOURCES, sources)}
-    vocals = src_map["vocals"]
-    accompaniment = sum(s for name, s in src_map.items() if name != "vocals")
+model = get_model(model_name)
+device_obj = torch.device(device_str)
+model.to(device_obj)
+model.eval()
 
-    # 保存为 WAV
-    save_audio(vocals.cpu(), vocals_path, model.samplerate)
-    save_audio(accompaniment.cpu(), accomp_path, model.samplerate)
+wav = load_track(hq_audio, model.audio_channels, model.samplerate)
+wav = wav.to(device_obj)
 
-    # 清理高品质中间文件（分离结果已保存，不再需要）
+with torch.no_grad():
+    sources = apply_model(model, wav.unsqueeze(0), device=device_obj,
+                          shifts=1, split=True, overlap=0.25,
+                          progress=False)[0]
+
+src_map = {{name: s for name, s in zip(SOURCES, sources)}}
+vocals = src_map["vocals"]
+accompaniment = sum(s for name, s in src_map.items() if name != "vocals")
+
+save_audio(vocals.cpu(), vocals_path, model.samplerate)
+save_audio(accompaniment.cpu(), accomp_path, model.samplerate)
+print("DEMUCS_OK")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", demucs_script],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+
+    if result.returncode != 0 or "DEMUCS_OK" not in result.stdout:
+        error_msg = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"demucs 子进程失败: {error_msg}")
+
+    # 清理高品质中间文件
     hq_audio.unlink(missing_ok=True)
 
     elapsed = time.time() - t0

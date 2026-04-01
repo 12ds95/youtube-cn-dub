@@ -43,6 +43,7 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
 # 必须在任何 import 之前设置此环境变量。
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import argparse
 import asyncio

@@ -1122,7 +1122,7 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 if re.match(r"^\[\d+\]", text_zh):
                     text_zh = _strip_numbered_prefix(text_zh)
                 # 清除 LLM 可能输出的 markdown 格式标记
-                text_zh = _strip_markdown(text_zh)
+                text_zh = _strip_markdown(text_zh, seg["text"])
             batch_results.append({
                 "start": seg["start"], "end": seg["end"],
                 "text_en": seg["text"], "text_zh": text_zh or seg["text"],
@@ -1202,7 +1202,7 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                     resp.raise_for_status()
                     zh = resp.json()["choices"][0]["message"]["content"].strip()
                     zh = _strip_think_block(zh)
-                    zh = _strip_markdown(zh)
+                    zh = _strip_markdown(zh, seg["text"])
                     if zh and len(zh.strip()) >= 2:
                         break
                     zh = None  # 空结果，重试
@@ -1219,33 +1219,39 @@ def _strip_think_block(content: str) -> str:
     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
-def _strip_markdown(text: str) -> str:
-    """去除翻译文本中的 Markdown 格式标记。
+def _strip_markdown(text: str, original: str = "") -> str:
+    """去除翻译文本中 LLM 额外添加的 Markdown 格式标记。
 
-    处理 LLM 输出中常见的 markdown 语法：
-      **加粗** / __加粗__  → 加粗
-      *斜体* / _斜体_     → 斜体
-      `行内代码`          → 行内代码
-      ~~删除线~~          → 删除线
-      # 标题              → 标题
-    注意：不处理合法的下划线（如变量名 vocab_size）。
+    只清除原文中不存在的 markdown 符号，保留原文本身就有的字符。
+    例如原文 "3 * 4 = 12" 中的 * 是乘号，翻译后应保留。
+
+    参数:
+        text:     翻译后的中文文本
+        original: 对应的英文原文（用于判断哪些符号是原文自带的）
     """
     if not text:
         return text
     # 反引号包裹的行内代码 `xxx` → xxx
-    text = re.sub(r'`([^`]+)`', r'\1', text)
+    if '`' not in original:
+        text = re.sub(r'`([^`]+)`', r'\1', text)
     # 加粗 **xxx** 或 __xxx__
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'__(.+?)__', r'\1', text)
+    if '**' not in original:
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    if '__' not in original:
+        text = re.sub(r'__(.+?)__', r'\1', text)
     # 斜体 *xxx*（但不匹配单独的 * 或乘号前后有空格的情况）
-    text = re.sub(r'(?<!\*)\*([^\s*][^*]*[^\s*])\*(?!\*)', r'\1', text)
+    if '*' not in original:
+        text = re.sub(r'(?<!\*)\*([^\s*][^*]*[^\s*])\*(?!\*)', r'\1', text)
     # 斜体 _xxx_（仅匹配前后有空格或行首行尾的，避免破坏 snake_case 变量名）
-    text = re.sub(r'(?<=\s)_([^_]+)_(?=\s|$)', r'\1', text)
-    text = re.sub(r'^_([^_]+)_(?=\s|$)', r'\1', text)
+    if '_' not in original:
+        text = re.sub(r'(?<=\s)_([^_]+)_(?=\s|$)', r'\1', text)
+        text = re.sub(r'^_([^_]+)_(?=\s|$)', r'\1', text)
     # 删除线 ~~xxx~~
-    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    if '~' not in original:
+        text = re.sub(r'~~(.+?)~~', r'\1', text)
     # 行首 # 标题标记
-    text = re.sub(r'^#{1,6}\s+', '', text)
+    if '#' not in original:
+        text = re.sub(r'^#{1,6}\s+', '', text)
     return text.strip()
 
 
@@ -1286,9 +1292,6 @@ def _parse_numbered_translations(content: str, expected_count: int) -> List[str]
     translations = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
                     for t in translations]
 
-    # 第四层：清除 markdown 格式标记
-    translations = [_strip_markdown(t) for t in translations]
-
     # 补足或截断
     while len(translations) < expected_count:
         translations.append("")
@@ -1316,7 +1319,7 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
          open(paths["bi"], "w", encoding="utf-8") as fbi:
         for idx, seg in enumerate(segments, 1):
             ts = f"{format_srt_time(seg['start'])} --> {format_srt_time(seg['end'])}"
-            text_zh = _strip_markdown(seg['text_zh'])
+            text_zh = _strip_markdown(seg['text_zh'], seg.get('text_en', ''))
             fen.write(f"{idx}\n{ts}\n{seg['text_en']}\n\n")
             fzh.write(f"{idx}\n{ts}\n{text_zh}\n\n")
             fbi.write(f"{idx}\n{ts}\n{text_zh}\n{seg['text_en']}\n\n")
@@ -1711,7 +1714,7 @@ async def _generate_tts_segments(
     for idx, seg in enumerate(segments):
         text_zh = seg.get("text_zh", seg.get("text", ""))
         # 最后防线：清除可能残留的 markdown 格式标记
-        text_zh = _strip_markdown(text_zh)
+        text_zh = _strip_markdown(text_zh, seg.get("text_en", seg.get("text", "")))
         if len(text_zh.strip()) >= 2:
             # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
             if not re.search(r'[\u4e00-\u9fff\u3400-\u4dbfa-zA-Z0-9]', text_zh):

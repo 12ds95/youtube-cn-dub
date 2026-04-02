@@ -257,6 +257,8 @@ DEFAULT_CONFIG = {
     # ── 性能选项 ──
     "tts_concurrency": 5,            # TTS 并发数（远程引擎失败时会自动阶梯降并发）
     "whisper_beam_size": 5,          # Whisper beam search 大小（越大越精确但越慢）
+    "cpu_threads": 0,                # CPU 线程数限制: 0=使用所有核心, N=限制为 N 线程
+                                     # 影响: demucs / whisper / ffmpeg atempo 并行数
     "skip_steps": [],                # 跳过指定步骤（按执行顺序）:
                                      #   标准流程(7/8步): download / extract / separate / transcribe / translate / subtitle / tts / merge
                                      #   迭代流程(8/9步): download / extract / separate / transcribe / translate / refine / tts / subtitle / merge
@@ -565,8 +567,9 @@ def extract_audio(video_path: Path, output_dir: Path) -> Path:
 
 
 # ─── Step 2.5: 人声/背景音分离 ─────────────────────────────────────
+
 def separate_audio(video_path: Path, output_dir: Path,
-                   config: dict = None) -> dict:
+                   config: dict = None, cpu_threads: int = 0) -> dict:
     """使用 demucs 将原始音频分离为人声和伴奏
 
     通过子进程运行 demucs，避免 PyTorch 的 libiomp5 与主进程中
@@ -607,8 +610,13 @@ def separate_audio(video_path: Path, output_dir: Path,
     t0 = time.time()
 
     # Step 2: 在子进程中运行 demucs，避免与 ctranslate2 的 libiomp5 死锁
+    thread_limit = cpu_threads if cpu_threads > 0 else 0
     demucs_script = f'''
+import os
 import torch
+if {thread_limit} > 0:
+    torch.set_num_threads({thread_limit})
+    os.environ["OMP_NUM_THREADS"] = str({thread_limit})
 from demucs.pretrained import get_model, SOURCES
 from demucs.separate import load_track, apply_model, save_audio
 from pathlib import Path
@@ -643,7 +651,16 @@ accompaniment = sum(s for name, s in src_map.items() if name != "vocals")
 
 save_audio(vocals.cpu(), vocals_path, model.samplerate)
 save_audio(accompaniment.cpu(), accomp_path, model.samplerate)
+
+# 清理: 释放资源
+del model, sources, wav, src_map, vocals, accompaniment
+import gc
+gc.collect()
+
 print("DEMUCS_OK")
+import sys
+sys.stdout.flush()
+os._exit(0)  # 强制退出，跳过 atexit 清理
 '''
     result = subprocess.run(
         [sys.executable, "-c", demucs_script],
@@ -666,7 +683,7 @@ print("DEMUCS_OK")
 
 # ─── Step 3: 语音识别 ──────────────────────────────────────────────
 def transcribe_audio(audio_path: Path, model_size: str = "small",
-                     beam_size: int = 5) -> List[dict]:
+                     beam_size: int = 5, cpu_threads: int = 0) -> List[dict]:
     """使用 faster-whisper 转录"""
     from faster_whisper import WhisperModel
 
@@ -679,7 +696,9 @@ def transcribe_audio(audio_path: Path, model_size: str = "small",
         model_path = model_size
         print(f"  🎙  从 HuggingFace 下载模型 ({model_size})...")
 
-    model = WhisperModel(model_path, device="cpu", compute_type="int8")
+    threads = cpu_threads if cpu_threads > 0 else os.cpu_count() or 4
+    model = WhisperModel(model_path, device="cpu", compute_type="int8",
+                         cpu_threads=threads)
     segments_raw, info = model.transcribe(
         str(audio_path), language="en", beam_size=beam_size,
         word_timestamps=True, vad_filter=True,
@@ -974,10 +993,12 @@ def _default_translation_rules() -> str:
     """通用翻译保护规则，无论主题识别是否成功都会注入"""
     return (
         "\n通用翻译规则（始终遵守）:"
+        "\n  - 禁止使用任何 Markdown 格式：不要使用 **加粗**、*斜体*、`反引号`、# 标题等标记"
+        "\n  - 代码相关词汇（函数名、变量名、类名等）直接用中文描述或保留原文，不要用反引号包裹"
         "\n  - 数学符号（i, e, π, θ 等）在数学/科学语境中保持为专业术语，不可翻译为日常用语（如 i→'我'）"
         "\n  - 负号'-'在数学/科学语境中必须翻译为'负'，不可省略（字幕'-3'应读作'负三'）"
         "\n  - 英文倒装句（there be, 状语前置等）翻译时需调整为中文习惯语序"
-        "\n  - 翻译结果用于语音配音朗读，需通顺自然，适合听觉理解"
+        "\n  - 翻译结果用于语音配音朗读，需通顺自然，适合听觉理解，输出纯文本"
         "\n  - 前后文语义连贯，避免相邻段之间出现语义断裂或内容重复"
     )
 
@@ -1100,6 +1121,8 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 # 安全网：确保 text_zh 没有 [N] 前缀泄漏
                 if re.match(r"^\[\d+\]", text_zh):
                     text_zh = _strip_numbered_prefix(text_zh)
+                # 清除 LLM 可能输出的 markdown 格式标记
+                text_zh = _strip_markdown(text_zh)
             batch_results.append({
                 "start": seg["start"], "end": seg["end"],
                 "text_en": seg["text"], "text_zh": text_zh or seg["text"],
@@ -1179,6 +1202,7 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                     resp.raise_for_status()
                     zh = resp.json()["choices"][0]["message"]["content"].strip()
                     zh = _strip_think_block(zh)
+                    zh = _strip_markdown(zh)
                     if zh and len(zh.strip()) >= 2:
                         break
                     zh = None  # 空结果，重试
@@ -1193,6 +1217,36 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
 def _strip_think_block(content: str) -> str:
     """去除 Qwen3 等模型返回的 <think>...</think> 推理块"""
     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+
+def _strip_markdown(text: str) -> str:
+    """去除翻译文本中的 Markdown 格式标记。
+
+    处理 LLM 输出中常见的 markdown 语法：
+      **加粗** / __加粗__  → 加粗
+      *斜体* / _斜体_     → 斜体
+      `行内代码`          → 行内代码
+      ~~删除线~~          → 删除线
+      # 标题              → 标题
+    注意：不处理合法的下划线（如变量名 vocab_size）。
+    """
+    if not text:
+        return text
+    # 反引号包裹的行内代码 `xxx` → xxx
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # 加粗 **xxx** 或 __xxx__
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    # 斜体 *xxx*（但不匹配单独的 * 或乘号前后有空格的情况）
+    text = re.sub(r'(?<!\*)\*([^\s*][^*]*[^\s*])\*(?!\*)', r'\1', text)
+    # 斜体 _xxx_（仅匹配前后有空格或行首行尾的，避免破坏 snake_case 变量名）
+    text = re.sub(r'(?<=\s)_([^_]+)_(?=\s|$)', r'\1', text)
+    text = re.sub(r'^_([^_]+)_(?=\s|$)', r'\1', text)
+    # 删除线 ~~xxx~~
+    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    # 行首 # 标题标记
+    text = re.sub(r'^#{1,6}\s+', '', text)
+    return text.strip()
 
 
 def _strip_numbered_prefix(line: str) -> str:
@@ -1232,6 +1286,9 @@ def _parse_numbered_translations(content: str, expected_count: int) -> List[str]
     translations = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
                     for t in translations]
 
+    # 第四层：清除 markdown 格式标记
+    translations = [_strip_markdown(t) for t in translations]
+
     # 补足或截断
     while len(translations) < expected_count:
         translations.append("")
@@ -1259,9 +1316,10 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
          open(paths["bi"], "w", encoding="utf-8") as fbi:
         for idx, seg in enumerate(segments, 1):
             ts = f"{format_srt_time(seg['start'])} --> {format_srt_time(seg['end'])}"
+            text_zh = _strip_markdown(seg['text_zh'])
             fen.write(f"{idx}\n{ts}\n{seg['text_en']}\n\n")
-            fzh.write(f"{idx}\n{ts}\n{seg['text_zh']}\n\n")
-            fbi.write(f"{idx}\n{ts}\n{seg['text_zh']}\n{seg['text_en']}\n\n")
+            fzh.write(f"{idx}\n{ts}\n{text_zh}\n\n")
+            fbi.write(f"{idx}\n{ts}\n{text_zh}\n{seg['text_en']}\n\n")
     print(f"  ✅ SRT 字幕已生成 (英文/中文/双语)")
     return paths["en"], paths["zh"], paths["bi"]
 
@@ -1652,6 +1710,8 @@ async def _generate_tts_segments(
     skipped_placeholder = 0
     for idx, seg in enumerate(segments):
         text_zh = seg.get("text_zh", seg.get("text", ""))
+        # 最后防线：清除可能残留的 markdown 格式标记
+        text_zh = _strip_markdown(text_zh)
         if len(text_zh.strip()) >= 2:
             # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
             if not re.search(r'[\u4e00-\u9fff\u3400-\u4dbfa-zA-Z0-9]', text_zh):
@@ -2087,7 +2147,8 @@ def _measure_speed_ratios(
     return results
 
 
-def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
+def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
+                           cpu_threads: int = 0) -> Path:
     """阶段 C: atempo 调速 + 叠加拼接 → chinese_dub.wav
 
     语速策略:
@@ -2189,6 +2250,55 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
     with open(output_dir / "speed_report.json", "w", encoding="utf-8") as f:
         json.dump(speed_report, f, ensure_ascii=False, indent=2)
 
+    # ── Phase 1: 并行 ffmpeg atempo 调速 ──
+    # 收集需要调速的任务，然后用 ThreadPoolExecutor 并行执行
+    def _run_atempo(tts_path: Path, adjusted_path: Path, speed: float):
+        """在线程中执行单个 ffmpeg atempo 调速"""
+        if adjusted_path.exists():
+            return True
+        filt = _build_atempo_filter(speed)
+        try:
+            subprocess.run([
+                "ffmpeg", "-i", str(tts_path), "-filter:a", filt,
+                "-ar", "16000", "-ac", "1", str(adjusted_path), "-y"
+            ], capture_output=True, check=True, timeout=30)
+            return True
+        except Exception:
+            return False
+
+    atempo_tasks = []  # (idx, tts_path, adjusted_path, speed_ratio)
+    for idx, seg in enumerate(segments):
+        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+        if not tts_path.exists() or tts_path.stat().st_size == 0:
+            continue
+        target_start = int(seg["start"] * 1000)
+        target_dur = int(seg["end"] * 1000) - target_start
+        if target_dur <= 0:
+            continue
+        speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else 1.0
+        raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
+        adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
+        if raw_ratio < SPEED_MIN and speed_ratio < 0.98:
+            atempo_tasks.append((idx, tts_path, adjusted, speed_ratio))
+        elif 0.5 < speed_ratio and speed_ratio != 1.0:
+            atempo_tasks.append((idx, tts_path, adjusted, speed_ratio))
+
+    # 并行执行所有 atempo 调速（每个都是独立的 ffmpeg subprocess，不受 GIL 影响）
+    max_threads = cpu_threads if cpu_threads > 0 else (os.cpu_count() or 4)
+    atempo_workers = min(max_threads, len(atempo_tasks)) if atempo_tasks else 1
+    atempo_results = {}  # idx -> bool
+    if atempo_tasks:
+        print(f"     并行调速: {len(atempo_tasks)} 段, {atempo_workers} 线程")
+        with ThreadPoolExecutor(max_workers=atempo_workers) as pool:
+            futures = {
+                pool.submit(_run_atempo, tp, ap, sp): idx
+                for idx, tp, ap, sp in atempo_tasks
+            }
+            for future in futures:
+                idx = futures[future]
+                atempo_results[idx] = future.result()
+
+    # ── Phase 2: 串行 overlay 拼接 ──
     for idx, seg in enumerate(segments):
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
         if not tts_path.exists() or tts_path.stat().st_size == 0:
@@ -2206,23 +2316,11 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
         speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else (len(tts_audio) / target_dur)
         raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
 
-        # 对于 TTS 远短于目标时长的片段：用钳制后的 ratio 调速 + 静音居中填充
         if raw_ratio < SPEED_MIN and len(tts_audio) > 0:
-            # 用 speed_ratio（已钳制到 SPEED_MIN）做轻微降速
             if speed_ratio < 0.98:
                 adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
-                if not adjusted.exists():
-                    filt = _build_atempo_filter(speed_ratio)
-                    try:
-                        subprocess.run([
-                            "ffmpeg", "-i", str(tts_path), "-filter:a", filt,
-                            "-ar", "16000", "-ac", "1", str(adjusted), "-y"
-                        ], capture_output=True, check=True, timeout=30)
-                    except Exception:
-                        adjusted = None
-                if adjusted and adjusted.exists():
+                if adjusted.exists():
                     tts_audio = PydubSegment.from_wav(str(adjusted))
-            # 居中放置，前后填充静音
             gap = target_dur - len(tts_audio)
             if gap > 0:
                 pad_front = gap // 2
@@ -2232,16 +2330,7 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path) -> Path:
             stats["padded"] += 1
         elif 0.5 < speed_ratio and speed_ratio != 1.0:
             adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
-            if not adjusted.exists():
-                filt = _build_atempo_filter(speed_ratio)
-                try:
-                    subprocess.run([
-                        "ffmpeg", "-i", str(tts_path), "-filter:a", filt,
-                        "-ar", "16000", "-ac", "1", str(adjusted), "-y"
-                    ], capture_output=True, check=True, timeout=30)
-                except Exception:
-                    adjusted = None
-            if adjusted and adjusted.exists():
+            if adjusted.exists():
                 tts_audio = PydubSegment.from_wav(str(adjusted))
                 stats["adjusted"] += 1
 
@@ -2269,7 +2358,8 @@ async def generate_chinese_dub(
     tts_dir = output_dir / "tts_segments"
     await _generate_tts_segments(segments, tts_dir, voice, concurrency,
                                  config=config)
-    return _align_tts_to_timeline(segments, output_dir)
+    cpu_threads = (config or {}).get("cpu_threads", 0)
+    return _align_tts_to_timeline(segments, output_dir, cpu_threads=cpu_threads)
 
 
 def _build_atempo_filter(speed_ratio: float) -> str:
@@ -3148,7 +3238,8 @@ async def process_video(config: dict):
             try:
                 sep_result = separate_audio(
                     video_path, output_dir,
-                    config.get("audio_separation", {}))
+                    config.get("audio_separation", {}),
+                    cpu_threads=config.get("cpu_threads", 0))
             except Exception as e:
                 _logger.log_error(
                     "音频分离失败",
@@ -3199,7 +3290,8 @@ async def process_video(config: dict):
             try:
                 raw_segments = transcribe_audio(
                     output_dir / "audio.wav", config["whisper_model"],
-                    config.get("whisper_beam_size", 5))
+                    config.get("whisper_beam_size", 5),
+                    cpu_threads=config.get("cpu_threads", 0))
                 raw_segments = deduplicate_segments(raw_segments)
                 # ── 保存转录中间结果（支持单独跳过 transcribe） ──
                 with open(transcribe_cache, "w", encoding="utf-8") as f:
@@ -3367,7 +3459,8 @@ async def process_video(config: dict):
             _log(f"[{step_n}/{total_steps}] 生成字幕 + 时间线对齐")
             if "subtitle" not in skip:
                 generate_srt_files(segments, output_dir)
-            dub_path = _align_tts_to_timeline(segments, output_dir)
+            dub_path = _align_tts_to_timeline(segments, output_dir,
+                                                cpu_threads=config.get("cpu_threads", 0))
             _log("")
         _logger.step_end()
 
@@ -3560,4 +3653,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # 清理 multiprocessing resource_tracker 守护进程
+        # ctranslate2/PyTorch 内部会 fork+exec 出 resource_tracker，
+        # pipeline.py 退出后它会残留在进程列表中。
+        try:
+            import multiprocessing.resource_tracker as _rt
+            _tracker_pid = getattr(_rt._resource_tracker, '_pid', None)
+            if _tracker_pid:
+                import signal
+                os.kill(_tracker_pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError, AttributeError):
+            pass

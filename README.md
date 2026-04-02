@@ -479,6 +479,10 @@ commit message 格式：`{type}: {描述}`，type 取值：
 
 **11. 纯文档更新无需运行测试。** 仅修改 README.md 等文档文件的 commit，不涉及代码逻辑变更，无需运行测试。commit log 中应标注 `[增量测试: +0]` 而非 `+N`。这能节省时间，同时避免不必要的测试开销。但需注意：如果文档中涉及配置示例、命令示例的变更，仍应手动验证其正确性。
 
+**12. LLM 输出默认含 Markdown 格式，必须在多层清洗。** LLM 翻译编程/技术类内容时，天然倾向对代码术语用反引号（`` ` ``）包裹、对强调词用加粗（`**`），这些符号会直接出现在字幕和 TTS 朗读中。防御策略必须多层叠加：(1) prompt 中明确禁止 Markdown 格式；(2) 翻译结果解析后调用 `_strip_markdown()` 清洗；(3) TTS 合成和字幕写入入口处再做最后防线清洗。单层防御不可靠——prompt 指令 LLM 可能不遵守，后处理可能被绕过（如缓存中的历史脏数据）。
+
+**13. 长时间高 CPU 任务需限制线程数。** demucs 音频分离默认用满所有 CPU 核心（如 12 核 400-500%），长时间运行会导致系统热降频 + GPU 调度饥饿，严重时触发 WindowServer watchdog timeout 导致系统 UI 崩溃。解决方案：通过 `cpu_threads` 配置限制线程数（如 12 核机器设为 8），给系统和其他应用留出余量。`torch.set_num_threads()` + `OMP_NUM_THREADS` 环境变量双重限制。
+
 ## 已知限制
 
 1. YouTube 下载需要能访问 YouTube 的网络环境
@@ -547,6 +551,16 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - 批量解析后单条校验失败的段，先走 LLM 逐条重试（3 次/条）
   - 仅 LLM 逐条重试仍失败的段，才回退 Google Translate
   - 完整链路：批量LLM(重试2次) → 逐条LLM(重试3次) → Google → 保留原文
+
+- **LLM 翻译输出含 Markdown 格式标记**（已解决）：编程/技术类视频翻译时，LLM 对代码术语用反引号包裹（如 `` `vocab_size` ``）、对强调词用加粗（如 `**机器翻译**`），这些标记直接出现在字幕和 TTS 朗读中。修复方案：
+  - 层1（源头）：`_default_translation_rules()` 注入"禁止使用任何 Markdown 格式"指令
+  - 层2（后处理）：新增 `_strip_markdown()` 函数，在 `_parse_numbered_translations()` 和 `_translate_llm_single()` 解析后自动去除 `**`、`` ` ``、`*`、`~~`、`#` 等标记
+  - 层3（最后防线）：TTS 入口和 `generate_srt_files()` 字幕写入处再次清洗，兼容缓存中的历史脏数据
+  - `_strip_markdown()` 对 snake_case 变量名（如 `self_attention_head`）做特殊处理，不会误伤合法下划线
+
+- **长时间高 CPU 导致系统崩溃**（已解决）：demucs 音频分离默认用满所有 CPU 核心（12 核 ~500% CPU），持续 30+ 分钟后触发系统热降频 + WindowServer watchdog timeout（80 秒无响应被杀），导致 macOS UI 崩溃。修复方案：
+  - `cpu_threads` 默认值从 `0`（所有核心）改为 `8`（12 核机器留 4 核给系统）
+  - 通过 `torch.set_num_threads()` + `OMP_NUM_THREADS` 双重限制 demucs/whisper/ffmpeg atempo 线程数
 
 ## TODO（按难度 / 优先级排序）
 

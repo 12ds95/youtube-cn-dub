@@ -1029,7 +1029,7 @@ def _default_translation_rules() -> str:
         "\n  - 英文倒装句（there be, 状语前置等）翻译时需调整为中文习惯语序"
         "\n  - 翻译结果用于语音配音朗读，需通顺自然，适合听觉理解，输出纯文本"
         "\n  - 前后文语义连贯，避免相邻段之间出现语义断裂或内容重复"
-        "\n  - 【长度控制】每句后标注的(≈N字)是目标字数，请尽量将译文控制在该范围内（±20%），避免配音时语速异常"
+        "\n  - 译文长度应与原文时长匹配：短句译文要简洁，长句可适当展开，避免配音时语速异常"
     )
 
 
@@ -1078,15 +1078,17 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     prev_context = None
     for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
         batch = segments[i:i + batch_size]
-        # 构造批量翻译请求：每行一句，用编号标记，末尾加目标字数提示
+        # 构造批量翻译请求：每行一句，用编号标记
         CHARS_PER_SEC = 4.5  # TTS 中文语速：约 4.5 字/秒
         lines = []
+        char_hints = []
         for j, seg in enumerate(batch):
-            # 计算目标字数：根据片段时长推算
+            lines.append(f"[{j+1}] {seg['text']}")
             dur_sec = seg.get("end", 0) - seg.get("start", 0)
             target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
-            lines.append(f"[{j+1}] {seg['text']} (≈{target_chars}字)")
+            char_hints.append(f"[{j+1}]≈{target_chars}字")
         user_msg = "\n".join(lines)
+        hint_line = f"各句参考字数：{', '.join(char_hints)}"
 
         # 构造上下文提示
         context_hint = ""
@@ -1099,7 +1101,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             f"{system_prompt}\n\n"
             + (f"{context_hint}\n" if context_hint else "")
             + f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
-            f"一行一句，不要合并或拆分：\n\n{user_msg}"
+            f"一行一句，不要合并或拆分。\n"
+            f"{hint_line}\n"
+            f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。\n\n{user_msg}"
         )
 
         payload = {
@@ -1217,14 +1221,14 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                           max_retries: int = 3):
     """逐条 LLM 翻译（降级方案），带重试"""
     import httpx
-    CHARS_PER_SEC = 4.5  # TTS 中文语速：约 4.5 字/秒
+    CHARS_PER_SEC = 4.5
     results = []
     for seg in batch:
         zh = None
-        # 计算目标字数
+        # 计算目标字数，作为前缀指令（不混入源文本）
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
         target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
-        user_content = f"{seg['text']} (≈{target_chars}字)"
+        user_content = f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注）\n{seg['text']}"
         for attempt in range(max_retries):
             try:
                 payload = {
@@ -1270,6 +1274,21 @@ def _strip_markdown(text: str, original: str = "") -> str:
     """
     if not text:
         return text
+    # ── 兜底：清除 LLM 回显的字数提示和翻译指令泄漏 ──
+    # 英文原文不可能包含中文字数提示，无需像 markdown 那样检查 original
+    # 1. 括号包裹的字数提示（各种变体）:
+    #    (≈26字) （约26个字） [≈26字] (目标约26字左右) (约20-30字) 等
+    text = re.sub(
+        r'[(\uff08\[]\s*(?:目标)?(?:约|≈)\s*\d+[\s\-~～]*(?:\d+)?\s*(?:个)?(?:中文)?字\s*(?:左右|以内)?\s*[)\uff09\]]',
+        '', text)
+    # 2. 行尾裸露的字数提示（无括号）: ...译文≈26字 / 约26字
+    text = re.sub(r'\s*(?:约|≈)\s*\d+\s*(?:个)?字\s*$', '', text)
+    # 3. 完整翻译指令句泄漏: （请将译文控制在约N字，不要在译文中输出字数标注）
+    text = re.sub(r'[(\uff08]\s*请将译文控制在[^)\uff09]*[)\uff09]', '', text)
+    # 4. 批量提示元数据泄漏: 各句参考字数：[1]≈26字, [2]≈8字 ...
+    text = re.sub(r'各句参考字数[：:][^\n]*', '', text)
+    # 5. 零散指令片段泄漏
+    text = re.sub(r'[,，]?\s*不要在译文中输出字数标注[。.，,]?', '', text)
     # 反引号包裹的行内代码 `xxx` → xxx
     if '`' not in original:
         text = re.sub(r'`([^`]+)`', r'\1', text)

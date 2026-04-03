@@ -397,16 +397,43 @@ def extract_video_id(url: str) -> Optional[str]:
 # ─── 依赖检查 ──────────────────────────────────────────────────────
 def _ensure_node_in_path():
     """确保 Node.js 在 PATH 中 (yt-dlp EJS 需要)"""
-    if shutil.which("node"):
-        return
     import glob
-    candidates = glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin"))
-    candidates += ["/usr/local/bin", "/opt/homebrew/bin"]
-    for path in candidates:
-        if os.path.isfile(os.path.join(path, "node")):
-            os.environ["PATH"] = path + ":" + os.environ.get("PATH", "")
+    import subprocess
+    
+    # 优先使用 nvm 的 node（通常更新、可用）
+    nvm_nodes = glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin"))
+    for path in nvm_nodes:
+        node_path = os.path.join(path, "node")
+        if os.path.isfile(node_path):
+            # 测试 node 是否可用
+            try:
+                subprocess.run([node_path, "--version"], capture_output=True, timeout=5, check=True)
+                os.environ["PATH"] = path + ":" + os.environ.get("PATH", "")
+                print(f"  🔧 使用 Node.js: {node_path}")
+                return
+            except Exception:
+                continue
+    
+    # 检查系统 node 是否可用
+    if shutil.which("node"):
+        try:
+            subprocess.run(["node", "--version"], capture_output=True, timeout=5, check=True)
             return
-    print("  ⚠️  未找到 Node.js，YouTube 下载可能失败。请安装: brew install node")
+        except Exception:
+            pass  # 系统 node 坏了，继续尝试其他选项
+    
+    # 最后尝试 homebrew
+    for path in ["/opt/homebrew/bin", "/usr/local/bin"]:
+        node_path = os.path.join(path, "node")
+        if os.path.isfile(node_path):
+            try:
+                subprocess.run([node_path, "--version"], capture_output=True, timeout=5, check=True)
+                os.environ["PATH"] = path + ":" + os.environ.get("PATH", "")
+                return
+            except Exception:
+                continue
+    
+    print("  ⚠️  未找到可用的 Node.js，YouTube 下载可能失败。请安装: brew install node")
 
 
 def check_dependencies(config: dict):
@@ -466,17 +493,19 @@ def download_video(url: str, output_dir: Path, browser: str = "chrome",
     print(f"  📥 下载视频: {url}")
     _ensure_node_in_path()
 
-    # 根据 download_quality 构建 format 选择器
-    # "best" → 不限分辨率，优先最高帧率+最高画质
-    # "1080p"/"720p"/"480p" → 限高但优先最高帧率
+    # 根据 download_quality 构建 format 选择器（多级 fallback 更鲁棒）
+    # "best" → 不限分辨率，多级 fallback: 分离轨→合并轨→任意可用
+    # "1080p"/"720p"/"480p" → 限高但多级 fallback
     quality = download_quality.lower().strip()
     if quality == "best":
-        fmt = "bestvideo+bestaudio/best"
-        print(f"  🎬 画质: 最高可用 (不限分辨率/帧率)")
+        # 多级 fallback: 分离视频+音频 → 合并最佳 → 任意视频 → 任意格式
+        fmt = "bestvideo+bestaudio/best/bestvideo*/best*"
+        print(f"  🎬 画质: 最高可用 (多级 fallback)")
     else:
         height = int(quality.replace("p", "")) if quality.replace("p", "").isdigit() else 720
-        fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
-        print(f"  🎬 画质: ≤{height}p (最高帧率)")
+        # 限高 + 多级 fallback
+        fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/bestvideo[height<={height}]*/best[height<={height}]*/best"
+        print(f"  🎬 画质: ≤{height}p (多级 fallback)")
 
     ydl_opts = {
         "format": fmt,
@@ -1000,6 +1029,7 @@ def _default_translation_rules() -> str:
         "\n  - 英文倒装句（there be, 状语前置等）翻译时需调整为中文习惯语序"
         "\n  - 翻译结果用于语音配音朗读，需通顺自然，适合听觉理解，输出纯文本"
         "\n  - 前后文语义连贯，避免相邻段之间出现语义断裂或内容重复"
+        "\n  - 【长度控制】每句后标注的(≈N字)是目标字数，请尽量将译文控制在该范围内（±20%），避免配音时语速异常"
     )
 
 
@@ -1048,10 +1078,14 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     prev_context = None
     for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
         batch = segments[i:i + batch_size]
-        # 构造批量翻译请求：每行一句，用编号标记
+        # 构造批量翻译请求：每行一句，用编号标记，末尾加目标字数提示
+        CHARS_PER_SEC = 4.5  # TTS 中文语速：约 4.5 字/秒
         lines = []
         for j, seg in enumerate(batch):
-            lines.append(f"[{j+1}] {seg['text']}")
+            # 计算目标字数：根据片段时长推算
+            dur_sec = seg.get("end", 0) - seg.get("start", 0)
+            target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+            lines.append(f"[{j+1}] {seg['text']} (≈{target_chars}字)")
         user_msg = "\n".join(lines)
 
         # 构造上下文提示
@@ -1183,16 +1217,21 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                           max_retries: int = 3):
     """逐条 LLM 翻译（降级方案），带重试"""
     import httpx
+    CHARS_PER_SEC = 4.5  # TTS 中文语速：约 4.5 字/秒
     results = []
     for seg in batch:
         zh = None
+        # 计算目标字数
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+        user_content = f"{seg['text']} (≈{target_chars}字)"
         for attempt in range(max_retries):
             try:
                 payload = {
                     "model": model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": seg["text"]},
+                        {"role": "user", "content": user_content},
                     ],
                     "temperature": temperature,
                     "max_tokens": 512,
@@ -1320,6 +1359,7 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
         for idx, seg in enumerate(segments, 1):
             ts = f"{format_srt_time(seg['start'])} --> {format_srt_time(seg['end'])}"
             text_zh = _strip_markdown(seg['text_zh'], seg.get('text_en', ''))
+            text_zh = _clean_refine_artifacts(text_zh)  # 清理 [轻]/[中]/[短] 等标签
             fen.write(f"{idx}\n{ts}\n{seg['text_en']}\n\n")
             fzh.write(f"{idx}\n{ts}\n{text_zh}\n\n")
             fbi.write(f"{idx}\n{ts}\n{text_zh}\n{seg['text_en']}\n\n")
@@ -1346,26 +1386,27 @@ class TTSEngine:
         子类可覆盖；默认直接返回 global_voice（仅对 edge-tts 有意义）。"""
         return global_voice
 
-    async def synthesize(self, text: str, path: str, voice: str):
-        """将 text 合成为音频文件，保存到 path"""
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
+        """将 text 合成为音频文件，保存到 path。rate 参数控制语速（1.0=默认）"""
         raise NotImplementedError
 
     async def synthesize_batch(self, items: List[dict], tts_dir: Path,
                                voice: str, concurrency: int = 5):
-        """批量合成。items 是 [(idx, text_zh), ...]，默认实现逐个调用 synthesize
+        """批量合成。items 是 [{"idx": N, "text_zh": "...", "rate": 1.0}, ...]
+        rate 为可选参数，不指定时默认 1.0。
         遇到 TTSFatalError（认证/余额等不可恢复错误）时立即中止并向上传播。
         """
         resolved_voice = self.resolve_voice(voice)
         semaphore = asyncio.Semaphore(concurrency)
         fatal_error = None  # 记录首个致命错误
 
-        async def _one(text, path):
+        async def _one(text, path, rate):
             nonlocal fatal_error
             if fatal_error:
                 return  # 已有致命错误，跳过后续
             async with semaphore:
                 try:
-                    await self.synthesize(text, path, resolved_voice)
+                    await self.synthesize(text, path, resolved_voice, rate)
                 except TTSFatalError as e:
                     fatal_error = e
                     raise
@@ -1373,8 +1414,9 @@ class TTSEngine:
         tasks = []
         for item in items:
             idx, text_zh = item["idx"], item["text_zh"]
+            rate = item.get("rate", 1.0)
             p = tts_dir / f"seg_{idx:04d}.mp3"
-            tasks.append(_one(text_zh, str(p)))
+            tasks.append(_one(text_zh, str(p), rate))
 
         if tasks:
             batch_n = max(1, concurrency * 2)
@@ -1391,10 +1433,20 @@ class EdgeTTSEngine(TTSEngine):
     name = "edge-tts"
     is_local = False
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
+        """合成音频，支持 rate 参数调整语速（0.85~1.20 为安全区间）
+
+        rate=1.0: 默认语速
+        rate=1.15: 加速 15%
+        rate=0.9: 减速 10%
+        """
         import edge_tts
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(path)
+        # 使用 edge-tts 原生 rate 参数控制语速（比 SSML prosody 包裹更可靠，
+        # 因为 Communicate 内部会转义 XML 特殊字符，导致 <prosody> 标签被朗读出来）
+        rate_pct = int((rate - 1.0) * 100)
+        rate_str = f"+{rate_pct}%" if rate_pct >= 0 else f"{rate_pct}%"
+        communicate = edge_tts.Communicate(text, voice, rate=rate_str)
+        await asyncio.wait_for(communicate.save(path), timeout=30)
 
 
 class GTTSEngine(TTSEngine):
@@ -1406,7 +1458,7 @@ class GTTSEngine(TTSEngine):
         """gTTS 使用语言代码 zh-cn，忽略全局 edge-tts voice"""
         return "zh-cn"
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         from gtts import gTTS
         loop = asyncio.get_event_loop()
         def _gen():
@@ -1427,7 +1479,7 @@ class PiperTTSEngine(TTSEngine):
         """Piper 使用本地模型路径，忽略全局 edge-tts voice"""
         return self.model_path or "zh_CN-huayan-medium"
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         loop = asyncio.get_event_loop()
         model = voice  # 已由 resolve_voice 转为模型路径
         def _gen():
@@ -1457,7 +1509,7 @@ class SherpaOnnxEngine(TTSEngine):
         """sherpa-onnx 使用 speaker_id，忽略全局 edge-tts voice"""
         return str(self.model_config.get("speaker_id", 0))
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         loop = asyncio.get_event_loop()
         cfg = self.model_config
         def _gen():
@@ -1511,7 +1563,7 @@ class CosyVoiceEngine(TTSEngine):
         """CosyVoice 使用中文语音角色名，忽略全局 edge-tts voice"""
         return "中文女"
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         loop = asyncio.get_event_loop()
         def _gen():
             model = self._load_model()
@@ -1548,7 +1600,7 @@ class SiliconFlowTTSEngine(TTSEngine):
         """SiliconFlow 使用自己的 voice_id，忽略全局 edge-tts voice"""
         return self.voice_id
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         import httpx
         url = "https://api.siliconflow.cn/v1/audio/speech"
         payload = {
@@ -1589,7 +1641,7 @@ class Pyttsx3Engine(TTSEngine):
         """pyttsx3 使用系统语音名，忽略全局 edge-tts voice"""
         return self.voice_name or "auto"
 
-    async def synthesize(self, text: str, path: str, voice: str):
+    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         loop = asyncio.get_event_loop()
         vname = self.voice_name
         rate = self.rate
@@ -1709,18 +1761,42 @@ async def _generate_tts_segments(
         chain_names = ["edge-tts"]
 
     # 收集所有需要合成的片段（必须在断点恢复前构建，resume 逻辑依赖 all_items）
+    # TTS rate 优化：根据目标时长和中文字数计算语速调节参数
+    CHARS_PER_SEC = 4.5  # edge-tts 中文默认语速：约 4.5 字/秒
+    MS_PER_CHAR = 1000 / CHARS_PER_SEC  # ≈222ms/字
     all_items = []
     skipped_placeholder = 0
     for idx, seg in enumerate(segments):
         text_zh = seg.get("text_zh", seg.get("text", ""))
-        # 最后防线：清除可能残留的 markdown 格式标记
+        # 最后防线：清除可能残留的格式标记
         text_zh = _strip_markdown(text_zh, seg.get("text_en", seg.get("text", "")))
+        text_zh = _clean_refine_artifacts(text_zh)  # 清理 [轻]/[中]/[短] 等标签
         if len(text_zh.strip()) >= 2:
             # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
             if not re.search(r'[\u4e00-\u9fff\u3400-\u4dbfa-zA-Z0-9]', text_zh):
                 skipped_placeholder += 1
                 continue
-            all_items.append({"idx": idx, "text_zh": text_zh})
+            # 计算 TTS rate 参数：根据目标时长调节语速
+            rate = 1.0
+            raw_ratio = 1.0
+            start_ms = int(seg.get("start", 0) * 1000)
+            end_ms = int(seg.get("end", 0) * 1000)
+            target_dur_ms = end_ms - start_ms
+            if target_dur_ms > 0:
+                # 计算中文字符数（含中日韩统一表意文字）
+                zh_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text_zh))
+                if zh_chars > 0:
+                    # 估算原始 TTS 时长
+                    estimated_tts_ms = zh_chars * MS_PER_CHAR
+                    # ratio = TTS时长 / 目标时长
+                    raw_ratio = estimated_tts_ms / target_dur_ms
+                    # ratio>1: TTS 太长，需加速(rate>1)；ratio<1: TTS 太短，需减速(rate<1)
+                    # 直接用 ratio 作为 rate，钳制到 edge-tts 安全区间
+                    rate = max(0.85, min(1.20, raw_ratio))
+            all_items.append({
+                "idx": idx, "text_zh": text_zh, "rate": rate,
+                "raw_ratio": raw_ratio, "target_dur_ms": target_dur_ms
+            })
     if skipped_placeholder:
         print(f"     ⚠️  跳过 {skipped_placeholder} 个无可发音内容的片段"
               f"（纯标点/占位符如 '---'）")
@@ -1728,6 +1804,65 @@ async def _generate_tts_segments(
     if not all_items:
         print(f"     无需生成 TTS 片段")
         return
+
+    # ── Phase 3: 预检自适应 —— ratio 超标时先调整译文 ──
+    # 只处理 ratio 超出 (0.75, 1.30) 的片段，这些片段即使用 TTS rate 也无法完全补偿
+    outliers = [item for item in all_items
+                if item["raw_ratio"] < 0.70 or item["raw_ratio"] > 1.35]
+    if outliers and config.get("llm"):
+        print(f"     🔄 预检：{len(outliers)} 个片段 ratio 超标，调整译文中...")
+        llm_config = config["llm"]
+        api_url = llm_config["api_url"].rstrip("/")
+        api_key = llm_config.get("api_key", "")
+        model = llm_config.get("model", "")
+        if api_key and model:
+            import httpx
+            endpoint = f"{api_url}/chat/completions" if "/chat/completions" not in api_url else api_url
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            adjusted_count = 0
+            for item in outliers:
+                idx = item["idx"]
+                seg = segments[idx]
+                old_zh = item["text_zh"]
+                target_chars = max(2, int(item["target_dur_ms"] / MS_PER_CHAR))
+                current_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', old_zh))
+                # 判断调整方向
+                if item["raw_ratio"] > 1.35:
+                    action = "精简"
+                    prompt = f"请将以下中文译文精简到约 {target_chars} 字，保持核心语义：\n{old_zh}"
+                else:
+                    action = "扩展"
+                    prompt = f"请将以下中文译文扩展到约 {target_chars} 字，使表达更完整自然：\n{old_zh}"
+                try:
+                    payload = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": "你是配音字幕调整助手。根据要求精简或扩展译文，输出纯文本，不要添加任何解释。"},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 256,
+                    }
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        resp.raise_for_status()
+                        new_zh = resp.json()["choices"][0]["message"]["content"].strip()
+                        new_zh = _strip_markdown(new_zh, seg.get("text_en", seg.get("text", "")))
+                        if new_zh and len(new_zh) >= 2:
+                            # 更新 segments 和 item
+                            segments[idx]["text_zh"] = new_zh
+                            item["text_zh"] = new_zh
+                            # 重新计算 rate
+                            new_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', new_zh))
+                            if new_chars > 0 and item["target_dur_ms"] > 0:
+                                new_ratio = (new_chars * MS_PER_CHAR) / item["target_dur_ms"]
+                                item["raw_ratio"] = new_ratio
+                                item["rate"] = max(0.85, min(1.20, new_ratio))
+                            adjusted_count += 1
+                except Exception as e:
+                    print(f"        ⚠️ 段落 {idx} {action}失败: {e}")
+            if adjusted_count:
+                print(f"        ✅ 成功调整 {adjusted_count}/{len(outliers)} 个片段")
 
     # ── 断点恢复：先用上次失败引擎重试失败片段 ──
     start_idx = 0

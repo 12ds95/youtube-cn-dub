@@ -2596,6 +2596,7 @@ async def run_refinement_loop(
             json.dump(segments, f, ensure_ascii=False, indent=2)
 
     converged_indices = set()  # Segments that are already within threshold
+    run_refinement_loop._expand_done = False  # 扩展只做一次
 
     for it in range(start_iter, max_iter):
         print(f"\n  {'─'*50}")
@@ -2647,9 +2648,9 @@ async def run_refinement_loop(
                 zh_pre = d["text_zh"][:25] + ("..." if len(d["text_zh"]) > 25 else "")
                 print(f"       #{d['idx']:3d}  {d['speed_ratio']:.2f}x  \"{zh_pre}\"")
 
-        # 2) 无超速 → 检查过短片段
+        # 2) 无超速 → 检查过短片段（最多尝试扩展一次，避免反复扩展引入噪声）
         if not overfast:
-            if underslow:
+            if underslow and not getattr(run_refinement_loop, '_expand_done', False):
                 print(f"     🔄 扩展 {len(underslow)} 个过短片段...")
                 new_segments = _expand_with_llm(segments, underslow, llm_config)
                 # 统计扩展变更
@@ -2658,12 +2659,15 @@ async def run_refinement_loop(
                     idx = item["idx"]
                     if segments[idx]["text_zh"] != new_segments[idx]["text_zh"]:
                         expand_changed += 1
+                run_refinement_loop._expand_done = True  # 标记已尝试扩展
                 if expand_changed:
                     segments = new_segments
                     print(f"     ✅ 扩展了 {expand_changed}/{len(underslow)} 个过短片段")
-                    continue  # 重新估算语速
+                    continue  # 重新估算一次，检查是否产生新的超速
                 else:
                     print(f"\n  ✅ 翻译优化完成! ({len(underslow)} 个过短片段无法进一步扩展，将由时间线对齐阶段静音填充)")
+            elif underslow:
+                print(f"\n  ✅ 翻译优化完成! ({len(underslow)} 个过短片段将由时间线对齐阶段静音填充)")
             else:
                 print(f"\n  ✅ 所有片段语速均在合理范围内，优化完成!")
             break
@@ -2674,10 +2678,9 @@ async def run_refinement_loop(
         print(f"     调用 LLM 精简 {len(overfast)} 个超速片段...")
         new_segments = _refine_with_llm(new_segments, overfast, llm_config)
 
-        # 3.5) 同时扩展过短翻译
-        if underslow:
-            print(f"     调用 LLM 扩展 {len(underslow)} 个过短片段...")
-            new_segments = _expand_with_llm(new_segments, underslow, llm_config)
+        # 3.5) 过短翻译不在 refine 阶段同时扩展
+        # 避免扩展产生的内容变超速后被下一轮 refine 误改，造成越改越偏
+        # 过短片段统一在无超速时（步骤 2）单独处理
 
         # 4) 统计变更
         changes = []
@@ -3123,12 +3126,13 @@ def _expand_with_llm(
 
     system_prompt = (
         "你是专业的英中翻译优化器。以下中文翻译将用于视频配音，"
-        "但当前翻译朗读时间远短于原始时间窗口，播放时会被降速，听起来不自然。\n"
-        "要求：\n"
-        "1) 适当补充细节或使用更完整的表达，使翻译朗读时长更接近英文原文\n"
-        "2) 参考上下文保持语义连贯，不要凭空捏造无关内容\n"
-        "3) 适合配音朗读，语句自然流畅\n"
-        "4) 只输出扩展后的翻译，保持 [编号] 格式，一行一句"
+        "当前翻译太短，需要适当扩展。\n"
+        "严格要求：\n"
+        "1) 只能基于对应英文原文的含义来扩展，严禁引入英文中没有的信息\n"
+        "2) 扩展后的中文必须保留原译文的核心词汇，只补充修饰语或使表达更完整\n"
+        "3) 扩展幅度要适度，目标字数已标注，不要大幅超出\n"
+        "4) 只输出扩展后的翻译，保持 [编号] 格式，一行一句\n"
+        "5) 不要使用破折号连接长从句，保持短句结构"
     )
 
     for i in range(0, len(underslow_items), batch_size):
@@ -3141,13 +3145,16 @@ def _expand_with_llm(
             prev_zh = segments[idx - 1]["text_zh"] if idx > 0 else "(开头)"
             next_zh = (segments[idx + 1]["text_zh"]
                        if idx < len(segments) - 1 else "(结尾)")
+            # 计算目标字数（基于时间窗口，约 4 字/秒）
+            target_dur = segments[idx]["end"] - segments[idx]["start"]
+            current_chars = sum(1 for c in item["text_zh"] if '\u4e00' <= c <= '\u9fff')
+            target_chars = min(int(target_dur * 4), current_chars * 2)  # 不超过 2 倍
             lines.append(
                 f"[{j+1}]\n"
                 f"  英文: {item['text_en']}\n"
-                f"  当前翻译: {item['text_zh']}\n"
-                f"  需扩展约 {expansion}% (当前仅占时间窗口的 {ratio:.0%})\n"
-                f"  上文: {prev_zh}\n"
-                f"  下文: {next_zh}"
+                f"  当前翻译({current_chars}字): {item['text_zh']}\n"
+                f"  目标: 扩展到约 {target_chars} 个中文字\n"
+                f"  上文: {prev_zh}"
             )
 
         user_msg = (
@@ -3176,13 +3183,24 @@ def _expand_with_llm(
             for item, new_zh in zip(batch, translations):
                 if new_zh and new_zh.strip():
                     clean_zh = _strip_numbered_prefix(new_zh) if re.match(r"^\[\d+\]", new_zh) else new_zh
+                    original_zh = item["text_zh"]
                     # 只有确实变长了才采纳
-                    if len(clean_zh) > len(item["text_zh"]):
-                        # 检查是否与相邻段重复
-                        if _is_duplicate_of_neighbors(clean_zh, item["idx"], expanded):
-                            print(f"       ⚠️  #{item['idx']} 扩展结果与相邻段重复，跳过")
-                            continue
-                        expanded[item["idx"]]["text_zh"] = clean_zh
+                    if len(clean_zh) <= len(original_zh):
+                        continue
+                    # 防止过度扩展：短原文允许更大倍率（≤10字→3x，≤20字→2.5x，>20字→2x）
+                    max_ratio = 3.0 if len(original_zh) <= 10 else (2.5 if len(original_zh) <= 20 else 2.0)
+                    if len(clean_zh) > len(original_zh) * max_ratio:
+                        print(f"       ⚠️  #{item['idx']} 扩展过长 ({len(clean_zh)}/{len(original_zh)}字，上限{max_ratio:.1f}x)，跳过")
+                        continue
+                    # 检查是否与相邻段重复
+                    if _is_duplicate_of_neighbors(clean_zh, item["idx"], expanded):
+                        print(f"       ⚠️  #{item['idx']} 扩展结果与相邻段重复，跳过")
+                        continue
+                    # 关键：检查扩展结果与原译文的语义忠实度（防止 LLM 跨段混淆）
+                    if not _check_refine_fidelity(original_zh, clean_zh, min_overlap=0.3):
+                        print(f"       ⚠️  #{item['idx']} 扩展结果偏离原译文过大，跳过")
+                        continue
+                    expanded[item["idx"]]["text_zh"] = clean_zh
         except Exception as e:
             print(f"     ⚠️  LLM 扩展批次 {i//batch_size+1} 失败: {e}")
 

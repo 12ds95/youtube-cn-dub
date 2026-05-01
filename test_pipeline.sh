@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # 端到端管线测试脚本 — 用最小视频反复验证完整流程
 # 跳过: download, extract, separate (保留已有的 original.mp4, audio.wav, 分离音频)
-# 运行: transcribe → translate → refine → tts → subtitle → merge
 #
 # 用法:
-#   bash test_pipeline.sh            # 完整测试 (transcribe → merge)
-#   bash test_pipeline.sh --fast     # 快速测试 (跳过 transcribe，复用 segments_cache)
+#   bash test_pipeline.sh              # 完整测试 (transcribe → merge)
+#   bash test_pipeline.sh --fast       # 快速测试 (跳过 transcribe+translate，复用缓存)
+#   bash test_pipeline.sh --refine     # 仅测翻译+迭代优化 (跳过 TTS/字幕/合成)
+#   bash test_pipeline.sh --retranslate # 删除翻译缓存从翻译开始，跳过 TTS 后步骤
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -32,21 +33,23 @@ for f in original.mp4 audio.wav info.json; do
     fi
 done
 
-FAST_MODE=false
-if [ "${1:-}" = "--fast" ]; then
-    FAST_MODE=true
-fi
+MODE="full"
+case "${1:-}" in
+    --fast)        MODE="fast" ;;
+    --refine)      MODE="refine" ;;
+    --retranslate) MODE="retranslate" ;;
+esac
 
 echo -e "${YELLOW}🧪 管线端到端测试${NC}"
 echo "   视频: $VIDEO_ID (Quaternions and 3d rotation, 359s)"
 echo "   目录: $VIDEO_DIR"
+echo "   模式: $MODE"
 echo ""
 
 # --- 清理上次生成的文件 ---
 echo -e "${YELLOW}🧹 清理旧的生成文件...${NC}"
 
-# 保留: original.mp4, audio.wav, audio_vocals.wav, audio_accompaniment.wav, info.json
-# 清理: 翻译、TTS、字幕、合成等所有中间产物
+# 所有模式都清理的文件
 rm -f  "$VIDEO_DIR/chinese_dub.wav"
 rm -f  "$VIDEO_DIR/final.mp4"
 rm -f  "$VIDEO_DIR"/subtitle_*.srt
@@ -55,22 +58,42 @@ rm -rf "$VIDEO_DIR/tts_segments"
 rm -rf "$VIDEO_DIR/iterations"
 rm -f  "$VIDEO_DIR"/pipeline_*.log
 
-if [ "$FAST_MODE" = true ]; then
-    echo "   --fast 模式: 保留 segments_cache.json (跳过 transcribe + translate)"
-else
-    rm -f "$VIDEO_DIR/segments_cache.json"
-    rm -f "$VIDEO_DIR/transcribe_cache.json"
-    echo "   完整模式: 清理所有缓存 (从 transcribe 开始)"
-fi
+case "$MODE" in
+    full)
+        rm -f "$VIDEO_DIR/segments_cache.json"
+        rm -f "$VIDEO_DIR/transcribe_cache.json"
+        echo "   完整模式: 清理所有缓存 (从 transcribe 开始)"
+        ;;
+    fast)
+        echo "   --fast 模式: 保留 segments_cache.json (跳过 transcribe + translate)"
+        ;;
+    refine)
+        echo "   --refine 模式: 保留 segments_cache.json，仅运行迭代优化 (跳过 TTS 后步骤)"
+        ;;
+    retranslate)
+        rm -f "$VIDEO_DIR/segments_cache.json"
+        echo "   --retranslate 模式: 删除翻译缓存，从翻译开始 (跳过 TTS 后步骤)"
+        ;;
+esac
 
 echo "   ✅ 清理完成"
 echo ""
 
 # --- 构建临时配置 ---
 SKIP_STEPS='["download", "extract", "separate"]'
-if [ "$FAST_MODE" = true ]; then
-    SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate"]'
-fi
+EXTRA_SKIP=""
+
+case "$MODE" in
+    fast)
+        SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate"]'
+        ;;
+    refine)
+        SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate", "tts", "subtitle", "merge"]'
+        ;;
+    retranslate)
+        SKIP_STEPS='["download", "extract", "separate", "transcribe", "tts", "subtitle", "merge"]'
+        ;;
+esac
 
 TMPCONFIG=$(mktemp /tmp/test_pipeline_XXXXXX.json)
 trap "rm -f '$TMPCONFIG'" EXIT
@@ -146,21 +169,84 @@ check_file() {
 }
 
 echo -e "${YELLOW}📋 输出验证:${NC}"
-check_file "$VIDEO_DIR/final.mp4"              "final.mp4 (最终视频)"
-check_file "$VIDEO_DIR/chinese_dub.wav"        "chinese_dub.wav (配音音轨)"
-check_file "$VIDEO_DIR/segments_cache.json"    "segments_cache.json (翻译缓存)"
-check_file "$VIDEO_DIR/subtitle_bilingual.srt" "subtitle_bilingual.srt (双语字幕)"
-check_file "$VIDEO_DIR/subtitle_zh.srt"        "subtitle_zh.srt (中文字幕)"
-check_file "$VIDEO_DIR/subtitle_en.srt"        "subtitle_en.srt (英文字幕)"
-check_file "$VIDEO_DIR/speed_report.json"      "speed_report.json (语速报告)"
 
-# 检查 TTS 片段目录
-TTS_COUNT=$(ls "$VIDEO_DIR/tts_segments"/*.mp3 2>/dev/null | wc -l | tr -d ' ')
-if [ "$TTS_COUNT" -gt 0 ]; then
-    echo -e "  ${GREEN}✅${NC} tts_segments/ ($TTS_COUNT 个片段)"
+if [ "$MODE" = "refine" ] || [ "$MODE" = "retranslate" ]; then
+    # 仅验证翻译相关文件
+    check_file "$VIDEO_DIR/segments_cache.json" "segments_cache.json (翻译缓存)"
+
+    # 分析翻译质量
+    echo ""
+    echo -e "${YELLOW}📊 翻译质量分析:${NC}"
+    VENV_PYTHON="venv/bin/python3"
+    if [ ! -f "$VENV_PYTHON" ]; then
+        VENV_PYTHON="python3"
+    fi
+
+    "$VENV_PYTHON" -c "
+import json, sys
+
+with open('$VIDEO_DIR/segments_cache.json') as f:
+    segs = json.load(f)
+
+total = len(segs)
+issues = []
+
+for i, seg in enumerate(segs):
+    en = seg.get('text_en', '')
+    zh = seg.get('text_zh', '')
+    en_len = len(en)
+    zh_chars = sum(1 for c in zh if '\u4e00' <= c <= '\u9fff')
+
+    # 检查中文过长（超过英文字符数）
+    if zh_chars > en_len * 0.8:
+        issues.append(f'  ⚠️  #{i} 中文过长 ({zh_chars}字/{en_len}英字): {zh[:40]}...')
+
+    # 检查重复：当前段中文与其他段高度相似
+    for j in range(max(0, i-3), i):
+        other_zh = segs[j].get('text_zh', '')
+        if len(zh) > 10 and len(other_zh) > 10:
+            # 简单子串检测
+            if zh in other_zh or other_zh in zh:
+                issues.append(f'  ❌  #{i} 与 #{j} 翻译重复: {zh[:40]}...')
+
+print(f'  总片段: {total}')
+# 统计迭代变化（如果有 iter_0）
+try:
+    with open('$VIDEO_DIR/iterations/iter_0_segments.json') as f:
+        orig = json.load(f)
+    changed = sum(1 for a, b in zip(orig, segs) if a.get('text_zh') != b.get('text_zh'))
+    print(f'  迭代变更: {changed}/{total} 段')
+except:
+    pass
+
+if issues:
+    print(f'  发现 {len(issues)} 个问题:')
+    for iss in issues[:10]:
+        print(iss)
+    if len(issues) > 10:
+        print(f'  ... 共 {len(issues)} 个问题')
+else:
+    print(f'  ✅ 未发现明显翻译问题')
+" || true
+
 else
-    echo -e "  ${RED}❌${NC} tts_segments/ — 无 TTS 片段"
-    PASS=false
+    # 完整验证
+    check_file "$VIDEO_DIR/final.mp4"              "final.mp4 (最终视频)"
+    check_file "$VIDEO_DIR/chinese_dub.wav"        "chinese_dub.wav (配音音轨)"
+    check_file "$VIDEO_DIR/segments_cache.json"    "segments_cache.json (翻译缓存)"
+    check_file "$VIDEO_DIR/subtitle_bilingual.srt" "subtitle_bilingual.srt (双语字幕)"
+    check_file "$VIDEO_DIR/subtitle_zh.srt"        "subtitle_zh.srt (中文字幕)"
+    check_file "$VIDEO_DIR/subtitle_en.srt"        "subtitle_en.srt (英文字幕)"
+    check_file "$VIDEO_DIR/speed_report.json"      "speed_report.json (语速报告)"
+
+    # 检查 TTS 片段目录
+    TTS_COUNT=$(ls "$VIDEO_DIR/tts_segments"/*.mp3 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$TTS_COUNT" -gt 0 ]; then
+        echo -e "  ${GREEN}✅${NC} tts_segments/ ($TTS_COUNT 个片段)"
+    else
+        echo -e "  ${RED}❌${NC} tts_segments/ — 无 TTS 片段"
+        PASS=false
+    fi
 fi
 
 echo ""

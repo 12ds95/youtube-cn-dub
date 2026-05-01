@@ -69,6 +69,28 @@ def _audit_dir(output_dir: Path) -> Path:
     return d
 
 
+def _migrate_audit_files(output_dir: Path):
+    """将旧版根目录下的审计文件迁移到 audit/ 子目录（一次性兼容）。"""
+    audit = _audit_dir(output_dir)
+    # 单文件迁移
+    for name in ("speed_report.json", "slowdown_segments.json",
+                 "calibration_results.json", "style_detection.json",
+                 "tts_failure.json"):
+        old = output_dir / name
+        if old.exists() and not (audit / name).exists():
+            shutil.move(str(old), str(audit / name))
+    # pipeline_*.log 迁移
+    for old in output_dir.glob("pipeline_*.log"):
+        dest = audit / old.name
+        if not dest.exists():
+            shutil.move(str(old), str(dest))
+    # iterations/ 目录迁移
+    old_iter = output_dir / "iterations"
+    new_iter = audit / "iterations"
+    if old_iter.is_dir() and not new_iter.exists():
+        shutil.move(str(old_iter), str(new_iter))
+
+
 # ─── 日志系统 ──────────────────────────────────────────────────────
 class PipelineLogger:
     """双输出日志：同时写屏幕和文件，自动记录各步骤耗时"""
@@ -4145,6 +4167,7 @@ async def process_video(config: dict):
             sys.exit(1)
         video_id = output_dir.name
         url = config.get("url", "")
+        _migrate_audit_files(output_dir)
         print(f"\n{'='*60}")
         print(f"🔄 从已有目录恢复: {output_dir}")
     else:

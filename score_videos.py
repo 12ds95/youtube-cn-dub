@@ -41,7 +41,25 @@ THRESHOLDS = {
     "atempo_std":  {"warn": 0.06, "fail": 0.10},
     "utmos_mean":  {"warn": 3.5, "fail": 3.0, "direction": "lower_is_bad"},
     "jitter_mean": {"warn": 0.025, "fail": 0.050},
+    "iso_compliance": {"warn": 50.0, "fail": 40.0, "direction": "lower_is_bad"},
 }
+
+# ─── 回归检测阈值 ─────────────────────────────────────────────
+# 指标恶化超过 warn% → 警告，超过 fail% → 失败
+REGRESSION_WARN_PCT = 15  # 15% 恶化 → WARN
+REGRESSION_FAIL_PCT = 30  # 30% 恶化 → FAIL
+
+# 用于回归比较的核心指标: (category, key, direction)
+# direction: "higher_is_bad" 表示值上升=恶化, "lower_is_bad" 表示值下降=恶化
+REGRESSION_METRICS = [
+    ("cps",     "mean",                   "CPS 均值",      "higher_is_bad"),
+    ("cps",     "p95",                    "CPS P95",       "higher_is_bad"),
+    ("cps",     "isometric_compliance_pct", "等时合规率",    "lower_is_bad"),
+    ("atempo",  "mean",                   "Atempo 均值",    "higher_is_bad"),
+    ("atempo",  "std",                    "Atempo 标准差",  "higher_is_bad"),
+    ("utmos",   "mean",                   "UTMOS 均值",     "lower_is_bad"),
+    ("prosody", "mean_jitter",            "Jitter 均值",    "higher_is_bad"),
+]
 
 DEFAULT_VIDEO_DIRS = [
     "output/d4EgbgTm0Bg",
@@ -149,6 +167,8 @@ def compute_cps(video_dir: Path) -> dict:
         "std": round(statistics.stdev(cps_values), 3) if len(cps_values) > 1 else 0,
         "above_6_pct": round(sum(1 for c in cps_values if c > 6.0) / len(cps_values) * 100, 1),
         "above_7_pct": round(sum(1 for c in cps_values if c > 7.0) / len(cps_values) * 100, 1),
+        "isometric_compliance_pct": round(
+            sum(1 for c in cps_values if 3.5 <= c <= 6.0) / len(cps_values) * 100, 1),
         "total_scored": len(details),
         "details": details,
     }
@@ -330,6 +350,9 @@ def print_scores(scores: dict, gate_mode: bool = False) -> bool:
             print(f"    {icon} {label}: {color}{val}{NC}")
         print(f"       >6.0 CPS: {cps['above_6_pct']}%")
         print(f"       >7.0 CPS: {cps['above_7_pct']}%")
+        compliance = cps.get('isometric_compliance_pct', 0)
+        icon_c, color_c = _status(compliance, "iso_compliance")
+        print(f"    {icon_c} 合规率 [3.5-6.0]: {color_c}{compliance}%{NC}")
         print(f"       评分段数: {cps['total_scored']}")
 
         if gate_mode:
@@ -445,38 +468,123 @@ def save_baseline(scores: dict, video_dir: Path):
     print(f"  💾 基线已保存: {out_path}")
 
 
-def print_comparison(scores: dict, video_dir: Path):
-    """对比基线打印 delta"""
+def _compute_regression(old_val, new_val, direction):
+    """计算回归百分比。正值=恶化，负值=改善。"""
+    if old_val is None or new_val is None:
+        return None
+    # 避免除零
+    if abs(old_val) < 1e-9:
+        return 0.0
+    delta = new_val - old_val
+    if direction == "lower_is_bad":
+        # 值下降=恶化，所以 regression = -delta/old (下降为正回归)
+        pct = -delta / abs(old_val) * 100
+    else:
+        # 值上升=恶化，所以 regression = delta/old
+        pct = delta / abs(old_val) * 100
+    return pct
+
+
+def check_regression(scores: dict, video_dir: Path) -> tuple:
+    """
+    检查当前评分是否相对基线有回归。
+
+    返回 (passed, warnings, failures)
+      - passed: True 如果无 FAIL 级回归
+      - warnings: [(label, old, new, pct)] 列表
+      - failures: [(label, old, new, pct)] 列表
+    """
     baseline_path = video_dir / "audit" / "baseline_scores.json"
     if not baseline_path.exists():
-        return
+        return True, [], []
+
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    warnings = []
+    failures = []
+
+    for cat, key, label, direction in REGRESSION_METRICS:
+        old_val = baseline.get(cat, {}).get(key)
+        new_data = scores.get(cat, {})
+        if isinstance(new_data, dict) and ("error" in new_data or new_data.get("skipped")):
+            continue
+        new_val = new_data.get(key) if isinstance(new_data, dict) else None
+        if old_val is None or new_val is None:
+            continue
+
+        regression_pct = _compute_regression(old_val, new_val, direction)
+        if regression_pct is None:
+            continue
+
+        if regression_pct >= REGRESSION_FAIL_PCT:
+            failures.append((label, old_val, new_val, regression_pct))
+        elif regression_pct >= REGRESSION_WARN_PCT:
+            warnings.append((label, old_val, new_val, regression_pct))
+
+    passed = len(failures) == 0
+    return passed, warnings, failures
+
+
+def print_comparison(scores: dict, video_dir: Path) -> bool:
+    """对比基线打印 delta 和回归检测结果。返回回归检测是否通过。"""
+    baseline_path = video_dir / "audit" / "baseline_scores.json"
+    if not baseline_path.exists():
+        return True
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     print(f"\n  {BOLD}📈 vs 基线 ({baseline.get('git_commit', '?')}"
           f" @ {baseline.get('timestamp', '?')[:10]}){NC}")
 
-    comparisons = [
-        ("cps", "mean", "CPS mean", False),
-        ("cps", "p95", "CPS p95", False),
-        ("atempo", "mean", "Atempo mean", False),
-        ("atempo", "std", "Atempo std", False),
-    ]
-    for cat, key, label, lower_bad in comparisons:
+    # 打印所有指标的 delta
+    for cat, key, label, direction in REGRESSION_METRICS:
         old = baseline.get(cat, {}).get(key)
-        new = scores.get(cat, {}).get(key)
-        if old is None or new is None or "error" in scores.get(cat, {}):
+        new_data = scores.get(cat, {})
+        if isinstance(new_data, dict) and ("error" in new_data or new_data.get("skipped")):
+            continue
+        new = new_data.get(key) if isinstance(new_data, dict) else None
+        if old is None or new is None:
             continue
         delta = new - old
+        regression_pct = _compute_regression(old, new, direction)
+
+        # 方向判断: 改善=绿色, 恶化=红色
+        lower_bad = (direction == "lower_is_bad")
         if abs(delta) < 0.001:
             arrow = "→"
             color = NC
+            severity = ""
         elif (delta < 0) != lower_bad:
+            # 改善
             arrow = "↓" if delta < 0 else "↑"
             color = GREEN
+            severity = ""
         else:
+            # 恶化
             arrow = "↑" if delta > 0 else "↓"
-            color = RED
+            if regression_pct is not None and regression_pct >= REGRESSION_FAIL_PCT:
+                color = RED
+                severity = f" {RED}[FAIL: +{regression_pct:.1f}%]{NC}"
+            elif regression_pct is not None and regression_pct >= REGRESSION_WARN_PCT:
+                color = YELLOW
+                severity = f" {YELLOW}[WARN: +{regression_pct:.1f}%]{NC}"
+            else:
+                color = RED
+                severity = ""
         print(f"    {arrow} {label}: {old} → {color}{new}{NC}"
-              f" ({'+' if delta > 0 else ''}{delta:.3f})")
+              f" ({'+' if delta > 0 else ''}{delta:.3f}){severity}")
+
+    # 回归检测汇总
+    passed, warnings, failures = check_regression(scores, video_dir)
+    if failures:
+        print(f"\n    {RED}🚨 回归检测: {len(failures)} 项 FAIL{NC}")
+        for label, old, new, pct in failures:
+            print(f"      ❌ {label}: {old} → {new} (恶化 {pct:.1f}%)")
+    if warnings:
+        print(f"\n    {YELLOW}⚠️  回归检测: {len(warnings)} 项 WARN{NC}")
+        for label, old, new, pct in warnings:
+            print(f"      ⚠️  {label}: {old} → {new} (恶化 {pct:.1f}%)")
+    if not failures and not warnings:
+        print(f"\n    {GREEN}✅ 回归检测: 无恶化{NC}")
+
+    return passed
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -522,7 +630,9 @@ def main():
             if not passed:
                 all_passed = False
             if args.compare or (not args.save_baseline):
-                print_comparison(scores, video_dir)
+                regression_passed = print_comparison(scores, video_dir)
+                if args.gate and not regression_passed:
+                    all_passed = False
 
         save_scores_json(scores, video_dir)
 

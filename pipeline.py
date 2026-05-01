@@ -229,15 +229,18 @@ DEFAULT_CONFIG = {
         "system_prompt": (           # 翻译 system prompt（一般无需修改）
             "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。"
             "要求：1)翻译准确流畅，符合中文表达习惯；"
-            "2)保持技术术语的专业性；"
-            "3)翻译要适合做视频配音朗读，语句通顺自然；"
-            "4)只输出翻译结果，不要解释。"
+            "2)领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON、Docker、Kubernetes 等）；"
+            "3)翻译正确性优先于字数控制——宁可译文稍长，也不要为凑字数而曲解原意；"
+            "4)翻译要适合做视频配音朗读，语句通顺自然；"
+            "5)只输出翻译结果，不要解释。"
         ),
         "batch_size": 8,             # 每批翻译的句子数（过大可能导致幻觉重复）
         "temperature": 0.3,          # 生成温度: 0.0=确定性 / 0.3=推荐 / 1.0=多样性
         "style": "",                 # 翻译风格: ""(默认) / "口语化" / "正式" / "学术" 等
         "prompt_template": "",       # 外部提示词模板路径（如 "prompts/dubbing_concise.txt"），为空则用内置 system_prompt
         "two_pass": False,           # 两步翻译: Pass1 忠实直译 → Pass2 配音改编（API 成本翻倍）
+        "isometric": 0,              # 等时多候选翻译: 0=关闭, 3=为高CPS段生成3个长度变体自动选优
+        "isometric_cps_threshold": 5.5,  # 估算CPS超过此值才触发多候选（自然中文 3.5-6.0）
     },
 
     # ── TTS 配音引擎 ──
@@ -1482,7 +1485,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
             f"一行一句，不要合并或拆分。\n"
             f"{hint_line}\n"
-            f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。\n\n{user_msg}"
+            f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
+            f"领域专业术语（如 API、GPU、LLM 等）保留英文原词。"
+            f"翻译正确性优先于字数匹配。\n\n{user_msg}"
         )
 
         payload = {
@@ -1618,6 +1623,18 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
 
     print(f"  ✅ LLM 翻译完成")
+
+    # ── 等时翻译：多候选长度优化 ──
+    isometric_n = llm_config.get("isometric", 0)
+    if isometric_n > 0 and llm_config.get("api_key"):
+        cps_threshold = llm_config.get("isometric_cps_threshold", 5.5)
+        high_cps = _identify_high_cps_segments(result, cps_threshold)
+        if high_cps:
+            print(f"  🎯 等时翻译: {len(high_cps)}/{len(result)} 段估算 CPS > {cps_threshold}，生成多候选...")
+            result = _isometric_translate_batch(result, high_cps, llm_config)
+        else:
+            print(f"  ✅ 等时翻译: 全部段 CPS 合规，无需多候选")
+
     return result
 
 
@@ -1635,7 +1652,8 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "你是专业的英中翻译引擎。请逐句忠实翻译以下英文，要求：\n"
         "1) 保留原文所有信息点，不遗漏不添加\n"
         "2) 直译为主，保持与原文的一一对应关系\n"
-        "3) 只输出翻译结果，不要解释"
+        "3) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
+        "4) 只输出翻译结果，不要解释"
     )
     # 清除外部模板，Pass 1 使用固定 prompt
     pass1_config["prompt_template"] = ""
@@ -1660,9 +1678,11 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "要求：\n"
         "1) 保持原文语义完整，不得遗漏信息\n"
         "2) 使表达更口语化、节奏更适合朗读\n"
-        "3) 译文长度应匹配参考字数（用于控制配音时长）\n"
-        "4) 每句保持 [编号] 格式，一行一句\n"
-        "5) 不要输出解释，只输出改编结果"
+        "3) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
+        "4) 翻译正确性优先于字数匹配——宁可稍长，不要曲解原意\n"
+        "5) 译文长度尽量匹配参考字数（用于控制配音时长）\n"
+        "6) 每句保持 [编号] 格式，一行一句\n"
+        "7) 不要输出解释，只输出改编结果"
     )
 
     print(f"  🎙️  Pass 2: 配音改编...")
@@ -1730,6 +1750,18 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
 
     print(f"     Pass 2 采纳: {pass2_adapted} 段, 回退 Pass 1: {pass2_fallback} 段")
     print(f"  ✅ 两步翻译完成 ({len(final_results)} 段)")
+
+    # ── 等时翻译：多候选长度优化（Pass 2 之后）──
+    isometric_n = llm_config.get("isometric", 0)
+    if isometric_n > 0 and llm_config.get("api_key"):
+        cps_threshold = llm_config.get("isometric_cps_threshold", 5.5)
+        high_cps = _identify_high_cps_segments(final_results, cps_threshold)
+        if high_cps:
+            print(f"  🎯 等时翻译: {len(high_cps)}/{len(final_results)} 段估算 CPS > {cps_threshold}，生成多候选...")
+            final_results = _isometric_translate_batch(final_results, high_cps, llm_config)
+        else:
+            print(f"  ✅ 等时翻译: 全部段 CPS 合规，无需多候选")
+
     return final_results
 
 
@@ -1744,7 +1776,10 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
         # 计算目标字数，作为前缀指令（不混入源文本）
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
         target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
-        user_content = f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注）\n{seg['text']}"
+        user_content = (
+            f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注。"
+            f"领域专业术语保留英文原词。翻译正确性优先于字数匹配。）\n{seg['text']}"
+        )
         for attempt in range(max_retries):
             try:
                 payload = {
@@ -2343,6 +2378,7 @@ async def _generate_tts_segments(
         # 最后防线：清除可能残留的格式标记
         text_zh = _strip_markdown(text_zh, seg.get("text_en", seg.get("text", "")))
         text_zh = _clean_refine_artifacts(text_zh)  # 清理 [轻]/[中]/[短] 等标签
+        text_zh = _fix_polyphones(text_zh)  # 多音字同音替换，纠正 TTS 误读
         if len(text_zh.strip()) >= 2:
             # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
             if not re.search(r'[\u4e00-\u9fff\u3400-\u4dbfa-zA-Z0-9]', text_zh):
@@ -2843,6 +2879,32 @@ def _estimate_duration_jieba(text_zh: str) -> float:
             total_ms += letters * 150 + digits * 120
 
     return total_ms
+
+
+def _identify_high_cps_segments(
+    segments: List[dict], cps_threshold: float = 5.5,
+) -> List[int]:
+    """识别估算 CPS 超标的段索引（用于等时翻译多候选优化）
+
+    使用 _estimate_duration_jieba 估算 TTS 时长，识别翻译过长的段。
+    双条件触发：CPS 超标 或 估算时长/目标时长 > 1.2。
+    """
+    high_cps = []
+    for i, seg in enumerate(segments):
+        text_zh = seg.get("text_zh", "")
+        zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
+        if zh_chars < 3:
+            continue
+        target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
+        if target_ms <= 500:
+            continue
+        target_sec = target_ms / 1000.0
+        estimated_cps = zh_chars / target_sec
+        estimated_ms = _estimate_duration_jieba(text_zh) * 1.1  # 含停顿
+        ratio = estimated_ms / target_ms if target_ms > 0 else 0
+        if estimated_cps > cps_threshold or ratio > 1.2:
+            high_cps.append(i)
+    return high_cps
 
 
 def _measure_speed_ratios(
@@ -3706,9 +3768,11 @@ def _refine_with_llm(
         "1) 必须忠实翻译英文原文，不得偏离原文含义\n"
         "2) 每个 [编号] 的精简版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
         "3) 精简是缩短同一句话，不是替换成其他句子——精简结果必须与当前翻译含义一致\n"
-        "4) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
-        "5) 适合配音朗读，语句自然\n"
-        "6) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
+        "4) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
+        "5) 翻译正确性优先于缩短幅度——宁可少缩短一些，不要为凑字数而曲解原意\n"
+        "6) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
+        "7) 适合配音朗读，语句自然\n"
+        "8) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
     )
 
     for i in range(0, len(overfast_items), batch_size):
@@ -3778,6 +3842,84 @@ def _refine_with_llm(
                         if refined[item["idx"]]["text_zh"] != segments[item["idx"]]["text_zh"])
     print(f"     精简完成: {total_refined}/{len(overfast_items)} 段已更新")
     return refined
+
+
+# ── 多音字同音替换词典 ──────────────────────────────────────────
+# edge-tts 不支持 SSML phoneme 标签，只能通过文本级同音字替换
+# 来纠正高频误读。格式: (正则模式, 替换文本)
+# 仅覆盖 TTS 高频误读场景，不做全量多音字处理。
+_POLYPHONE_RULES: List[tuple] = [
+    # ── 了 (le/liǎo) ──
+    # "了解/了然/了不起/了无/了如指掌/了结/了事/了断/了却" → liǎo
+    # edge-tts 默认读 le，需替换为同音字 "瞭"
+    (re.compile(r"了(解|然|不起|无|如指掌|结|事|断|却|得|望)"), r"瞭\1"),
+    # ── 得 (de/dé/děi) ──
+    # "获得/取得/得到/得出/得益/得分/得力/心得" → dé
+    # edge-tts 在这些词中可能误读为轻声 de
+    (re.compile(r"(获|取|觉|值|舍|记)(得)"), r"\1\2"),  # 这些通常读对，保留
+    (re.compile(r"得(亏|靠)"), r"得\1"),  # děi，通常读对
+    # ── 行 (háng/xíng) ──
+    # "行业/银行/行列/行情/行号/行距/同行/内行/外行" → háng
+    (re.compile(r"(银|央|商|投|同|内|外|在)(行)(?![动进走为驶驰了])"), r"\1杭"),
+    (re.compile(r"行(业|列|情|号|距|家|当|规)"), r"杭\1"),
+    # ── 数 (shù/shǔ) ──
+    # "数据/数量/数字/数组/数值/参数/变数/常数/函数" → shù (名词)
+    # "数一数二/数不胜数" → shǔ (动词)
+    (re.compile(r"数(一数二|不胜数|落|说)"), r"属\1"),
+    # ── 重 (zhòng/chóng) ──
+    # "重新/重复/重建/重启/重来/重试/重置/重写" → chóng
+    (re.compile(r"重(新|复|建|启|来|试|置|写|装|做|现|返|叠|演|申|审|组|设|排|整|定义|命名|构|塑|回|制|载|开|发|拨|提|归)"), r"虫\1"),
+    # ── 处 (chù/chǔ) ──
+    # "处理/处于/相处/处置/处罚/处分" → chǔ
+    # "到处/各处/用处/好处/坏处/长处/短处/何处/深处" → chù
+    (re.compile(r"(到|各|用|好|坏|长|短|何|深|远|近|随|四|别|妙|益)(处)"), r"\1触"),
+    # ── 调 (diào/tiáo) ──
+    # "调用/调试/调度/调配" → diào
+    # "调整/调节/调解/调和/协调" → tiáo
+    (re.compile(r"(协)(调)"), r"\1条"),
+    (re.compile(r"调(整|节|解|和|配|谐|制|控|理|频|幅)"), r"条\1"),
+    # ── 率 (lǜ/shuài) ──
+    # "效率/频率/概率/比率/速率/利率/税率/汇率" → lǜ
+    # "率领/率先/率队" → shuài
+    (re.compile(r"率(领|先|队|部|军|众|性|直|真)"), r"帅\1"),
+    # ── 量 (liàng/liáng) ──
+    # "测量/丈量/量体裁衣" → liáng (动词)
+    # "数量/质量/流量" → liàng (名词，通常读对)
+    (re.compile(r"(测|丈|衡|估|计|度|称)(量)"), r"\1良"),
+    # ── 传 (chuán/zhuàn) ──
+    # "传记/自传/外传/列传/经传" → zhuàn
+    (re.compile(r"(自|外|列|内|经|别|正|小|评)(传)(?![输送播递达承感染导])"), r"\1撰"),
+    # ── 应 (yīng/yìng) ──
+    # "应该/应当/应有" → yīng
+    # "应用/应对/响应/适应/反应" → yìng (通常读对)
+    (re.compile(r"应(该|当|有尽有|许|属|予)"), r"英\1"),
+    # ── 乐 (lè/yuè) ──
+    # "音乐/乐器/乐曲/乐队/乐谱/乐章" → yuè
+    (re.compile(r"(音)(乐)(?!趣|观)"), r"\1月"),
+    (re.compile(r"乐(器|曲|队|谱|章|团|坛|理|律|感|手)"), r"月\1"),
+    # ── 的 (de/dí/dì) ──
+    # "的确/的当" → dí，edge-tts 常误读为 de
+    (re.compile(r"的(确|当)"), r"滴\1"),
+    # ── 差 (chā/chà/chāi) ──
+    # "差异/差距/差别/偏差/误差/温差/时差/落差" → chā
+    # "差不多/差点" → chà (通常读对)
+    # "出差/差事/差遣" → chāi
+    (re.compile(r"(出)(差)(?!异|距|别|值|额|价|分|评|错)"), r"\1拆"),
+    (re.compile(r"差(遣|事|役|使)"), r"拆\1"),
+]
+
+
+def _fix_polyphones(text: str) -> str:
+    """对 TTS 输入文本做多音字同音替换，纠正 edge-tts 高频误读。
+
+    仅处理有明确上下文规则的高频多音字，不做全量替换。
+    替换字为同音字（读音一致、字形不同），不影响语义理解。
+    """
+    if not text:
+        return text
+    for pattern, repl in _POLYPHONE_RULES:
+        text = pattern.sub(repl, text)
+    return text
 
 
 def _clean_refine_artifacts(text: str) -> str:
@@ -3868,12 +4010,13 @@ def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]
 def _select_best_candidate(
     candidates: List[str], target_ms: int, original_zh: str,
     idx: int, segments: List[dict],
+    allow_same_length: bool = False,
 ) -> str:
     """从多个精简候选中选最接近目标时长的，同时排除不合格候选。
 
     选择策略：
       1. 排除与相邻段重复的候选
-      2. 排除比原文更长的候选
+      2. 排除比原文更长的候选（allow_same_length=True 时允许同等长度）
       3. 排除与原文语义忠实度过低的候选（防止跨段内容污染）
       4. 用 jieba 分词估算每个候选的朗读时长
       5. 选时长最接近 target_ms 且不超出的
@@ -3896,9 +4039,13 @@ def _select_best_candidate(
         cand = _clean_refine_artifacts(cand)
         if not cand or len(cand) < 2:
             continue
-        # 排除比原文更长的
-        if len(cand) >= len(original_zh):
-            continue
+        # 长度过滤：等时模式允许同等长度，仅排除超过原文 110% 的
+        if allow_same_length:
+            if len(cand) > len(original_zh) * 1.1:
+                continue
+        else:
+            if len(cand) >= len(original_zh):
+                continue
         # 排除与邻段重复的
         if _is_duplicate_of_neighbors(cand, idx, segments):
             continue
@@ -3937,6 +4084,138 @@ def _select_best_candidate(
             diff = abs(est_ms - target_ms)
             scored.append((cand, diff))
         return min(scored, key=lambda s: s[1])[0]
+
+
+def _isometric_translate_batch(
+    segments: List[dict], high_cps_indices: List[int], llm_config: dict,
+) -> List[dict]:
+    """等时翻译：为高 CPS 段生成多候选长度变体并选优
+
+    在翻译完成后运行，对估算 CPS 超标的段生成 [轻]/[中]/[短] 三个长度变体，
+    用 jieba 分词估算时长选最接近目标的候选。
+
+    复用现有基础设施:
+      - _parse_multi_candidates() 解析 [轻]/[中]/[短]
+      - _select_best_candidate() 候选选择（allow_same_length=True）
+      - _estimate_duration_jieba() 时长估算
+    """
+    import httpx
+    import copy
+
+    result = copy.deepcopy(segments)
+    CHARS_PER_SEC = 4.5
+
+    api_url = llm_config["api_url"].rstrip("/")
+    api_key = llm_config["api_key"]
+    model = llm_config["model"]
+    temperature = llm_config.get("temperature", 0.3)
+    batch_size = min(llm_config.get("batch_size", 15), 5)
+
+    endpoint = (api_url if "/chat/completions" in api_url
+                else f"{api_url}/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    CONTEXT_TRUNCATE = 30
+
+    system_prompt = (
+        "你是专业的英中视频配音翻译专家。以下英文已有初始中文翻译，"
+        "但翻译朗读时长可能不匹配原始时间窗口。\n"
+        "请为每段生成 3 个不同长度的中文翻译版本：\n"
+        "  [轻] 标准版（接近初始翻译长度，微调表达使其更适合朗读）\n"
+        "  [中] 紧凑版（缩短约 15-20%，精简表达但保留完整信息）\n"
+        "  [短] 精简版（缩短约 30-40%，只保留核心语义）\n\n"
+        "规则：\n"
+        "1) 三个版本都必须忠实翻译英文原文，不得偏离原文含义\n"
+        "2) 每个 [编号] 的版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
+        "3) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
+        "4) 翻译正确性优先于长度匹配——宁可稍长，不要为缩短而曲解原意\n"
+        "5) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
+        "6) 适合配音朗读，语句自然，短句为主\n"
+        "7) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
+    )
+
+    # 构建待处理列表
+    items = []
+    for idx in high_cps_indices:
+        seg = segments[idx]
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+        zh_chars = sum(1 for c in seg.get("text_zh", "") if '\u4e00' <= c <= '\u9fff')
+        items.append({
+            "idx": idx,
+            "text_en": seg.get("text_en", seg.get("text", "")),
+            "text_zh": seg.get("text_zh", ""),
+            "zh_chars": zh_chars,
+            "target_chars": target_chars,
+            "dur_sec": dur_sec,
+        })
+
+    adopted = 0
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+        lines = []
+        for j, item in enumerate(batch):
+            idx = item["idx"]
+            prev_zh = segments[idx - 1]["text_zh"][:CONTEXT_TRUNCATE] if idx > 0 else ""
+            next_zh = (segments[idx + 1]["text_zh"][:CONTEXT_TRUNCATE]
+                       if idx < len(segments) - 1 else "")
+            context_hint = ""
+            if prev_zh:
+                context_hint += f"  上文摘要（仅供参考，不要从中取内容）: {prev_zh}...\n"
+            if next_zh:
+                context_hint += f"  下文摘要（仅供参考，不要从中取内容）: {next_zh}..."
+            lines.append(
+                f"[{j+1}]\n"
+                f"  英文: {item['text_en']}\n"
+                f"  当前翻译({item['zh_chars']}字): {item['text_zh']}\n"
+                f"  目标≈{item['target_chars']}字 (时间窗口 {item['dur_sec']:.1f}秒)\n"
+                + (context_hint if context_hint else "")
+            )
+
+        user_msg = (
+            f"请为以下 {len(batch)} 段翻译各生成 [轻]/[中]/[短] 三个长度版本：\n\n"
+            + "\n\n".join(lines)
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": temperature,
+            "max_tokens": 4096,
+        }
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+
+            candidates_per_item = _parse_multi_candidates(content, len(batch))
+
+            for item, candidates in zip(batch, candidates_per_item):
+                idx = item["idx"]
+                target_ms = int((segments[idx]["end"] - segments[idx]["start"]) * 1000)
+
+                best_zh = _select_best_candidate(
+                    candidates, target_ms, item["text_zh"], idx, result,
+                    allow_same_length=True)
+
+                if best_zh:
+                    result[idx]["text_zh"] = best_zh
+                    adopted += 1
+        except Exception as e:
+            print(f"     ⚠️  等时翻译批次 {i//batch_size+1} 失败: {e}")
+
+        print(f"     等时进度: {min(i + batch_size, len(items))}/{len(items)}")
+
+    print(f"     等时翻译完成: {adopted}/{len(items)} 段已优化")
+    return result
 
 
 def _expand_with_llm(

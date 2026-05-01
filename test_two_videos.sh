@@ -67,7 +67,9 @@ run_video() {
     "model": "qwen3-coder-next",
     "batch_size": 8,
     "temperature": 0.3,
-    "two_pass": true
+    "two_pass": true,
+    "isometric": 3,
+    "isometric_cps_threshold": 5.5
   },
   "nlp_segmentation": true,
   "tts_chain": ["edge-tts", "piper", "gtts", "pyttsx3"],
@@ -100,7 +102,7 @@ JSONEOF
 
     echo -e "${YELLOW}🚀 开始运行管线...${NC}"
     echo "   skip_steps: $SKIP_STEPS"
-    echo "   功能: two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown"
+    echo "   功能: two_pass, nlp_segmentation, isometric, post_tts_calibration, gap_borrowing, video_slowdown"
     echo ""
 
     local START_TIME

@@ -145,6 +145,70 @@ bash test_pipeline.sh --baseline     # 全功能关闭，验证不引入回归
 ./venv/bin/python3 score_videos.py --compare          # 对比基线
 ```
 
+### 基线管理与回归检测
+
+**何时保存基线**：
+- 每次管线功能变更（翻译策略、TTS引擎、语速控制等）生效并验证通过后
+- 使用 `--save-baseline` 保存当前评分，会记录 git commit hash 和时间戳
+
+**回归检测机制**：
+
+当存在基线文件 (`audit/baseline_scores.json`) 时，评分工具自动计算每个核心指标相对基线的变化百分比。
+
+| 恶化程度 | 阈值 | 效果 |
+|----------|------|------|
+| WARN | 指标恶化 ≥ 15% | 黄色警告，不影响门禁 |
+| FAIL | 指标恶化 ≥ 30% | 红色失败，`--gate` 模式退出码 1 |
+
+**受监控指标**：
+| 指标 | 恶化方向 | 说明 |
+|------|----------|------|
+| CPS 均值 | 上升=恶化 | 语速过快 |
+| CPS P95 | 上升=恶化 | 尾部极端语速 |
+| Atempo 均值 | 上升=恶化 | 调速幅度增大 |
+| Atempo 标准差 | 上升=恶化 | 调速不一致 |
+| UTMOS 均值 | 下降=恶化 | 语音自然度降低 (可选) |
+| Jitter 均值 | 上升=恶化 | 声学质量下降 (可选) |
+
+**工作流**：
+```bash
+# 1. 保存基线（管线功能变更前）
+./venv/bin/python3 score_videos.py --save-baseline
+
+# 2. 执行管线功能变更...
+
+# 3. 重跑管线并评分（自动对比基线）
+./venv/bin/python3 score_videos.py --gate
+
+# 4. 如果回归通过，更新基线
+./venv/bin/python3 score_videos.py --save-baseline
+```
+
+### 等时翻译 (isometric translation)
+
+**原理**：IWSLT 2025 研究表明 LLM 忽略显式字数指令，但多候选生成 + 过滤可达 90%+ 长度合规率。
+
+**配置**：
+```json
+{
+  "llm": {
+    "isometric": 3,
+    "isometric_cps_threshold": 5.5
+  }
+}
+```
+
+**工作流**：翻译完成后，识别估算 CPS > 阈值的段，为每段生成 [轻]/[中]/[短] 三个长度变体，用 jieba 分词估算时长选最接近目标的。
+
+| 指标 | 计算方式 | WARN | FAIL | 说明 |
+|------|----------|------|------|------|
+| 等时合规率 | CPS 在 [3.5, 6.0] 的段占比 | < 50% | < 40% | 越高越好 |
+
+**复用现有基础设施**：
+- `_parse_multi_candidates()` 解析 [轻]/[中]/[短]
+- `_select_best_candidate()` 候选选择（新增 `allow_same_length` 参数）
+- `_estimate_duration_jieba()` 时长估算
+
 ### 迭代优化 (refine mode)
 | 指标 | 计算方式 | 目标 | 相关功能 |
 |------|----------|------|---------|

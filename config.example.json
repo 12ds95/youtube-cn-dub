@@ -19,12 +19,15 @@
     "api_url": "https://api.deepseek.com/v1",
     "api_key": "",
     "model": "deepseek-chat",
-    "system_prompt": "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。要求：1)翻译准确流畅，符合中文表达习惯；2)保持技术术语的专业性；3)翻译要适合做视频配音朗读，语句通顺自然；4)只输出翻译结果，不要解释。",
+    "system_prompt": "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。要求：1)翻译准确流畅，符合中文表达习惯；2)领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON、Docker、Kubernetes 等）；3)翻译正确性优先于字数控制——宁可译文稍长，也不要为凑字数而曲解原意；4)翻译要适合做视频配音朗读，语句通顺自然；5)只输出翻译结果，不要解释。",
     "batch_size": 8,
     "temperature": 0.3,
     "style": "",
     "prompt_template": "",
-    "two_pass": false
+    "two_pass": false,
+    "isometric": 0,
+    "isometric_cps_threshold": 5.5,
+    "__isometric 说明__": "等时多候选翻译: 0=禁用, 3=为高CPS段生成3个长度变体自动选优（减少调速需求）"
   },
 
   "__=== TTS 配音引擎 ===__": "",

@@ -126,6 +126,25 @@ bash test_pipeline.sh --baseline     # 全功能关闭，验证不引入回归
 | 减速标记数 | slowdown_segments.json 中的段数 | < 5 | video_slowdown |
 | 减速因子范围 | factor 值范围 | 0.85 ~ 1.0 | max_slowdown_factor |
 
+### TTS 自然度 (质量评分)
+| 指标 | 计算方式 | WARN | FAIL | 依赖 |
+|------|----------|------|------|------|
+| CPS 均值 | 中文字数 / TTS实际时长 | > 5.5 | > 6.5 | mutagen (已有) |
+| CPS P95 | 95th 百分位 CPS | > 6.5 | > 8.0 | mutagen |
+| Atempo 均值 | speed_report.json avg_clamped | > 1.10 | > 1.20 | speed_report.json |
+| Atempo 标准差 | speed_report.json std_clamped | > 0.06 | > 0.10 | speed_report.json |
+| UTMOS MOS | 神经网络语音质量预测 | < 3.5 | < 3.0 | utmos (可选) |
+| Jitter | 基频抖动 (Praat) | > 2.5% | > 5.0% | parselmouth (可选) |
+
+自动化评分命令：
+```bash
+./venv/bin/python3 score_videos.py                    # 评分全部测试视频
+./venv/bin/python3 score_videos.py output/VIDEO_ID    # 评分单个视频
+./venv/bin/python3 score_videos.py --gate             # 质量门禁（超阈值退出 1）
+./venv/bin/python3 score_videos.py --save-baseline    # 保存基线
+./venv/bin/python3 score_videos.py --compare          # 对比基线
+```
+
 ### 迭代优化 (refine mode)
 | 指标 | 计算方式 | 目标 | 相关功能 |
 |------|----------|------|---------|

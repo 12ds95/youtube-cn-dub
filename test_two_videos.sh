@@ -144,6 +144,14 @@ JSONEOF
         PASS=false
     fi
 
+    # 质量评分门禁
+    echo ""
+    echo -e "${YELLOW}📊 质量评分 ($VIDEO_ID):${NC}"
+    ./venv/bin/python3 score_videos.py "$VIDEO_DIR" --gate
+    if [ $? -ne 0 ]; then
+        PASS=false
+    fi
+
     echo ""
     echo -e "  ⏱️  耗时: ${MINUTES}分${SECONDS}秒"
 

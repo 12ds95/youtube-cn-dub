@@ -116,6 +116,11 @@ else
     echo "  ✅ yt-dlp-ejs"
 fi
 
+# 质量评分工具（可选，score_videos.py 使用）
+echo ""
+echo "  📦 安装质量评分工具（可选）..."
+$PIP_INSTALL praat-parselmouth -q 2>/dev/null && echo "  ✅ praat-parselmouth" || echo "  ⏭  praat-parselmouth (可选，跳过)"
+
 # ─── 4. 检查系统工具 ──────────────────────────────────────────
 echo ""
 echo "[4/4] 检查系统工具..."

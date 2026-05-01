@@ -12,12 +12,14 @@
 
 ### 主测试（日常迭代，验收标准）
 ```bash
-# 跳过 Whisper + 翻译，复用已有翻译缓存
-# 全功能开启: refine + TTS + 后校准 + 对齐 + 间隙借用 + 视频减速 + 字幕 + 合成
-# 验证 TTS/语速/对齐/后校准/合成 全链路协同
+# 跳过 Whisper，复用 transcribe_cache.json（转录结果稳定，不浪费时间）
+# 全功能端到端开启: two_pass + nlp_segmentation + 幻觉检测 + refine +
+#   TTS + 后校准 + 间隙借用 + 视频减速 + 字幕 + 合成
 bash test_pipeline.sh --fast
 ```
-这是最常用的验收命令。改了 TTS、对齐、后校准、语速平滑等代码后用这个。
+这是最常用的验收命令。**所有新功能同时开启**，从翻译到最终合成全链路验证。
+
+**不测 `--full`（太慢）**。`--full` 包含 Whisper 转录，单次耗时过长且转录结果已稳定。日常迭代始终用 `--fast`。
 
 ### 翻译集成测试（改了翻译代码时用）
 ```bash
@@ -38,8 +40,8 @@ bash test_pipeline.sh --baseline     # 全功能关闭，验证不引入回归
 
 | 改了什么 | 用哪个模式 | 原因 |
 |----------|-----------|------|
-| TTS / 语速平滑 / 对齐 / 后校准 | `--fast` | 翻译不变，直接测后半链路 |
-| 翻译 / 幻觉检测 / 两步翻译 / NLP分句 | `--integrated` | 需要重新翻译，但不需要重新转录 |
+| 任何代码改动（日常验收） | `--fast` | 跳过 Whisper，全功能端到端 |
+| 翻译 / 幻觉检测 / 两步翻译 / NLP分句 | `--fast` 或 `--integrated` | 重新翻译 + 后续全链路 |
 | 迭代优化 / refine 精简扩展 | `--refine` | 只跑 refine 步骤 |
 | 怀疑新功能引入回归 | `--baseline` | 全部关闭对比 |
 
@@ -53,11 +55,11 @@ bash test_pipeline.sh --baseline     # 全功能关闭，验证不引入回归
         ▼
 ┌────────────────┐
 │  2. 全量分析    │  对以下产出做量化分析（不能只看"通过/失败"）:
-│                │  ┌─ segments_cache.json → 幻觉率、覆盖率、相邻重复
-│                │  ├─ speed_report.json   → 标准差、离群段、均值
-│                │  ├─ slowdown_segments.json → 减速标记数和因子
-│                │  ├─ pipeline_*.log      → 各步骤耗时、错误、警告
-│                │  └─ final.mp4          → 人工抽查 3~5 段听感
+│                │  ┌─ segments_cache.json        → 幻觉率、覆盖率、相邻重复
+│                │  ├─ audit/speed_report.json    → 标准差、离群段、均值
+│                │  ├─ audit/slowdown_segments.json → 减速标记数和因子
+│                │  ├─ audit/pipeline_*.log       → 各步骤耗时、错误、警告
+│                │  └─ final.mp4                  → 人工抽查 3~5 段听感
 └───────┬────────┘
         ▼
 ┌────────────────┐
@@ -222,7 +224,7 @@ if cache.exists():
     print(f"  相邻重复:   {adj_dup}/{len(segs)-1} = {adj_dup/(len(segs)-1):.1%}  {'✅' if adj_dup/(len(segs)-1) < 0.02 else '❌'}")
 
 # ── 语速 ──
-speed_file = p / "speed_report.json"
+speed_file = p / "audit" / "speed_report.json"
 if speed_file.exists():
     rpt = json.loads(speed_file.read_text())
     print(f"\n【语速/时间轴】")
@@ -236,7 +238,7 @@ if speed_file.exists():
     print(f"  基线:       {rpt.get('baseline', '?')}")
 
 # ── 减速标记 ──
-slow_file = p / "slowdown_segments.json"
+slow_file = p / "audit" / "slowdown_segments.json"
 if slow_file.exists():
     slows = json.loads(slow_file.read_text())
     print(f"\n【视频减速】")

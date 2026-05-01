@@ -162,7 +162,7 @@ def test_no_empty_translations():
 
 def test_speed_report_quality():
     """语速报告质量检查 (借鉴 VideoLingo 音频溢出容差)"""
-    report = os.path.join(CACHE_DIR, "speed_report.json")
+    report = os.path.join(CACHE_DIR, "audit", "speed_report.json")
     if not os.path.exists(report):
         print("  ⏭  跳过: speed_report.json 不存在")
         return

@@ -58,21 +58,17 @@ echo -e "${YELLOW}🧹 清理旧的生成文件...${NC}"
 rm -f  "$VIDEO_DIR/chinese_dub.wav"
 rm -f  "$VIDEO_DIR/final.mp4"
 rm -f  "$VIDEO_DIR"/subtitle_*.srt
-rm -f  "$VIDEO_DIR/speed_report.json"
 rm -rf "$VIDEO_DIR/tts_segments"
-rm -rf "$VIDEO_DIR/iterations"
-rm -f  "$VIDEO_DIR"/pipeline_*.log
+rm -rf "$VIDEO_DIR/audit"
 
 case "$MODE" in
     full|baseline)
         rm -f "$VIDEO_DIR/segments_cache.json"
         rm -f "$VIDEO_DIR/transcribe_cache.json"
-        rm -f "$VIDEO_DIR/slowdown_segments.json"
         echo "   $MODE 模式: 清理所有缓存 (从 transcribe 开始)"
         ;;
     integrated)
         rm -f "$VIDEO_DIR/segments_cache.json"
-        rm -f "$VIDEO_DIR/slowdown_segments.json"
         echo "   --integrated 模式: 保留 transcribe_cache，清理翻译缓存 (从翻译开始，全功能)"
         ;;
     fast)
@@ -256,7 +252,7 @@ for i, seg in enumerate(segs):
 print(f'  总片段: {total}')
 # 统计迭代变化（如果有 iter_0）
 try:
-    with open('$VIDEO_DIR/iterations/iter_0_segments.json') as f:
+    with open('$VIDEO_DIR/audit/iterations/iter_0_segments.json') as f:
         orig = json.load(f)
     changed = sum(1 for a, b in zip(orig, segs) if a.get('text_zh') != b.get('text_zh'))
     print(f'  迭代变更: {changed}/{total} 段')
@@ -281,7 +277,7 @@ else
     check_file "$VIDEO_DIR/subtitle_bilingual.srt" "subtitle_bilingual.srt (双语字幕)"
     check_file "$VIDEO_DIR/subtitle_zh.srt"        "subtitle_zh.srt (中文字幕)"
     check_file "$VIDEO_DIR/subtitle_en.srt"        "subtitle_en.srt (英文字幕)"
-    check_file "$VIDEO_DIR/speed_report.json"      "speed_report.json (语速报告)"
+    check_file "$VIDEO_DIR/audit/speed_report.json"  "audit/speed_report.json (语速报告)"
 
     # 检查 TTS 片段目录
     TTS_COUNT=$(ls "$VIDEO_DIR/tts_segments"/*.mp3 2>/dev/null | wc -l | tr -d ' ')

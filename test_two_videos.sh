@@ -7,12 +7,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# ctrl+c / 异常退出时清理临时配置文件
+trap 'rm -f /tmp/test_*_*.json' EXIT
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-VIDEOS=("d4EgbgTm0Bg" "kCc8FmEb1nY")
+VIDEOS=("d4EgbgTm0Bg" "kCc8FmEb1nY" "zjMuIxRvygQ")
 
 run_video() {
     local VIDEO_ID="$1"
@@ -42,12 +45,12 @@ run_video() {
     rm -f  "$VIDEO_DIR/chinese_dub.wav"
     rm -f  "$VIDEO_DIR/final.mp4"
     rm -f  "$VIDEO_DIR"/subtitle_*.srt
-    rm -f  "$VIDEO_DIR/speed_report.json"
-    rm -f  "$VIDEO_DIR/slowdown_segments.json"
     rm -rf "$VIDEO_DIR/tts_segments"
-    rm -rf "$VIDEO_DIR/iterations"
-    rm -f  "$VIDEO_DIR"/pipeline_*.log
+    rm -rf "$VIDEO_DIR/audit"
     echo "   清理完成"
+
+    # 清理上次残留的临时配置文件 (ctrl+c 后 mktemp 模板冲突)
+    rm -f /tmp/test_${VIDEO_ID}_*.json
 
     # 构建临时配置
     local TMPCONFIG
@@ -74,7 +77,7 @@ run_video() {
   "skip_steps": $SKIP_STEPS,
   "refine": {
     "enabled": true,
-    "max_iterations": 3,
+    "max_iterations": 20,
     "speed_threshold": 1.25,
     "post_tts_calibration": true,
     "calibration_threshold": 1.30
@@ -117,7 +120,7 @@ JSONEOF
     echo ""
     echo -e "${YELLOW}📋 输出验证 ($VIDEO_ID):${NC}"
     local PASS=true
-    for f in final.mp4 chinese_dub.wav segments_cache.json subtitle_bilingual.srt subtitle_zh.srt subtitle_en.srt speed_report.json; do
+    for f in final.mp4 chinese_dub.wav segments_cache.json subtitle_bilingual.srt subtitle_zh.srt subtitle_en.srt audit/speed_report.json; do
         if [ -f "$VIDEO_DIR/$f" ] && [ "$(stat -f%z "$VIDEO_DIR/$f" 2>/dev/null)" -gt 0 ]; then
             local size
             size=$(stat -f%z "$VIDEO_DIR/$f" | awk '{

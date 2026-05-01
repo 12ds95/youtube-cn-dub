@@ -61,6 +61,14 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
 
+# ─── 审计目录 ──────────────────────────────────────────────────────
+def _audit_dir(output_dir: Path) -> Path:
+    """返回审计日志子目录 output_dir/audit/，不存在则创建。"""
+    d = output_dir / "audit"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # ─── 日志系统 ──────────────────────────────────────────────────────
 class PipelineLogger:
     """双输出日志：同时写屏幕和文件，自动记录各步骤耗时"""
@@ -80,7 +88,7 @@ class PipelineLogger:
         """设置日志文件，在 output_dir 确定后调用"""
         output_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_path = output_dir / f"pipeline_{ts}.log"
+        self.log_path = _audit_dir(output_dir) / f"pipeline_{ts}.log"
         self._file = open(self.log_path, "w", encoding="utf-8")
         self._file.write(f"# Pipeline 执行日志 - {datetime.now().isoformat()}\n\n")
 
@@ -1012,9 +1020,13 @@ def translate_segments(segments: List[dict], config: dict) -> List[dict]:
     if engine == "llm":
         llm_cfg = config["llm"]
         video_title = config.get("video_title", "")
+        # 获取输出目录用于保存风格检测等 JSON
+        output_dir = None
+        if config.get("resume_from"):
+            output_dir = Path(config["resume_from"])
         if llm_cfg.get("two_pass", False):
-            return _translate_llm_two_pass(segments, llm_cfg, video_title)
-        return _translate_llm(segments, llm_cfg, video_title)
+            return _translate_llm_two_pass(segments, llm_cfg, video_title, output_dir=output_dir)
+        return _translate_llm(segments, llm_cfg, video_title, output_dir=output_dir)
     else:
         return _translate_google(segments)
 
@@ -1053,7 +1065,7 @@ def _translate_google(segments: List[dict], batch_size: int = 20) -> List[dict]:
 
 def _detect_translation_style(segments: List[dict], video_title: str,
                                endpoint: str, headers: dict, model: str,
-                               temperature: float) -> str:
+                               temperature: float, output_dir: Path = None) -> str:
     """扫描完整视频内容后，识别主题和翻译风格，返回追加到 system_prompt 的指导规则。
 
     策略：把全部英文原文拼接后送给 LLM 做一次完整扫描（专用轮次），而非只看开头。
@@ -1187,6 +1199,20 @@ def _detect_translation_style(segments: List[dict], video_title: str,
 
         result = "\n".join(guide_parts)
         print(f"     ✅ 主题: {topic} | 风格: {style} | 术语规则: {len(term_rules)} 条")
+        if term_rules:
+            for rule in term_rules[:5]:
+                print(f"        · {rule}")
+            if len(term_rules) > 5:
+                print(f"        ... 共 {len(term_rules)} 条")
+
+        # 保存风格检测结果 JSON (便于 review/debug)
+        if output_dir:
+            style_path = _audit_dir(output_dir) / "style_detection.json"
+            style_data = {"topic": topic, "style": style,
+                          "term_rules": term_rules, "warnings": warnings}
+            with open(style_path, "w", encoding="utf-8") as _f:
+                json.dump(style_data, _f, ensure_ascii=False, indent=2)
+
         return result
 
     except Exception as e:
@@ -1344,7 +1370,7 @@ def _check_batch_alignment(batch: List[dict], translations: List[str]) -> List[i
     return [i for i, s in enumerate(scores) if s >= 1.5]
 
 
-def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = "") -> List[dict]:
+def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = "", output_dir: Path = None) -> List[dict]:
     """LLM 大模型翻译引擎 (OpenAI 兼容 API)"""
     import httpx
 
@@ -1384,7 +1410,8 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     # 用视频标题 + 前几段内容让 LLM 判断专业领域，注入术语保护规则
     if not style:
         topic_guide = _detect_translation_style(
-            segments, video_title, endpoint, headers, model, temperature
+            segments, video_title, endpoint, headers, model, temperature,
+            output_dir=output_dir
         )
         if topic_guide:
             system_prompt += f"\n{topic_guide}"
@@ -1499,6 +1526,8 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                     text_zh = _strip_numbered_prefix(text_zh)
                 # 清除 LLM 可能输出的 markdown 格式标记
                 text_zh = _strip_markdown(text_zh, seg["text"])
+                # 深度安全网：清除文本中间任何残留的 [N] 标号
+                text_zh = re.sub(r'\[\d+\]\s*', '', text_zh)
             batch_results.append({
                 "start": seg["start"], "end": seg["end"],
                 "text_en": seg["text"], "text_zh": text_zh or seg["text"],
@@ -1570,7 +1599,7 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     return result
 
 
-def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title: str = "") -> List[dict]:
+def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title: str = "", output_dir: Path = None) -> List[dict]:
     """两步翻译: Pass 1 忠实直译 → Pass 2 配音改编 (参考 VideoLingo 三步法)"""
     import httpx
     import copy
@@ -1591,7 +1620,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     pass1_config["style"] = ""
 
     print(f"  📝 Pass 1: 忠实直译...")
-    pass1_results = _translate_llm(segments, pass1_config, video_title)
+    pass1_results = _translate_llm(segments, pass1_config, video_title, output_dir=output_dir)
 
     # ── Pass 2: 配音改编 ──
     # 输入 = 英文原文 + Pass 1 直译，输出 = 适合配音的自然中文
@@ -1616,6 +1645,8 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
 
     print(f"  🎙️  Pass 2: 配音改编...")
     final_results = list(pass1_results)  # 复制 Pass 1 结果作为 fallback
+    pass2_adapted = 0
+    pass2_fallback = 0
 
     for i in range(0, len(pass1_results), batch_size):
         batch = pass1_results[i:i + batch_size]
@@ -1658,6 +1689,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
 
             for j, (seg, adapted) in enumerate(zip(batch, adaptations)):
                 if j in halluc:
+                    pass2_fallback += 1
                     continue  # 保持 Pass 1 结果
                 if adapted and len(adapted.strip()) >= 2:
                     clean = _strip_numbered_prefix(adapted) if re.match(r"^\[\d+\]", adapted) else adapted
@@ -1665,9 +1697,16 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
                     # 语义校验: 改编结果不应与直译完全无关
                     if len(clean) >= 2:
                         final_results[i + j]["text_zh"] = clean
+                        pass2_adapted += 1
+                    else:
+                        pass2_fallback += 1
+                else:
+                    pass2_fallback += 1
         except Exception as e:
             print(f"     ⚠️  Pass 2 批次失败: {e}，保留 Pass 1 结果")
+            pass2_fallback += len(batch)
 
+    print(f"     Pass 2 采纳: {pass2_adapted} 段, 回退 Pass 1: {pass2_fallback} 段")
     print(f"  ✅ 两步翻译完成 ({len(final_results)} 段)")
     return final_results
 
@@ -1784,6 +1823,17 @@ def _parse_numbered_translations(content: str, expected_count: int) -> List[str]
     content = _strip_think_block(content)
 
     lines = content.strip().split("\n")
+
+    # ── 预处理: 拆分同一行内的多个 [N] 标记 ──
+    # LLM 有时将 "[1] 文本[2] 文本[3] 文本" 输出在同一行
+    expanded_lines = []
+    for line in lines:
+        parts = re.split(r'(?=\[\d+\])', line)
+        for part in parts:
+            part = part.strip()
+            if part:
+                expanded_lines.append(part)
+    lines = expanded_lines
 
     # ── 编号验证解析: 按编号放入对应槽位 ──
     slots = [""] * expected_count  # 预分配槽位
@@ -2241,7 +2291,7 @@ async def _generate_tts_segments(
     """
     tts_dir.mkdir(exist_ok=True)
     config = config or {}
-    failure_json = tts_dir.parent / "tts_failure.json"
+    failure_json = _audit_dir(tts_dir.parent) / "tts_failure.json"
 
     # ── 解析引擎链 ──
     tts_chain = config.get("tts_chain", None)
@@ -2545,7 +2595,7 @@ async def _generate_tts_segments(
             if target_ms > 0:
                 from pydub import AudioSegment as PydubSegment
                 silence = PydubSegment.silent(
-                    duration=min(target_ms, 500), frame_rate=16000)
+                    duration=target_ms, frame_rate=16000)
                 silence.export(str(p), format="mp3")
                 silence_count += 1
                 print(f"     ⚠️  seg_{idx:04d}.mp3 所有引擎均失败，填充静音")
@@ -2841,6 +2891,11 @@ async def _post_tts_calibrate(
         return segments
 
     print(f"  🔧 后校准: {len(overfast)} 段超 {threshold}x，精简译文...")
+    for item in overfast[:5]:
+        print(f"     #{item['idx']:3d} ({item['speed_ratio']:.2f}x)"
+              f" \"{item.get('text_zh', '')[:25]}...\"")
+    if len(overfast) > 5:
+        print(f"     ... 共 {len(overfast)} 段")
 
     # 2. 精简译文
     refined_segments = _refine_with_llm(segments, overfast, llm_config)
@@ -2857,6 +2912,32 @@ async def _post_tts_calibrate(
     if not changed_indices:
         print(f"  ⚠️  后校准: LLM 未能精简任何段")
         return segments
+
+    # 打印变更 diff (学习 run_refinement_loop 变更打印模式)
+    for idx in changed_indices[:3]:
+        old = segments[idx]["text_zh"][:18] + ("..." if len(segments[idx]["text_zh"]) > 18 else "")
+        new = refined_segments[idx]["text_zh"][:18] + ("..." if len(refined_segments[idx]["text_zh"]) > 18 else "")
+        ratio = next(r["speed_ratio"] for r in overfast if r["idx"] == idx)
+        print(f"     #{idx:3d} ({ratio:.1f}x) \"{old}\" → \"{new}\"")
+    if len(changed_indices) > 3:
+        print(f"     ... 共 {len(changed_indices)} 处变更")
+
+    # 保存校准结果 JSON (便于 review/debug)
+    import json as _json_cal
+    cal_path = _audit_dir(tts_dir.parent) / "calibration_results.json"
+    cal_data = {
+        "threshold": threshold,
+        "overfast_count": len(overfast),
+        "changed_count": len(changed_indices),
+        "changes": [{
+            "idx": idx,
+            "old_zh": segments[idx]["text_zh"],
+            "new_zh": refined_segments[idx]["text_zh"],
+            "old_ratio": next(r["speed_ratio"] for r in overfast if r["idx"] == idx),
+        } for idx in changed_indices],
+    }
+    with open(cal_path, "w", encoding="utf-8") as _f:
+        _json_cal.dump(cal_data, _f, ensure_ascii=False, indent=2)
 
     # 4. 仅对改动段重新生成 TTS
     voice = config.get("voice", "zh-CN-YunxiNeural")
@@ -2962,6 +3043,8 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
     video_slowdown = align_cfg.get("video_slowdown", False)
     max_slowdown_factor = align_cfg.get("max_slowdown_factor", 0.85)
     slowdown_segments = []  # 记录需要视频减速的段: {"idx", "start", "end", "factor"}
+    borrow_events = []      # 记录借用事件用于汇总打印
+    slowdown_rejected = 0   # 超出减速上限被截断的段数
 
     # 计算段间间隙 (用于 gap borrowing)
     gap_after = []  # gap_after[i] = segments[i+1].start - segments[i].end (ms)
@@ -3088,8 +3171,11 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
         "clamped_fast": stats["clamped_fast"],
         "clamped_slow": stats["clamped_slow"],
         "gap_borrowing": gap_borrowing,
+        "borrow_events": borrow_events if borrow_events else [],
+        "video_slowdown": video_slowdown,
+        "slowdown_rejected": slowdown_rejected,
     }
-    with open(output_dir / "speed_report.json", "w", encoding="utf-8") as f:
+    with open(_audit_dir(output_dir) / "speed_report.json", "w", encoding="utf-8") as f:
         json.dump(speed_report, f, ensure_ascii=False, indent=2)
 
     # ── Phase 1: 并行 ffmpeg atempo 调速 ──
@@ -3190,6 +3276,8 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
                         # 允许 TTS 延伸到间隙中，不截断
                         borrowed = True
                         stats["borrowed"] += 1
+                        borrow_events.append({"idx": idx, "overflow_ms": overflow_ms,
+                                              "borrow_ms": borrow_amount})
             if not borrowed:
                 # Video Slowdown: 超时≤15% 且启用时，标记视频减速而非截断音频
                 overflow_ratio = overflow_ms / target_dur if target_dur > 0 else 1.0
@@ -3205,6 +3293,7 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
                         })
                         # 不截断，让 TTS 保持原长（视频端会减速适配）
                     else:
+                        slowdown_rejected += 1
                         tts_audio = tts_audio[:target_dur]
                 else:
                     tts_audio = tts_audio[:target_dur]
@@ -3219,16 +3308,26 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
 
     dub_path = output_dir / "chinese_dub.wav"
     final_audio.export(str(dub_path), format="wav")
+
+    # 间隙借用汇总
+    if borrow_events:
+        total_ms = sum(e["borrow_ms"] for e in borrow_events)
+        max_e = max(borrow_events, key=lambda e: e["borrow_ms"])
+        print(f"     间隙借用: {len(borrow_events)} 段, "
+              f"总 {total_ms}ms, 最大 #{max_e['idx']} {max_e['borrow_ms']}ms")
+
     print(f"  ✅ 配音完成 (调速:{stats['adjusted']}, 填充:{stats['padded']},"
           f" 限速:{stats['clamped_fast']}, 提速:{stats['clamped_slow']},"
           f" 借用:{stats['borrowed']}, 跳过:{stats['skipped']}, 总:{len(segments)})")
 
     # ── Video Slowdown 报告 ──
     if slowdown_segments:
-        slowdown_path = output_dir / "slowdown_segments.json"
+        slowdown_path = _audit_dir(output_dir) / "slowdown_segments.json"
         with open(slowdown_path, "w", encoding="utf-8") as f:
             json.dump(slowdown_segments, f, ensure_ascii=False, indent=2)
         print(f"  🐢 视频减速标记: {len(slowdown_segments)} 段 → {slowdown_path.name}")
+    if slowdown_rejected:
+        print(f"     (另有 {slowdown_rejected} 段超减速上限 {max_slowdown_factor}x, 已截断)")
 
     return dub_path
 
@@ -3284,7 +3383,7 @@ async def run_refinement_loop(
         print("  ⚠️  迭代优化需要 LLM 翻译引擎 (llm.api_key 为空)，跳过")
         return segments
 
-    iter_dir = output_dir / "iterations"
+    iter_dir = _audit_dir(output_dir) / "iterations"
     iter_dir.mkdir(exist_ok=True)
 
     segments = copy.deepcopy(segments)
@@ -3651,6 +3750,11 @@ def _refine_with_llm(
         except Exception as e:
             print(f"     ⚠️  LLM 精简批次 {i//batch_size+1} 失败: {e}")
 
+        print(f"     精简进度: {min(i + batch_size, len(overfast_items))}/{len(overfast_items)}")
+
+    total_refined = sum(1 for item in overfast_items
+                        if refined[item["idx"]]["text_zh"] != segments[item["idx"]]["text_zh"])
+    print(f"     精简完成: {total_refined}/{len(overfast_items)} 段已更新")
     return refined
 
 
@@ -3920,7 +4024,7 @@ def _expand_with_llm(
 
 def clean_iterations(output_dir: Path):
     """清理迭代中间数据，恢复到初始翻译状态"""
-    iter_dir = output_dir / "iterations"
+    iter_dir = _audit_dir(output_dir) / "iterations"
     tts_dir = output_dir / "tts_segments"
     cleaned = []
 
@@ -4006,7 +4110,7 @@ def merge_final_video(video_path: Path, dub_path: Path,
     print(f"  ✅ 最终视频: {final_path}")
 
     # ── Video Slowdown 提示 ──
-    slowdown_path = output_dir / "slowdown_segments.json"
+    slowdown_path = _audit_dir(output_dir) / "slowdown_segments.json"
     if slowdown_path.exists():
         with open(slowdown_path, "r", encoding="utf-8") as f:
             slowdown_segs = json.load(f)
@@ -4362,7 +4466,7 @@ async def process_video(config: dict):
             _log(f"  🗣  voice={config['voice']}, 并发={config.get('tts_concurrency', 5)}")
             # 清除旧的 TTS 缓存（翻译已变更，旧文件内容可能不匹配）
             # 但如果存在 tts_failure.json（断点恢复场景），保留已有文件，只重试失败片段
-            failure_json_path = output_dir / "tts_failure.json"
+            failure_json_path = _audit_dir(output_dir) / "tts_failure.json"
             if tts_dir.exists() and not failure_json_path.exists():
                 for f in tts_dir.iterdir():
                     f.unlink()

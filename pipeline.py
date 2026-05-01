@@ -259,6 +259,8 @@ DEFAULT_CONFIG = {
     "whisper_beam_size": 5,          # Whisper beam search 大小（越大越精确但越慢）
     "cpu_threads": 0,                # CPU 线程数限制: 0=使用所有核心, N=限制为 N 线程
                                      # 影响: demucs / whisper / ffmpeg atempo 并行数
+    "global_speed": 1.0,             # 全局语速倍率: 0.8=慢速朗读 / 1.0=正常 / 1.2=快速
+                                     # 统一缩放所有 TTS 片段语速，不影响原始音频
     "skip_steps": [],                # 跳过指定步骤（按执行顺序）:
                                      #   标准流程(7/8步): download / extract / separate / transcribe / translate / subtitle / tts / merge
                                      #   迭代流程(8/9步): download / extract / separate / transcribe / translate / refine / tts / subtitle / merge
@@ -1207,9 +1209,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         for br in batch_results:
             result.append(br)
 
-        # 保存最后两句作为下一批的上下文
+        # 保存最后几句作为下一批的上下文（扩展窗口提升跨批次连贯性）
         if batch_results:
-            prev_context = [r["text_zh"] for r in batch_results[-2:]]
+            prev_context = [r["text_zh"] for r in batch_results[-4:]]
 
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
 
@@ -1811,7 +1813,10 @@ async def _generate_tts_segments(
                     raw_ratio = estimated_tts_ms / target_dur_ms
                     # ratio>1: TTS 太长，需加速(rate>1)；ratio<1: TTS 太短，需减速(rate<1)
                     # 直接用 ratio 作为 rate，钳制到 edge-tts 安全区间
-                    rate = max(0.85, min(1.20, raw_ratio))
+                    rate = raw_ratio
+            # 应用全局语速倍率
+            global_speed = (config or {}).get("global_speed", 1.0)
+            rate = max(0.85, min(1.20, rate * global_speed))
             all_items.append({
                 "idx": idx, "text_zh": text_zh, "rate": rate,
                 "raw_ratio": raw_ratio, "target_dur_ms": target_dur_ms
@@ -2305,7 +2310,7 @@ def _measure_speed_ratios(
 
 
 def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
-                           cpu_threads: int = 0) -> Path:
+                           cpu_threads: int = 0, global_speed: float = 1.0) -> Path:
     """阶段 C: atempo 调速 + 叠加拼接 → chinese_dub.wav
 
     语速策略:
@@ -2377,6 +2382,13 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
             clamped_ratios.append(None)
         else:
             clamped_ratios.append(max(SPEED_MIN, min(SPEED_MAX, r)))
+
+    # 应用全局语速倍率
+    if global_speed != 1.0:
+        clamped_ratios = [
+            max(SPEED_MIN, min(SPEED_MAX, r * global_speed)) if r is not None else None
+            for r in clamped_ratios
+        ]
 
     # 统计钳制情况
     for i, (sm, cl) in enumerate(zip(smoothed_ratios, clamped_ratios)):
@@ -2494,6 +2506,11 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
         if len(tts_audio) > target_dur:
             tts_audio = tts_audio[:target_dur]
 
+        # 平滑过渡：短淡入淡出防止片段边界爆音
+        CROSSFADE_MS = 30
+        if len(tts_audio) > CROSSFADE_MS * 2:
+            tts_audio = tts_audio.fade_in(CROSSFADE_MS).fade_out(CROSSFADE_MS)
+
         if target_start < total_ms:
             final_audio = final_audio.overlay(tts_audio, position=target_start)
 
@@ -2516,7 +2533,9 @@ async def generate_chinese_dub(
     await _generate_tts_segments(segments, tts_dir, voice, concurrency,
                                  config=config)
     cpu_threads = (config or {}).get("cpu_threads", 0)
-    return _align_tts_to_timeline(segments, output_dir, cpu_threads=cpu_threads)
+    global_speed = (config or {}).get("global_speed", 1.0)
+    return _align_tts_to_timeline(segments, output_dir, cpu_threads=cpu_threads,
+                                  global_speed=global_speed)
 
 
 def _build_atempo_filter(speed_ratio: float) -> str:
@@ -2628,10 +2647,23 @@ async def run_refinement_loop(
                 zh_pre = d["text_zh"][:25] + ("..." if len(d["text_zh"]) > 25 else "")
                 print(f"       #{d['idx']:3d}  {d['speed_ratio']:.2f}x  \"{zh_pre}\"")
 
-        # 2) 无超速 → 收敛（过短交给时间对齐阶段处理）
+        # 2) 无超速 → 检查过短片段
         if not overfast:
             if underslow:
-                print(f"\n  ✅ 翻译优化完成! ({len(underslow)} 个过短片段将由时间线对齐阶段静音填充)")
+                print(f"     🔄 扩展 {len(underslow)} 个过短片段...")
+                new_segments = _expand_with_llm(segments, underslow, llm_config)
+                # 统计扩展变更
+                expand_changed = 0
+                for item in underslow:
+                    idx = item["idx"]
+                    if segments[idx]["text_zh"] != new_segments[idx]["text_zh"]:
+                        expand_changed += 1
+                if expand_changed:
+                    segments = new_segments
+                    print(f"     ✅ 扩展了 {expand_changed}/{len(underslow)} 个过短片段")
+                    continue  # 重新估算语速
+                else:
+                    print(f"\n  ✅ 翻译优化完成! ({len(underslow)} 个过短片段无法进一步扩展，将由时间线对齐阶段静音填充)")
             else:
                 print(f"\n  ✅ 所有片段语速均在合理范围内，优化完成!")
             break
@@ -2641,6 +2673,11 @@ async def run_refinement_loop(
         # 3) LLM 精简过长翻译
         print(f"     调用 LLM 精简 {len(overfast)} 个超速片段...")
         new_segments = _refine_with_llm(new_segments, overfast, llm_config)
+
+        # 3.5) 同时扩展过短翻译
+        if underslow:
+            print(f"     调用 LLM 扩展 {len(underslow)} 个过短片段...")
+            new_segments = _expand_with_llm(new_segments, underslow, llm_config)
 
         # 4) 统计变更
         changes = []
@@ -3216,7 +3253,7 @@ def merge_final_video(video_path: Path, dub_path: Path,
             "-filter_complex",
             f"[1:a]volume={vocal_vol},aresample=44100[voc];"
             f"[2:a]volume={bgm_vol},aresample=44100[bgm];"
-            f"[3:a]aresample=44100[dub];"
+            f"[3:a]aresample=44100,loudnorm=I=-16:TP=-1.5:LRA=11[dub];"
             f"[voc][bgm][dub]amix=inputs=3:duration=first"
             f":dropout_transition=2[aout]",
             "-map", "0:v", "-map", "[aout]",
@@ -3230,7 +3267,7 @@ def merge_final_video(video_path: Path, dub_path: Path,
             "ffmpeg",
             "-i", str(video_path), "-i", str(dub_path),
             "-filter_complex",
-            f"[0:a]volume={volume}[bg];[1:a]aresample=44100[dub];"
+            f"[0:a]volume={volume}[bg];[1:a]aresample=44100,loudnorm=I=-16:TP=-1.5:LRA=11[dub];"
             f"[bg][dub]amix=inputs=2:duration=first:dropout_transition=2[aout]",
             "-map", "0:v", "-map", "[aout]",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
@@ -3617,7 +3654,8 @@ async def process_video(config: dict):
             if "subtitle" not in skip:
                 generate_srt_files(segments, output_dir)
             dub_path = _align_tts_to_timeline(segments, output_dir,
-                                                cpu_threads=config.get("cpu_threads", 0))
+                                                cpu_threads=config.get("cpu_threads", 0),
+                                                global_speed=config.get("global_speed", 1.0))
             _log("")
         _logger.step_end()
 

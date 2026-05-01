@@ -6,18 +6,24 @@
 
 ```
 YouTube 视频 → yt-dlp 下载 → ffmpeg 提取音频 → (可选)demucs 人声/伴奏分离
-    → faster-whisper 语音识别 → LLM 主题识别 + LLM/Google 翻译 → (可选)迭代优化
-    → edge-tts 中文配音 → ffmpeg 时间对齐(语速钳制) + 字幕生成 → 合成最终视频
+    → faster-whisper 语音识别 → (可选)NLP 分句优化 → LLM 主题识别 + LLM/Google 翻译
+    → (可选)迭代优化 → edge-tts 中文配音 → (可选)TTS 后校准
+    → ffmpeg 时间对齐(间隙借用+语速钳制) + 字幕生成 → 合成最终视频
 ```
 
 核心特性：
 
 - **多翻译引擎**：Google Translate（免费）或 LLM 大模型（DeepSeek、Qwen、OpenAI 等 OpenAI 兼容 API）
-- **翻译质量增强**：翻译前 LLM 自动扫描完整内容识别主题和专业术语，注入保护规则（如数学符号、负号）；批间传递 4 句上下文保持连贯性
+- **翻译质量增强**：翻译前 LLM 自动扫描完整内容识别主题和专业术语，注入保护规则（如数学符号、负号）；批间传递 6 句上下文 + 3 句前瞻保持连贯性
+- **两步翻译法**：可选 `llm.two_pass` 模式，先忠实直译再改写为配音朗读风格，显著提升译文自然度（API 费用翻倍，默认关闭）
+- **NLP 智能分句**：可选 spaCy 英文句子边界检测，对 Whisper 输出进行拆分（>8s 多句段）和合并（<1.5s 碎片段），提升翻译和配音质量
+- **翻译幻觉防御**：三层检测（批内去重 + 缩小批次 8 段/批 + 上下文窗口毒化检测），自动清空幻觉结果走逐条重译
 - **迭代优化**：自动检测配音语速过快的片段，调用 LLM 精简翻译并重新生成；过短片段自动扩展译文减少静音填充，循环直到语速自然
+- **TTS 后校准**：可选 `post_tts_calibration`，TTS 生成后实测时长超标的段自动精简译文并重新合成，无需完整迭代循环
 - **人声/伴奏分离**：可选 demucs 音频分离，合成时人声静音（被中文配音替代）、背景音保持原始音量，听感更自然
 - **音频响度标准化**：配音音轨自动应用 EBU R128 响度标准化（loudnorm），确保音量一致
-- **语速钳制**：配音速度限定在 [0.95x, 1.25x] 区间，过慢静音填充、过快限速截断，片段边界 30ms 淡入淡出消除爆音
+- **时间线对齐增强**：间隙借用（从相邻静音借时间）+ 视频减速标记（极端超时段标记而非截断）+ 语速三级平滑（trimmed mean 基线 + 自适应混合 + 双向指数平滑）
+- **语速钳制**：配音速度限定在 [1.00x, 1.25x] 区间，过慢静音填充、过快限速截断，片段边界 30ms 淡入淡出消除爆音
 - **全局语速控制**：`global_speed` 参数统一缩放所有配音片段语速（0.8=慢速，1.0=正常，1.2=快速）
 - **断点续跑**：每个步骤的中间结果均有缓存，支持从任意阶段恢复
 - **结构化错误反馈**：可预知错误给出诊断信息和可操作的修复建议，不只打印 traceback
@@ -112,9 +118,11 @@ bash run.sh --config config.json
     "api_url": "https://api.deepseek.com/v1",
     "api_key": "sk-your-key-here",
     "model": "deepseek-chat",
-    "batch_size": 15,
+    "batch_size": 8,
     "temperature": 0.3,
-    "style": ""
+    "style": "",
+    "prompt_template": "",
+    "two_pass": false
   }
 }
 ```
@@ -125,9 +133,11 @@ bash run.sh --config config.json
 | `llm.api_key` | string | `""` | API 密钥（也可用 `--llm-api-key` 命令行传入） |
 | `llm.model` | string | `"deepseek-chat"` | 模型名称 |
 | `llm.system_prompt` | string | *(内置翻译 prompt)* | 翻译 system prompt（一般无需修改） |
-| `llm.batch_size` | int | `15` | 每批翻译的句子数（过大可能导致对齐问题） |
+| `llm.batch_size` | int | `8` | 每批翻译的句子数（过大可能触发幻觉） |
 | `llm.temperature` | float | `0.3` | 生成温度：0.0=确定性，1.0=多样性 |
 | `llm.style` | string | `""` | 翻译风格：`""` / `"口语化"` / `"正式"` / `"学术"` |
+| `llm.prompt_template` | string | `""` | 外部提示词模板文件路径（如 `prompts/dubbing_concise.txt`） |
+| `llm.two_pass` | bool | `false` | 两步翻译：先忠实直译再改写为配音风格（API 费用翻倍） |
 
 ### TTS 配音引擎
 
@@ -256,8 +266,32 @@ bash run.sh --config config.json
 |------|------|--------|------|
 | `tts_concurrency` | int | `5` | TTS 并发数（远程引擎失败时自动阶梯降并发） |
 | `whisper_beam_size` | int | `5` | Whisper beam search 大小（越大越精确但越慢） |
+| `nlp_segmentation` | bool | `false` | 启用 spaCy NLP 分句优化（需安装 spacy + en_core_web_sm） |
+| `cpu_threads` | int | `0` | CPU 线程限制（0=不限制，建议设为核心数-4 避免系统卡死） |
 | `global_speed` | float | `1.0` | 全局语速倍率：`0.8`=慢速朗读，`1.0`=正常，`1.2`=快速。统一缩放所有 TTS 片段语速 |
 | `skip_steps` | list | `[]` | 跳过指定步骤（按执行顺序）：`download` / `extract` / `separate` / `transcribe` / `translate` / `refine` / `tts` / `subtitle` / `merge` |
+
+### 时间线对齐增强
+
+TTS 配音超出目标时长时的渐进处理策略：间隙借用 → 视频减速标记 → 截断。
+
+```json
+{
+  "alignment": {
+    "gap_borrowing": false,
+    "max_borrow_ms": 300,
+    "video_slowdown": false,
+    "max_slowdown_factor": 0.85
+  }
+}
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `alignment.gap_borrowing` | bool | `false` | 从相邻静音间隙借用时间（需确认间隙为真静音） |
+| `alignment.max_borrow_ms` | int | `300` | 最大借用时长(ms)，间隙需有 60% 以上余量 |
+| `alignment.video_slowdown` | bool | `false` | 极端超时段标记视频减速（当前版本仅标记+输出报告） |
+| `alignment.max_slowdown_factor` | float | `0.85` | 最大减速因子（0.85 = 视频播放速度不低于 85%） |
 
 ### 迭代优化
 
@@ -269,6 +303,8 @@ bash run.sh --config config.json
 | `refine.max_iterations` | int | `5` | 单次运行最大迭代轮次（收敛后 early stop） |
 | `refine.speed_threshold` | float | `1.25` | 加速倍率阈值：>1.25x 即触发精简（1.0=原速，1.5x 已很明显） |
 | `refine.resume_iteration` | int | null | 从第 N 轮迭代恢复（大循环断点续跑） |
+| `refine.post_tts_calibration` | bool | `false` | TTS 后校准：生成 TTS 后实测超标的段自动精简+重合成（限 1 轮） |
+| `refine.calibration_threshold` | float | `1.30` | 校准触发阈值：实际时长/目标时长 > 1.30 时触发 |
 | `clean_iterations` | bool | `false` | 清理 `iterations/` 目录后重新优化 |
 
 ```bash
@@ -317,7 +353,8 @@ bash run.sh --resume-from output/VIDEO_ID
 | `subtitle_zh.srt` / `subtitle_en.srt` | 单语字幕 |
 | `segments_cache.json` | 转录+翻译缓存（可手动编辑微调） |
 | `transcribe_cache.json` | 转录中间结果缓存（纯英文，支持单独跳过 transcribe） |
-| `speed_report.json` | 语速调整统计（中位数、钳制数等） |
+| `speed_report.json` | 语速调整统计（中位数、钳制数、标准差等） |
+| `slowdown_segments.json` | 视频减速标记报告（启用 `video_slowdown` 时生成） |
 | `pipeline_YYYYMMDD_HHMMSS.log` | 执行日志（各步骤耗时 + 错误详情） |
 | `tts_failure.json` | TTS 断点恢复文件（失败时生成） |
 | `tts_segments/` | TTS 音频片段目录（含调速后的 `_adj.wav` 缓存） |
@@ -335,6 +372,9 @@ youtube-cn-dub/
 ├── test.sh                # 测试入口（smoke / unit / all）
 ├── download_model.sh      # 模型下载（Whisper / Piper / sherpa-onnx，含国内镜像）
 ├── config.example.json    # 配置模板
+├── prompts/               # 外部提示词模板
+│   ├── default.txt                 # 默认翻译提示词
+│   └── dubbing_concise.txt         # 配音精简风格提示词
 ├── tests/                 # 单元测试
 │   ├── test_estimate_speed.py      # 字符估算语速测试
 │   ├── test_expand_disabled.py     # expand 禁用验证测试
@@ -346,7 +386,10 @@ youtube-cn-dub/
 │   ├── test_tts_retry.py           # TTS 重试增强测试
 │   ├── test_tts_engines.py         # TTS 可插拔引擎架构测试
 │   ├── test_tts_smoke.py           # TTS 引擎冒烟测试（真实合成）
-│   └── test_voice_smoothing.py     # 语速平滑测试
+│   ├── test_voice_smoothing.py     # 语速平滑测试
+│   ├── test_audio_separation.py    # 音频分离测试
+│   ├── test_semantic_alignment.py  # 语义对齐测试
+│   └── test_pipeline_validation.py # 管线端到端验证测试
 ├── devlog/                # 开发日志（排查记录）
 └── models/                # 模型目录（不入库）
     ├── faster-whisper-*/   # Whisper 语音识别模型
@@ -503,9 +546,9 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - LLM 翻译失败会多层重试后回退 Google Translate（回退链：LLM 批量(重试2次) → LLM 逐条(重试3次) → Google → 保留原文）
 
 - **语音一致性优化**（已解决）：各片段独立计算加速/降速比，语速方差大、听感割裂。修复方案：
-  - `_align_tts_to_timeline` 实现三步语速平滑：收集原始 speed_ratio → 计算中位数基线 → 混合（60% 自身 + 40% 基线）+ 指数平滑（α=0.3）
-  - 最终钳制到 [0.95, 1.25] 区间：过慢段静音居中填充，过快段限速截断
-  - 语速分布方差显著缩小，相邻片段过渡更自然
+  - `_align_tts_to_timeline` 实现三级语速平滑：trimmed mean 基线（去掉头尾 10%）→ 自适应混合（偏离小 20% 权重，偏离大 60% 权重）→ 双向指数平滑（α=0.3，前向+后向取平均）
+  - 最终钳制到 [1.00, 1.25] 区间：过慢段静音居中填充（不允许降速），过快段限速截断
+  - 语速分布标准差从 0.1174(raw) 降至 0.0544(smoothed)，相邻片段过渡更自然
 
 - **迭代性能优化**（已解决）：迭代优化对所有片段重复计算，且先生成 TTS 再迭代导致大量浪费。修复方案：
   - 引入 `converged_indices` 集合，已满足阈值的片段在后续轮次中跳过
@@ -539,8 +582,8 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - `info.json` 中记录实际下载的帧率和分辨率
 
 - **语速调整失控**（已解决）：时间线对齐阶段 `_align_tts_to_timeline` 无语速区间约束，极端情况下出现 0.5x 拖慢或 1.8x 快进，听感极差。修复方案：
-  - 语速钳制到 [0.95, 1.25] 区间：低于 0.95 的用静音居中填充而非极端降速，高于 1.25 的限速截断
-  - 保留三步平滑策略（中位数基线 → 混合 → 指数平滑）后再钳制，支持 `global_speed` 全局倍率调节
+  - 语速钳制到 [1.00, 1.25] 区间：低于 1.00 的用静音居中填充而非降速（SPEED_MIN=1.00 禁止任何降速），高于 1.25 的限速截断
+  - 保留三级平滑策略（trimmed mean 基线 → 自适应混合 → 双向指数平滑）后再钳制，支持 `global_speed` 全局倍率调节
   - 片段边界 30ms 淡入淡出（fade_in/fade_out）消除硬切爆音
   - 最终混音时配音音轨自动 EBU R128 响度标准化（loudnorm I=-16, TP=-1.5），确保音量一致
   - 输出 `speed_report.json` 记录调速统计（中位数、钳制数等），支持调试和断点恢复
@@ -576,18 +619,16 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - ✅ 可预知错误给出结构化反馈（错误类型 + 问题描述 + 修复建议）
   - ✅ skip_steps 跳过关键步骤但产出不存在时，给出可直接使用的配置修改建议
   - 待完善：跳过的步骤应打印简要说明（如 `[5/7] 生成字幕 - 跳过（已在 skip_steps 中）`）
-  - 待完善：断点恢复场景应明确标注哪些步骤从缓存恢复、哪些实际执行
 
 - **字幕输出模式可选**：当前只生成外挂字幕（`.srt`），最终视频不内嵌字幕。目标：
   - 新增配置项 `subtitle_mode`，支持三种模式：`"external"`（仅外挂 `.srt`，默认）、`"embedded"`（仅内嵌到视频）、`"both"`（同时生成外挂和内嵌两个版本）
   - 内嵌字幕使用 ffmpeg `-vf subtitles=xxx.srt` 或 `-c:s mov_text` 软字幕
   - 输出文件命名：`final.mp4`（外挂）、`final_subtitled.mp4`（内嵌）
 
-- **翻译质量增强 — 倒装句语序优化**：英文倒装句翻译后语序不符合中文习惯，且可能导致相邻译文内容交换（swap）。目标：
-  - 优化 LLM 翻译 prompt，明确要求倒装句调整为中文习惯语序
-  - 检测并处理倒装导致的相邻译文内容 swap 问题：当第 N 段译文与第 N+1 段原文更匹配时，自动交换，这种交换可能不止一次
-  - 新增后处理步骤：翻译完成后扫描相邻段或者多断，用语义相似度（或 LLM 判定）检测错位并修复
-  - 测试用例：收集典型英文倒装句（there be, 状语前置, 宾语前置等）验证翻译语序
+- **翻译质量增强 — 跨段语序优化**：英文从句/倒装句翻译后可能导致相邻译文内容错位。目标：
+  - ✅ 已通过 `llm.two_pass` 两步翻译部分缓解（Pass 2 配音改写时自然调整语序）
+  - ✅ 翻译 prompt 已注入"倒装句调整语序"通用规则
+  - 待完善：检测并处理跨段内容 swap 问题（当第 N 段译文与第 N+1 段原文更匹配时自动交换）
 
 ### 🟡 中优先级 / 中难度（需一定重构）
 
@@ -597,16 +638,13 @@ commit message 格式：`{type}: {描述}`，type 取值：
   - ✅ PipelineLogger 为每个主要步骤记录耗时，写入日志文件
   - 待完善：生成性能报告（如 `output/VIDEO_ID/performance.json`），包含各阶段耗时、并发利用率、失败重试次数
   - 待完善：结合本地 GPU 资源（如 Whisper large-v3 CUDA 加速、TTS 本地模型 GPU 推理）优化资源分配
-  - 待完善：支持配置 GPU 使用策略（`"gpu": "auto" / "cuda" / "cpu"`）
 
 ### 🟢 低优先级 / 高难度（架构级重构）
 
-- **代码模块化重构 + 多角色预留**：当前 pipeline.py 单文件过大（2300+ 行），不利于迭代和多人协作。目标：
-  - 按功能拆分为独立模块：`pipeline/` 目录包含 `download.py`、`transcribe.py`、`translate.py`、`tts/`（引擎抽象层）、`subtitle.py`、`merge.py`、`refine.py` 等
-  - 保持现有 API 向后兼容，主入口仍为 `pipeline.py`（改为导入各模块）
-  - 预留多角色支持：segments 数据结构增加 `speaker_id` 字段，TTS 引擎接口支持按角色分发（`synthesize(text, path, voice, speaker_id=None)`）
-  - 配置支持多角色映射：`"speakers": {"narrator": "zh-CN-YunxiNeural", "character_a": "zh-CN-XiaoxiaoNeural"}`
-  - 需要评估：speaker diarization 集成方案（pyannote-audio / Whisper 自带说话人分离）、跨引擎混用时的音质一致性、模块间数据流设计
+- **代码模块化重构 + 多角色配音**：当前 pipeline.py 单文件 ~4100 行，不利于迭代。详见 `ROADMAP.md` P2/P3 规划：
+  - P2: 多角色配音（pyannote 说话人分轨 + 多音色 TTS）
+  - P3.3: 按功能拆分为独立模块（config/download/transcribe/translate/refine/tts/align/subtitle/merge）
+  - 保持现有 API 向后兼容，主入口仍为 `pipeline.py`
 
 ## 许可
 

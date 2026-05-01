@@ -12,10 +12,12 @@
 |------|------|------|
 | 下载视频 | yt-dlp + yt-dlp-ejs | 从 YouTube 下载视频，通过浏览器 cookies 认证 |
 | 语音识别 | faster-whisper | 英文语音转文字，带精确时间戳 |
-| 翻译 | Google Translate / LLM (可选) | 英文翻译为中文，支持大模型翻译 |
-| 中文配音 | edge-tts | 微软 TTS 引擎，自然中文语音（并发生成） |
-| 时间对齐 | ffmpeg atempo | 调速使中文配音匹配原始时间线 |
-| 迭代优化 | LLM + edge-tts | 自动精简过长翻译，循环至语速自然 |
+| NLP 分句 | spaCy (可选) | 按句子边界拆分/合并 Whisper 输出段落 |
+| 翻译 | LLM (可选两步) / Google | 英文翻译为中文，支持忠实直译+配音改写 |
+| 迭代优化 | LLM + 字符估算 | 自动精简过长翻译，循环至语速收敛 |
+| 中文配音 | edge-tts 等 7 引擎 | TTS 合成中文语音（并发生成） |
+| TTS 后校准 | LLM + edge-tts (可选) | 实测超标的段精简+重合成 |
+| 时间对齐 | ffmpeg atempo | 调速+间隙借用+视频减速标记 |
 | 视频合成 | ffmpeg | 合并视频+配音+原声背景 |
 
 ### 快速使用
@@ -89,8 +91,10 @@ config.json 中 LLM 部分示例：
     "api_url": "https://api.deepseek.com/v1",
     "api_key": "sk-your-key-here",
     "model": "deepseek-chat",
-    "batch_size": 15,
-    "temperature": 0.3
+    "batch_size": 8,
+    "temperature": 0.3,
+    "prompt_template": "",
+    "two_pass": false
   }
 }
 ```
@@ -206,7 +210,106 @@ config.json 中的配置：
     "enabled": true,
     "max_iterations": 3,
     "speed_threshold": 1.25,
-    "resume_iteration": null
+    "resume_iteration": null,
+    "post_tts_calibration": false,
+    "calibration_threshold": 1.30
+  }
+}
+```
+
+### v3 新增功能
+
+以下功能默认关闭，按需在 config.json 中启用：
+
+#### 两步翻译法（`llm.two_pass`）
+
+先忠实直译（保留所有信息点），再改写为适合配音朗读的自然中文。显著提升译文流畅度，但 API 费用翻倍。
+
+```json
+{
+  "llm": {
+    "two_pass": true
+  }
+}
+```
+
+#### NLP 智能分句（`nlp_segmentation`）
+
+使用 spaCy 英文句子边界检测，优化 Whisper 输出的分段质量：
+- 拆分：单段包含多个完整句子且时长 >8s → 按词级时间戳拆分
+- 合并：相邻段都 <1.5s 且属同一句子 → 合并
+
+需安装依赖：`pip install spacy && python -m spacy download en_core_web_sm`
+
+```json
+{
+  "nlp_segmentation": true
+}
+```
+
+#### 时间线对齐增强（`alignment`）
+
+TTS 超出目标时长时的渐进策略：间隙借用 → 视频减速标记 → 截断。
+
+```json
+{
+  "alignment": {
+    "gap_borrowing": true,
+    "max_borrow_ms": 300,
+    "video_slowdown": true,
+    "max_slowdown_factor": 0.85
+  }
+}
+```
+
+- **间隙借用**：从相邻静音间隙借用时间（需确认为真静音，借用量不超过间隙的 60%）
+- **视频减速**：极端超时段标记视频减速而非截断音频（当前版本仅标记+输出 `slowdown_segments.json`）
+
+#### TTS 后校准（`refine.post_tts_calibration`）
+
+TTS 全部生成后，用 pydub 实测每段时长。超标的段自动调用 LLM 精简译文并重新合成（限 1 轮），无需完整迭代循环。
+
+```json
+{
+  "refine": {
+    "post_tts_calibration": true,
+    "calibration_threshold": 1.30
+  }
+}
+```
+
+#### 翻译幻觉三层防御
+
+默认启用（无需配置），自动防护 LLM 批翻译崩溃：
+1. **批内去重**：同一译文出现 ≥3 次判定幻觉，清空走逐条重译
+2. **缩小批次**：`batch_size` 默认 8（原 15），减少长上下文崩溃概率
+3. **上下文毒化检测**：窗口内某句重复占比 ≥40% 时丢弃整个窗口
+
+#### 推荐的全功能配置
+
+```json
+{
+  "translator": "llm",
+  "llm": {
+    "api_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-your-key-here",
+    "model": "deepseek-chat",
+    "batch_size": 8,
+    "two_pass": true
+  },
+  "nlp_segmentation": true,
+  "alignment": {
+    "gap_borrowing": true,
+    "max_borrow_ms": 300,
+    "video_slowdown": true,
+    "max_slowdown_factor": 0.85
+  },
+  "refine": {
+    "enabled": true,
+    "max_iterations": 3,
+    "speed_threshold": 1.25,
+    "post_tts_calibration": true,
+    "calibration_threshold": 1.30
   }
 }
 ```
@@ -244,10 +347,11 @@ bash download_model.sh tiny     # 轻量，约 75MB
 1. **网络要求**：YouTube 下载需要代理；Google 翻译和 edge-tts 需要网络连接
 2. **Chrome 需关闭**：yt-dlp 读取 Chrome cookies 时，Chrome 浏览器需要处于关闭状态
 3. **翻译质量**：Google Translate 对技术内容翻译偏弱，推荐使用 LLM 翻译（DeepSeek 费用低效果好）
-4. **配音语速**：部分中文翻译较长的片段会被加速，使用 `--refine` 可自动优化
+4. **配音语速**：部分中文翻译较长的片段会被加速，使用 `--refine` 可自动优化；语速钳制在 [1.00x, 1.25x] 区间
 5. **Intel Mac 性能**：Whisper small 模型转录一个 6 分钟视频大约需要 2-3 分钟
-6. **LLM 依赖**：使用 LLM 翻译或迭代优化需额外安装 `pip install httpx`
-7. **ffmpeg 版本**：Anaconda 自带的 ffmpeg 3.4 无法解码 edge-tts MP3，需确保 Homebrew ffmpeg ≥ 4.x 在 PATH 中优先（`run.sh` 已自动处理）
+6. **LLM 依赖**：使用 LLM 翻译或迭代优化需额外安装 `pip install httpx`（`setup.sh` 已包含）
+7. **NLP 分句依赖**：启用 `nlp_segmentation` 需安装 `pip install spacy && python -m spacy download en_core_web_sm`（约 12MB）
+8. **ffmpeg 版本**：Anaconda 自带的 ffmpeg 3.4 无法解码 edge-tts MP3，需确保 Homebrew ffmpeg ≥ 4.x 在 PATH 中优先（`run.sh` 已自动处理）
 
 ### 测试记录
 
@@ -268,7 +372,7 @@ python pipeline.py --config config.json
 | 阶段 | 耗时 | 说明 |
 |------|------|------|
 | Whisper 转录 | ~150s | small 模型, 72 段, Intel CPU |
-| LLM 翻译 | ~30s | 5 批次, 每批 15 段 |
+| LLM 翻译 | ~30s | 9 批次, 每批 8 段 |
 | TTS 生成 | ~60s | 72 段, 并发 5 |
 | 迭代优化 (5轮) | ~200s | 含 LLM 精简 + TTS 重生成 |
 | 时间线对齐 + 合成 | ~30s | ffmpeg atempo + amix |

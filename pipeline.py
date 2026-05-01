@@ -203,9 +203,11 @@ DEFAULT_CONFIG = {
             "3)翻译要适合做视频配音朗读，语句通顺自然；"
             "4)只输出翻译结果，不要解释。"
         ),
-        "batch_size": 15,            # 每批翻译的句子数（过大可能导致对齐问题）
+        "batch_size": 8,             # 每批翻译的句子数（过大可能导致幻觉重复）
         "temperature": 0.3,          # 生成温度: 0.0=确定性 / 0.3=推荐 / 1.0=多样性
         "style": "",                 # 翻译风格: ""(默认) / "口语化" / "正式" / "学术" 等
+        "prompt_template": "",       # 外部提示词模板路径（如 "prompts/dubbing_concise.txt"），为空则用内置 system_prompt
+        "two_pass": False,           # 两步翻译: Pass1 忠实直译 → Pass2 配音改编（API 成本翻倍）
     },
 
     # ── TTS 配音引擎 ──
@@ -257,10 +259,17 @@ DEFAULT_CONFIG = {
     # ── 性能选项 ──
     "tts_concurrency": 5,            # TTS 并发数（远程引擎失败时会自动阶梯降并发）
     "whisper_beam_size": 5,          # Whisper beam search 大小（越大越精确但越慢）
+    "nlp_segmentation": False,       # spaCy NLP 断句优化（split长段/merge碎段，需 pip install spacy）
     "cpu_threads": 0,                # CPU 线程数限制: 0=使用所有核心, N=限制为 N 线程
                                      # 影响: demucs / whisper / ffmpeg atempo 并行数
     "global_speed": 1.0,             # 全局语速倍率: 0.8=慢速朗读 / 1.0=正常 / 1.2=快速
                                      # 统一缩放所有 TTS 片段语速，不影响原始音频
+    "alignment": {                   # 时间线对齐增强选项
+        "gap_borrowing": False,      # 间隙借用: TTS 稍超目标时长时，从相邻静音间隙借用时间而非截断
+        "max_borrow_ms": 300,        # 最大借用时长 (ms)，防止段间重叠
+        "video_slowdown": False,     # 视频减速: TTS 超时≤15%且无法借用时，对视频段施加减速而非截断音频
+        "max_slowdown_factor": 0.85, # 最大减速因子 (0.85 = 视频播放速度降至 85%)
+    },
     "skip_steps": [],                # 跳过指定步骤（按执行顺序）:
                                      #   标准流程(7/8步): download / extract / separate / transcribe / translate / subtitle / tts / merge
                                      #   迭代流程(8/9步): download / extract / separate / transcribe / translate / refine / tts / subtitle / merge
@@ -274,6 +283,8 @@ DEFAULT_CONFIG = {
         "max_iterations": 5,         # 单次运行最大迭代轮次（收敛后 early stop）
         "speed_threshold": 1.25,     # 加速倍率阈值: >1.25x 即触发精简（1.0=原速, 1.5x 已很明显）
         "resume_iteration": None,    # 从第 N 轮迭代恢复（大循环断点续跑）
+        "post_tts_calibration": False,  # TTS 后校准: 测量实际时长，对超速段重新精简+重生成
+        "calibration_threshold": 1.30,  # 后校准触发阈值 (ratio > 此值的段将被精简)
     },
     "clean_iterations": False,       # 清理迭代中间数据（iterations/ 目录）后重新优化
 }
@@ -735,8 +746,18 @@ def transcribe_audio(audio_path: Path, model_size: str = "small",
         word_timestamps=True, vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
     )
-    segments = [{"start": s.start, "end": s.end, "text": s.text.strip()}
-                for s in segments_raw]
+    segments = []
+    for s in segments_raw:
+        seg = {"start": s.start, "end": s.end, "text": s.text.strip()}
+        # 保留 word_timestamps 用于 NLP 分句
+        if s.words:
+            # 借鉴 pyvideotrans: 跳过 >30 字符的 "单词" (ASR 幻觉)
+            seg["words"] = [{"start": w.start, "end": w.end, "word": w.word}
+                            for w in s.words if len(w.word.strip()) <= 30]
+        # 跳过无效段 (end <= start)
+        if seg["end"] <= seg["start"] or not seg["text"]:
+            continue
+        segments.append(seg)
     print(f"  ✅ 转录完成: {len(segments)} 段, 语言={info.language} ({info.language_probability:.0%})")
     return segments
 
@@ -834,13 +855,166 @@ def deduplicate_segments(segments: List[dict]) -> List[dict]:
     return deduped
 
 
+# ─── Step 3.6: NLP 分句优化 ───────────────────────────────────────────
+
+def _nlp_resegment(segments: List[dict]) -> List[dict]:
+    """
+    用 spaCy 检测英文句子边界，优化 Whisper 分段:
+    - Split: 含多个完整句子 且 duration > 8s 的段 → 按 word timestamp 切分
+    - Merge: 相邻段都 < 1.5s 且属同一句 → 合并
+    完成后 strip words 字段（不写入 cache）。
+    """
+    try:
+        import spacy
+    except ImportError:
+        print("  ⚠️  spaCy 未安装，跳过 NLP 分句 (pip install spacy && python -m spacy download en_core_web_sm)")
+        return segments
+
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        print("  ⚠️  spaCy 模型 en_core_web_sm 未下载，跳过 NLP 分句")
+        return segments
+
+    result = []
+    split_count = 0
+    merge_count = 0
+
+    # ── Pass 1: Split long multi-sentence segments ──
+    split_segments = []
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        text = seg.get("text", "").strip()
+        words = seg.get("words")
+
+        # 只对有 word_timestamps 且 duration > 8s 的段尝试 split
+        if duration <= 8.0 or not words or not text:
+            split_segments.append(seg)
+            continue
+
+        doc = nlp(text)
+        sentences = list(doc.sents)
+        if len(sentences) < 2:
+            split_segments.append(seg)
+            continue
+
+        # 尝试按句子边界切分
+        # 建立 char→word index 映射
+        char_pos = 0
+        word_char_ranges = []
+        for w in words:
+            w_text = w["word"].strip()
+            # 找到 word 在 text 中的位置
+            idx = text.find(w_text, char_pos)
+            if idx == -1:
+                idx = char_pos
+            word_char_ranges.append((idx, idx + len(w_text)))
+            char_pos = idx + len(w_text)
+
+        # 找到每个句子边界对应的 word index
+        new_segs = []
+        sent_start_word = 0
+        for sent_idx, sent in enumerate(sentences):
+            sent_end_char = sent.end_char
+            # 找到最后一个 word 结束位置 <= sent_end_char 的 word
+            sent_end_word = sent_start_word
+            for wi in range(sent_start_word, len(word_char_ranges)):
+                if word_char_ranges[wi][0] < sent_end_char:
+                    sent_end_word = wi
+                else:
+                    break
+
+            # 构建新段
+            seg_words = words[sent_start_word:sent_end_word + 1]
+            if seg_words:
+                new_seg = {
+                    "start": seg_words[0]["start"],
+                    "end": seg_words[-1]["end"],
+                    "text": sent.text.strip(),
+                    "words": seg_words,
+                }
+                new_segs.append(new_seg)
+
+            sent_start_word = sent_end_word + 1
+
+        if len(new_segs) >= 2:
+            # 修正首段 start 和末段 end 对齐原段
+            new_segs[0]["start"] = seg["start"]
+            new_segs[-1]["end"] = seg["end"]
+            split_segments.extend(new_segs)
+            split_count += len(new_segs) - 1
+        else:
+            split_segments.append(seg)
+
+    # ── Pass 2: Merge adjacent short segments (<1.5s) belonging to same sentence ──
+    if len(split_segments) < 2:
+        result = split_segments
+    else:
+        # 拼接全文用于句子边界判断
+        all_text = " ".join(s.get("text", "") for s in split_segments)
+        doc_all = nlp(all_text)
+        # 建立 char offset → sentence index 映射
+        sent_boundaries = [(sent.start_char, sent.end_char) for sent in doc_all.sents]
+
+        def get_sent_idx(char_offset):
+            for idx, (sc, ec) in enumerate(sent_boundaries):
+                if sc <= char_offset < ec:
+                    return idx
+            return -1
+
+        # 计算每段在 all_text 中的 char offset
+        seg_char_offsets = []
+        offset = 0
+        for s in split_segments:
+            seg_char_offsets.append(offset)
+            offset += len(s.get("text", "")) + 1  # +1 for the space
+
+        result = [split_segments[0]]
+        for i in range(1, len(split_segments)):
+            prev_seg = result[-1]
+            curr_seg = split_segments[i]
+            prev_dur = prev_seg["end"] - prev_seg["start"]
+            curr_dur = curr_seg["end"] - curr_seg["start"]
+
+            # 只有两段都短(<1.5s) 且属于同一句子才合并
+            if prev_dur < 1.5 and curr_dur < 1.5:
+                prev_sent = get_sent_idx(seg_char_offsets[i - 1])
+                curr_sent = get_sent_idx(seg_char_offsets[i])
+                if prev_sent == curr_sent and prev_sent >= 0:
+                    # 合并
+                    merged_text = (prev_seg.get("text", "") + " " + curr_seg.get("text", "")).strip()
+                    merged_words = prev_seg.get("words", []) + curr_seg.get("words", [])
+                    result[-1] = {
+                        "start": prev_seg["start"],
+                        "end": curr_seg["end"],
+                        "text": merged_text,
+                        "words": merged_words,
+                    }
+                    merge_count += 1
+                    continue
+
+            result.append(curr_seg)
+
+    # ── Strip words field ──
+    for seg in result:
+        seg.pop("words", None)
+
+    if split_count > 0 or merge_count > 0:
+        print(f"  🧠 NLP 分句: split +{split_count}, merge -{merge_count} ({len(segments)} → {len(result)} 段)")
+    return result
+
+
 # ─── Step 4: 翻译 ──────────────────────────────────────────────────
 
 def translate_segments(segments: List[dict], config: dict) -> List[dict]:
     """根据配置选择翻译引擎"""
     engine = config.get("translator", "google")
     if engine == "llm":
-        return _translate_llm(segments, config["llm"], config.get("video_title", ""))
+        llm_cfg = config["llm"]
+        video_title = config.get("video_title", "")
+        if llm_cfg.get("two_pass", False):
+            return _translate_llm_two_pass(segments, llm_cfg, video_title)
+        return _translate_llm(segments, llm_cfg, video_title)
     else:
         return _translate_google(segments)
 
@@ -1035,6 +1209,141 @@ def _default_translation_rules() -> str:
     )
 
 
+def _load_prompt_template(template_path: str) -> str:
+    """加载外部提示词模板文件，返回模板内容。路径不存在则返回空字符串。"""
+    if not template_path:
+        return ""
+    # 支持相对路径（相对于项目根目录）
+    p = Path(template_path)
+    if not p.is_absolute():
+        p = Path(__file__).parent / template_path
+    if p.exists():
+        return p.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def _detect_batch_hallucination(translations: List[str], prev_context: List[str] = None) -> set:
+    """检测批内幻觉：相同译文出现 3+ 次（或占 25%+ 批次），或与上下文窗口重复 2+ 次。
+    返回应标记为失败的 translation index 集合。"""
+    from collections import Counter
+    non_empty = [(i, t.strip()) for i, t in enumerate(translations) if t and t.strip()]
+    if len(non_empty) < 3:
+        return set()
+    counts = Counter(t for _, t in non_empty)
+    threshold = max(3, int(len(translations) * 0.25))
+    hallucinated_texts = {text for text, cnt in counts.items() if cnt >= threshold}
+    # 与 prev_context 重复检测：同一短语在本批出现 2+ 次且存在于上下文中
+    if prev_context:
+        prev_set = set(prev_context)
+        for text, cnt in counts.items():
+            if cnt >= 2 and text in prev_set:
+                hallucinated_texts.add(text)
+    return {i for i, t in non_empty if t in hallucinated_texts}
+
+
+def _check_batch_alignment(batch: List[dict], translations: List[str]) -> List[int]:
+    """检测批内跨段内容错位 — 通用方案，无领域专属词典。
+
+    三层信号融合检测:
+      1. 正向锚点: 英文中的数字/缩写/专有名词 → 检查出现在哪段译文
+      2. 反向锚点: 中文译文中保留的英文单词 → 反向追溯到哪段英文
+      3. 长度比异常: EN-ZH 字符比率偏离局部中位数
+    得分 ≥ 1.5 判定为错位，返回需重试的 index 列表。
+    """
+    if len(batch) < 3:
+        return []
+
+    # ── 通用句首词排除集 (避免句首大写被误判为专有名词) ──
+    _COMMON_CAPS = {
+        'The', 'This', 'That', 'These', 'Those', 'What', 'When', 'Where',
+        'Which', 'How', 'And', 'But', 'For', 'Not', 'You', 'They', 'His',
+        'Her', 'Its', 'Our', 'Are', 'Can', 'Will', 'Has', 'Have', 'Had',
+        'Was', 'Were', 'May', 'Let', 'Now', 'Here', 'There', 'Also', 'Just',
+        'Some', 'All', 'Any', 'Each', 'Every', 'Much', 'Many', 'More', 'Most',
+        'Such', 'Very', 'Well', 'Then', 'Than', 'Once', 'Only', 'Even',
+        'Still', 'About', 'After', 'Before', 'Over', 'Under', 'So', 'If',
+    }
+
+    def _extract_anchors(en_text):
+        """通用锚点提取: 数字、大写缩写、专有名词 (纯正则，无词典)"""
+        anchors = set()
+        # 数字 (含小数、百分比)
+        for m in re.findall(r'\d+(?:\.\d+)?%?', en_text):
+            if len(m) >= 2:  # 跳过单个数字 (太模糊)
+                anchors.add(('num', m))
+        # 全大写缩写 (>=2字符): GPU, DNA, API, HTTP
+        for m in re.findall(r'\b[A-Z]{2,}\b', en_text):
+            anchors.add(('acr', m))
+        # 非句首大写词 = 专有名词 (>2字符, 排除常见词)
+        words = en_text.split()
+        for k, w in enumerate(words):
+            clean = re.sub(r'[^a-zA-Z]', '', w)
+            if clean and clean[0].isupper() and k > 0 and len(clean) > 2:
+                if clean not in _COMMON_CAPS:
+                    anchors.add(('name', clean))
+        return anchors
+
+    def _anchor_in_zh(anchor, zh_text):
+        """检查锚点是否出现在中文译文中 (通用匹配)"""
+        kind, val = anchor
+        if kind == 'num':
+            return val in zh_text
+        # 缩写和专有名词: 中文常保留英文原词
+        return val.lower() in zh_text.lower()
+
+    en_texts = [b.get("text", "") for b in batch]
+    zh_texts = [t if t else "" for t in translations]
+    scores = [0.0] * len(batch)
+
+    # ── 信号 1: 正向锚点 (EN 关键词 → 检查 ZH 位置) ──
+    for i in range(len(batch)):
+        anchors = _extract_anchors(en_texts[i])
+        if len(anchors) < 2:
+            continue
+        hits_self = sum(1 for a in anchors if _anchor_in_zh(a, zh_texts[i]))
+        for delta in [-1, 1]:
+            j = i + delta
+            if j < 0 or j >= len(zh_texts):
+                continue
+            hits_nb = sum(1 for a in anchors if _anchor_in_zh(a, zh_texts[j]))
+            if hits_self == 0 and hits_nb >= 2:
+                scores[i] += 2.0
+            elif hits_nb >= hits_self + 2 and hits_nb >= 3:
+                scores[i] += 1.5
+
+    # ── 信号 2: 反向锚点 (ZH 中保留的英文 → 反向追溯 EN) ──
+    _trivial = {'the', 'a', 'an', 'of', 'in', 'to', 'and', 'or', 'is', 'it',
+                'at', 'on', 'by', 'as', 'so', 'if', 'no', 'do', 'be', 'we', 'he'}
+    for i, zh in enumerate(zh_texts):
+        preserved = {m.lower() for m in re.findall(r'[A-Za-z]{2,}', zh)
+                     if m.lower() not in _trivial}
+        if not preserved:
+            continue
+        en_lower = en_texts[i].lower()
+        hits_self = sum(1 for w in preserved if w in en_lower)
+        for delta in [-1, 1]:
+            j = i + delta
+            if 0 <= j < len(en_texts):
+                hits_nb = sum(1 for w in preserved if w in en_texts[j].lower())
+                if hits_nb > hits_self and hits_nb >= 2:
+                    scores[i] += 1.5
+
+    # ── 信号 3: 长度比异常 (EN-ZH 字符比率偏离局部中位数) ──
+    def _zh_chars(text):
+        return sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+
+    ratios = [_zh_chars(zh) / max(len(en), 1) for en, zh in zip(en_texts, zh_texts)]
+    for i in range(len(ratios)):
+        window = sorted(ratios[max(0, i - 2):min(len(ratios), i + 3)])
+        if len(window) >= 3:
+            median = window[len(window) // 2]
+            if median > 0.05:
+                if ratios[i] > median * 3.0 or ratios[i] < median * 0.2:
+                    scores[i] += 1.0
+
+    return [i for i, s in enumerate(scores) if s >= 1.5]
+
+
 def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = "") -> List[dict]:
     """LLM 大模型翻译引擎 (OpenAI 兼容 API)"""
     import httpx
@@ -1046,6 +1355,11 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     batch_size = llm_config.get("batch_size", 15)
     temperature = llm_config.get("temperature", 0.3)
     style = llm_config.get("style", "")
+    # 外部提示词模板优先于内置 system_prompt
+    template_content = _load_prompt_template(llm_config.get("prompt_template", ""))
+    if template_content:
+        system_prompt = template_content
+        print(f"     📄 使用外部提示词模板: {llm_config['prompt_template']}")
     if style:
         system_prompt += f"\n翻译风格要求：{style}"
 
@@ -1092,17 +1406,31 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         user_msg = "\n".join(lines)
         hint_line = f"各句参考字数：{', '.join(char_hints)}"
 
-        # 构造上下文提示
+        # 构造上下文提示（滑动窗口：6句回看 + 3句前瞻）
         context_hint = ""
         if video_title:
             context_hint += f"视频主题：{video_title}\n"
         if prev_context:
+            # 上下文毒化检测：同一短语占比过高 → 重置，防止幻觉级联
+            from collections import Counter as _Counter
+            _pc_counts = _Counter(prev_context)
+            _top_phrase, _top_cnt = _pc_counts.most_common(1)[0]
+            if _top_cnt >= max(2, int(len(prev_context) * 0.4)):
+                print(f"     ⚠️  上下文窗口污染 ('{_top_phrase[:12]}...' ×{_top_cnt})，重置")
+                prev_context = None
+        if prev_context:
             context_hint += f"前文：{'；'.join(prev_context)}\n"
+        # 前瞻：取当前批次之后 3 句英文原文供理解语境
+        next_start = i + batch_size
+        if next_start < len(segments):
+            next_preview = [segments[k]["text"][:60] for k in range(next_start, min(next_start + 3, len(segments)))]
+            context_hint += f"下文预览：{'；'.join(next_preview)}\n"
 
         batch_prompt = (
             f"{system_prompt}\n\n"
             + (f"{context_hint}\n" if context_hint else "")
-            + f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
+            + f"前文和下文仅供理解语境，翻译只针对当前批次编号内容。\n"
+            f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
             f"一行一句，不要合并或拆分。\n"
             f"{hint_line}\n"
             f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。\n\n{user_msg}"
@@ -1139,6 +1467,14 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                         continue
                     print(f"     ⚠️  LLM 批次对齐仍失败，降级逐条翻译")
                     translations = _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature)
+                # 批内幻觉检测：相同译文重复出现 → 标记为空，走逐段重试
+                halluc_indices = _detect_batch_hallucination(translations, prev_context)
+                if halluc_indices:
+                    halluc_sample = translations[list(halluc_indices)[0]] if halluc_indices else ""
+                    print(f"     ⚠️  检测到批内幻觉 ({len(halluc_indices)} 段, "
+                          f"'{halluc_sample[:15]}...')，降级逐段翻译")
+                    for hi in halluc_indices:
+                        translations[hi] = ""
                 break  # 成功则退出重试循环
             except Exception as e:
                 if batch_attempt < batch_max_retries:
@@ -1206,17 +1542,134 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 except ImportError:
                     print(f"       ⚠️  deep_translator 未安装，无法回退 Google 翻译")
 
+        # ── 跨段错位检测: 锚定术语交叉相似度 ──
+        batch_zhs = [br["text_zh"] for br in batch_results]
+        misaligned = _check_batch_alignment(batch, batch_zhs)
+        if misaligned:
+            print(f"     ⚠️  检测到 {len(misaligned)} 段跨段错位，逐段重译修复...")
+            retry_segs = [batch[j] for j in misaligned]
+            retry_zhs = _translate_llm_single(
+                retry_segs, endpoint, headers, model, system_prompt, temperature
+            )
+            for k, j in enumerate(misaligned):
+                zh = retry_zhs[k]
+                if zh and len(zh.strip()) >= 2:
+                    batch_results[j]["text_zh"] = zh.strip()
+                    print(f"       ✅ 错位修复: #{i+j} \"{batch[j]['text'][:30]}\"")
+
         for br in batch_results:
             result.append(br)
 
-        # 保存最后几句作为下一批的上下文（扩展窗口提升跨批次连贯性）
+        # 保存最后几句作为下一批的上下文（6句滑动窗口提升跨批次连贯性）
         if batch_results:
-            prev_context = [r["text_zh"] for r in batch_results[-4:]]
+            prev_context = [r["text_zh"] for r in batch_results[-6:]]
 
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
 
     print(f"  ✅ LLM 翻译完成")
     return result
+
+
+def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title: str = "") -> List[dict]:
+    """两步翻译: Pass 1 忠实直译 → Pass 2 配音改编 (参考 VideoLingo 三步法)"""
+    import httpx
+    import copy
+
+    print(f"  🔄 两步翻译模式 (Pass 1: 忠实直译 → Pass 2: 配音改编)")
+
+    # ── Pass 1: 忠实直译 ──
+    # 使用修改后的 system_prompt 强调忠实性
+    pass1_config = copy.deepcopy(llm_config)
+    pass1_config["system_prompt"] = (
+        "你是专业的英中翻译引擎。请逐句忠实翻译以下英文，要求：\n"
+        "1) 保留原文所有信息点，不遗漏不添加\n"
+        "2) 直译为主，保持与原文的一一对应关系\n"
+        "3) 只输出翻译结果，不要解释"
+    )
+    # 清除外部模板，Pass 1 使用固定 prompt
+    pass1_config["prompt_template"] = ""
+    pass1_config["style"] = ""
+
+    print(f"  📝 Pass 1: 忠实直译...")
+    pass1_results = _translate_llm(segments, pass1_config, video_title)
+
+    # ── Pass 2: 配音改编 ──
+    # 输入 = 英文原文 + Pass 1 直译，输出 = 适合配音的自然中文
+    api_url = llm_config["api_url"].rstrip("/")
+    api_key = llm_config["api_key"]
+    model = llm_config["model"]
+    batch_size = llm_config.get("batch_size", 8)
+    temperature = llm_config.get("temperature", 0.3)
+    endpoint = api_url if "/chat/completions" in api_url else f"{api_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    CHARS_PER_SEC = 4.5
+    adapt_system = (
+        "你是视频配音翻译改编专家。将直译版改写为适合口语配音朗读的自然中文。\n"
+        "要求：\n"
+        "1) 保持原文语义完整，不得遗漏信息\n"
+        "2) 使表达更口语化、节奏更适合朗读\n"
+        "3) 译文长度应匹配参考字数（用于控制配音时长）\n"
+        "4) 每句保持 [编号] 格式，一行一句\n"
+        "5) 不要输出解释，只输出改编结果"
+    )
+
+    print(f"  🎙️  Pass 2: 配音改编...")
+    final_results = list(pass1_results)  # 复制 Pass 1 结果作为 fallback
+
+    for i in range(0, len(pass1_results), batch_size):
+        batch = pass1_results[i:i + batch_size]
+        lines = []
+        for j, seg in enumerate(batch):
+            dur_sec = seg.get("end", 0) - seg.get("start", 0)
+            target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+            lines.append(
+                f"[{j+1}] EN: {seg['text_en']}\n"
+                f"     直译: {seg['text_zh']}\n"
+                f"     目标≈{target_chars}字"
+            )
+
+        user_msg = (
+            f"请将以下 {len(batch)} 段直译改编为配音用自然中文，"
+            f"每句用 [编号] 格式输出：\n\n" + "\n\n".join(lines)
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": adapt_system},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": temperature,
+            "max_tokens": 4096,
+        }
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                content = _strip_think_block(content)
+
+            adaptations = _parse_numbered_translations(content, len(batch))
+
+            # 幻觉检测: Pass 2 也可能幻觉
+            halluc = _detect_batch_hallucination(adaptations)
+
+            for j, (seg, adapted) in enumerate(zip(batch, adaptations)):
+                if j in halluc:
+                    continue  # 保持 Pass 1 结果
+                if adapted and len(adapted.strip()) >= 2:
+                    clean = _strip_numbered_prefix(adapted) if re.match(r"^\[\d+\]", adapted) else adapted
+                    clean = _strip_markdown(clean, seg["text_en"])
+                    # 语义校验: 改编结果不应与直译完全无关
+                    if len(clean) >= 2:
+                        final_results[i + j]["text_zh"] = clean
+        except Exception as e:
+            print(f"     ⚠️  Pass 2 批次失败: {e}，保留 Pass 1 结果")
+
+    print(f"  ✅ 两步翻译完成 ({len(final_results)} 段)")
+    return final_results
 
 
 def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temperature,
@@ -1322,33 +1775,59 @@ def _strip_numbered_prefix(line: str) -> str:
 
 
 def _parse_numbered_translations(content: str, expected_count: int) -> List[str]:
-    """解析 LLM 返回的编号格式翻译"""
+    """解析 LLM 返回的编号格式翻译 — 编号验证槽位放置
+
+    核心改进: 按 [N] 编号放入对应槽位 (slot N-1)，而非按行序依次追加。
+    防止 LLM 跳号/乱序时导致的跨段内容错位。
+    """
     # 第一层：去除 <think> 推理块（qwen3-coder 等模型会输出）
     content = _strip_think_block(content)
 
     lines = content.strip().split("\n")
-    translations = []
+
+    # ── 编号验证解析: 按编号放入对应槽位 ──
+    slots = [""] * expected_count  # 预分配槽位
+    numbered_entries = []  # [(number, text), ...]
+    last_num = None  # 用于续行追加
 
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        # 匹配 [1] 翻译内容 或 1. 翻译内容
+        # 匹配 [N] 翻译内容 或 N. 翻译内容
         match = re.match(r"^\[(\d+)\]\s*(.+)$", line)
         if not match:
             match = re.match(r"^(\d+)\.\s*(.+)$", line)
         if match:
-            translations.append(match.group(2).strip())
-        elif translations:
-            # 可能是上一行的续行
-            translations[-1] += line
+            num = int(match.group(1))
+            text = match.group(2).strip()
+            numbered_entries.append((num, text))
+            last_num = len(numbered_entries) - 1
+        elif last_num is not None:
+            # 续行：追加到上一个编号条目
+            num, prev_text = numbered_entries[last_num]
+            numbered_entries[last_num] = (num, prev_text + line)
 
-    # 第二层：如果解析数量不对，按行分割并同样去除编号前缀
-    if len(translations) != expected_count:
-        raw_lines = [l.strip() for l in content.strip().split("\n") if l.strip()]
-        translations = [_strip_numbered_prefix(l) for l in raw_lines]
+    # 按编号放入槽位
+    if numbered_entries:
+        for num, text in numbered_entries:
+            idx = num - 1  # [1] → slot 0
+            if 0 <= idx < expected_count:
+                slots[idx] = text
 
-    # 第三层：最终安全检查，确保没有 [N] 前缀泄漏
+        # 检查：如果编号验证填充率足够（≥50%），使用槽位结果
+        filled = sum(1 for s in slots if s.strip())
+        if filled >= expected_count * 0.5:
+            # 最终安全检查：去除残留 [N] 前缀
+            slots = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
+                     for t in slots]
+            return slots
+
+    # ── 降级: 编号解析失败，按行序分割（兼容无编号输出） ──
+    raw_lines = [l.strip() for l in content.strip().split("\n") if l.strip()]
+    translations = [_strip_numbered_prefix(l) for l in raw_lines]
+
+    # 最终安全检查：确保没有 [N] 前缀泄漏
     translations = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
                     for t in translations]
 
@@ -1804,15 +2283,10 @@ async def _generate_tts_segments(
             end_ms = int(seg.get("end", 0) * 1000)
             target_dur_ms = end_ms - start_ms
             if target_dur_ms > 0:
-                # 计算中文字符数（含中日韩统一表意文字）
-                zh_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text_zh))
-                if zh_chars > 0:
-                    # 估算原始 TTS 时长
-                    estimated_tts_ms = zh_chars * MS_PER_CHAR
-                    # ratio = TTS时长 / 目标时长
+                # 使用 jieba 分词估算（含 URL 检测），比纯字符计数更准确
+                estimated_tts_ms = _estimate_duration_jieba(text_zh) * 1.3  # 韵律/停顿修正
+                if estimated_tts_ms > 0:
                     raw_ratio = estimated_tts_ms / target_dur_ms
-                    # ratio>1: TTS 太长，需加速(rate>1)；ratio<1: TTS 太短，需减速(rate<1)
-                    # 直接用 ratio 作为 rate，钳制到 edge-tts 安全区间
                     rate = raw_ratio
             # 应用全局语速倍率
             global_speed = (config or {}).get("global_speed", 1.0)
@@ -1844,10 +2318,17 @@ async def _generate_tts_segments(
             endpoint = f"{api_url}/chat/completions" if "/chat/completions" not in api_url else api_url
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
             adjusted_count = 0
+            # URL 模式：含域名的文本 TTS 会逐字母朗读，LLM 无法有效精简
+            _url_pat = re.compile(
+                r'(?:https?://)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}'
+            )
             for item in outliers:
                 idx = item["idx"]
                 seg = segments[idx]
                 old_zh = item["text_zh"]
+                # 含 URL 且超速的片段：LLM 无法有效缩短 URL 发音，跳过
+                if item["raw_ratio"] > 1.35 and _url_pat.search(old_zh):
+                    continue
                 target_chars = max(2, int(item["target_dur_ms"] / MS_PER_CHAR))
                 current_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', old_zh))
                 # 判断调整方向
@@ -1876,10 +2357,10 @@ async def _generate_tts_segments(
                             # 更新 segments 和 item
                             segments[idx]["text_zh"] = new_zh
                             item["text_zh"] = new_zh
-                            # 重新计算 rate
-                            new_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', new_zh))
-                            if new_chars > 0 and item["target_dur_ms"] > 0:
-                                new_ratio = (new_chars * MS_PER_CHAR) / item["target_dur_ms"]
+                            # 重新计算 rate（使用 jieba 估算，含 URL 检测）
+                            new_est_ms = _estimate_duration_jieba(new_zh)
+                            if new_est_ms > 0 and item["target_dur_ms"] > 0:
+                                new_ratio = new_est_ms / item["target_dur_ms"]
                                 item["raw_ratio"] = new_ratio
                                 item["rate"] = max(0.85, min(1.20, new_ratio))
                             adjusted_count += 1
@@ -2211,8 +2692,8 @@ def _estimate_speed_ratios(
             other_chars = sum(1 for c in text_zh if c.isalnum() and not ('\u4e00' <= c <= '\u9fff'))
             estimated_ms = zh_chars * ms_per_zh_char + other_chars * ms_per_en_char
 
-        # 标点和停顿约占 10% 额外时间
-        estimated_ms *= 1.1
+        # 标点停顿 + 语句韵律延长 + 特殊符号朗读，约占 30% 额外时间
+        estimated_ms *= 1.3
         ratio = estimated_ms / target_ms
         if ratio > threshold:
             status = "overfast"
@@ -2238,13 +2719,31 @@ def _estimate_duration_jieba(text_zh: str) -> float:
       双字词（如"今天""学习"）: ~380ms
       三字词（如"计算机""互联网"）: ~530ms
       四字及以上（如"人工智能"）: ~150ms/字
-      英文/数字: ~100ms/字符
+      英文单词: ~150ms/字符
+      URL/域名（逐字母朗读）: ~280ms/字符
+      数字: ~120ms/字符
     """
     import jieba
     import unicodedata
 
-    words = jieba.lcut(text_zh)
-    total_ms = 0.0
+    # 先检测 URL/域名模式：TTS 会逐字母朗读这些内容
+    _URL_PATTERN = re.compile(
+        r'(?:https?://)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}'
+        r'(?:/[^\s]*)?'
+    )
+
+    # 预处理：找出 URL 并计算其独立时长，然后从文本中移除
+    url_ms = 0.0
+    clean_text = text_zh
+    for m in _URL_PATTERN.finditer(text_zh):
+        url_str = m.group()
+        # URL 逐字母朗读：每个字母/符号约 280ms
+        url_chars = sum(1 for c in url_str if c.isalnum() or c in './-_:')
+        url_ms += url_chars * 280
+        clean_text = clean_text.replace(url_str, '', 1)
+
+    words = jieba.lcut(clean_text)
+    total_ms = url_ms
     for word in words:
         # 跳过纯标点/空白
         meaningful = [c for c in word if not unicodedata.category(c).startswith(('P', 'Z', 'C'))]
@@ -2266,7 +2765,10 @@ def _estimate_duration_jieba(text_zh: str) -> float:
             else:
                 total_ms += zh_count * 150
         if other_count > 0:
-            total_ms += other_count * 100  # 英文/数字
+            # 英文/数字：比纯中文慢（TTS 需要切换语言）
+            digits = sum(1 for c in meaningful if c.isdigit())
+            letters = other_count - digits
+            total_ms += letters * 150 + digits * 120
 
     return total_ms
 
@@ -2309,8 +2811,127 @@ def _measure_speed_ratios(
     return results
 
 
+async def _post_tts_calibrate(
+    segments: List[dict], tts_dir: Path, config: dict,
+) -> List[dict]:
+    """P1.3 TTS 后校准: 测量实际 TTS 时长，对超速段精简译文并重新生成 TTS（最多 1 轮）。
+
+    流程:
+      1. 用 _measure_speed_ratios 测量实际 TTS vs 目标时长
+      2. 筛选 ratio > calibration_threshold 的段
+      3. 对这些段用 _refine_with_llm 精简译文
+      4. 仅对改动段重新生成 TTS
+    """
+    import copy
+
+    refine_cfg = config.get("refine", {})
+    threshold = refine_cfg.get("calibration_threshold", 1.30)
+    llm_config = config.get("llm", {})
+
+    if not llm_config.get("api_key"):
+        print("  ⚠️  后校准需要 LLM 配置，跳过")
+        return segments
+
+    # 1. 测量实际 TTS 时长
+    speed_results = _measure_speed_ratios(segments, tts_dir, threshold=1.5)
+    overfast = [r for r in speed_results if r["speed_ratio"] > threshold]
+
+    if not overfast:
+        print(f"  ✅ 后校准: 无超速段 (阈值={threshold}x)")
+        return segments
+
+    print(f"  🔧 后校准: {len(overfast)} 段超 {threshold}x，精简译文...")
+
+    # 2. 精简译文
+    refined_segments = _refine_with_llm(segments, overfast, llm_config)
+
+    # 3. 找到实际被修改的段
+    changed_indices = []
+    for item in overfast:
+        idx = item["idx"]
+        old_zh = segments[idx].get("text_zh", "")
+        new_zh = refined_segments[idx].get("text_zh", "")
+        if new_zh and new_zh != old_zh:
+            changed_indices.append(idx)
+
+    if not changed_indices:
+        print(f"  ⚠️  后校准: LLM 未能精简任何段")
+        return segments
+
+    # 4. 仅对改动段重新生成 TTS
+    voice = config.get("voice", "zh-CN-YunxiNeural")
+    print(f"  🔄 后校准: 重新生成 {len(changed_indices)} 段 TTS...")
+
+    tts_items = []
+    for idx in changed_indices:
+        seg = refined_segments[idx]
+        text_zh = seg.get("text_zh", "")
+        target_dur_ms = int((seg["end"] - seg["start"]) * 1000)
+        # 计算新的 rate
+        rate = 1.0
+        if target_dur_ms > 0:
+            estimated_tts_ms = _estimate_duration_jieba(text_zh) * 1.3
+            if estimated_tts_ms > 0:
+                rate = estimated_tts_ms / target_dur_ms
+        global_speed = config.get("global_speed", 1.0)
+        rate = max(0.85, min(1.20, rate * global_speed))
+        tts_items.append({"idx": idx, "text_zh": text_zh, "rate": rate})
+
+    # 使用 edge-tts 逐段重新生成
+    import edge_tts
+    for item in tts_items:
+        idx = item["idx"]
+        text = item["text_zh"]
+        rate_pct = f"{int((item['rate'] - 1) * 100):+d}%"
+        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate_pct)
+            await communicate.save(str(tts_path))
+        except Exception as e:
+            print(f"    ⚠️  seg_{idx:04d} TTS 重新生成失败: {e}")
+
+    print(f"  ✅ 后校准完成: {len(changed_indices)} 段已更新")
+    return refined_segments
+
+
+def _detect_silence_regions(audio_path: Path, min_silence_len: int = 200,
+                            silence_thresh: int = -40) -> List[tuple]:
+    """检测音频中的静音区间，返回 [(start_ms, end_ms), ...] 列表。
+
+    用于 gap borrowing: 确认段间间隙确实是静音后才允许借用。
+    """
+    from pydub import AudioSegment as PydubSegment
+    from pydub.silence import detect_silence
+
+    if not audio_path.exists():
+        return []
+    audio = PydubSegment.from_wav(str(audio_path))
+    # detect_silence 返回 [[start, end], ...] 格式
+    silent_ranges = detect_silence(audio, min_silence_len=min_silence_len,
+                                   silence_thresh=silence_thresh)
+    return [(s, e) for s, e in silent_ranges]
+
+
+def _is_in_silence(position_ms: int, duration_ms: int,
+                   silence_regions: List[tuple]) -> bool:
+    """检查给定时间区间是否处于静音区域内（至少 70% 重叠）。"""
+    if not silence_regions:
+        return True  # 无静音数据时默认允许借用
+    overlap = 0
+    for s_start, s_end in silence_regions:
+        if s_start >= position_ms + duration_ms:
+            break
+        if s_end <= position_ms:
+            continue
+        o_start = max(position_ms, s_start)
+        o_end = min(position_ms + duration_ms, s_end)
+        overlap += max(0, o_end - o_start)
+    return overlap >= duration_ms * 0.7
+
+
 def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
-                           cpu_threads: int = 0, global_speed: float = 1.0) -> Path:
+                           cpu_threads: int = 0, global_speed: float = 1.0,
+                           config: dict = None) -> Path:
     """阶段 C: atempo 调速 + 叠加拼接 → chinese_dub.wav
 
     语速策略:
@@ -2328,13 +2949,36 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
     original_audio = PydubSegment.from_wav(str(audio_path))
     total_ms = len(original_audio)
 
+    # ── Gap Borrowing 配置 ──
+    align_cfg = (config or {}).get("alignment", {})
+    gap_borrowing = align_cfg.get("gap_borrowing", False)
+    max_borrow_ms = align_cfg.get("max_borrow_ms", 300)
+    silence_regions = []
+    if gap_borrowing:
+        silence_regions = _detect_silence_regions(audio_path)
+        print(f"     间隙借用已启用 (上限 {max_borrow_ms}ms, 检测到 {len(silence_regions)} 个静音区间)")
+
+    # ── Video Slowdown 配置 ──
+    video_slowdown = align_cfg.get("video_slowdown", False)
+    max_slowdown_factor = align_cfg.get("max_slowdown_factor", 0.85)
+    slowdown_segments = []  # 记录需要视频减速的段: {"idx", "start", "end", "factor"}
+
+    # 计算段间间隙 (用于 gap borrowing)
+    gap_after = []  # gap_after[i] = segments[i+1].start - segments[i].end (ms)
+    for idx in range(len(segments)):
+        if idx < len(segments) - 1:
+            gap = int(segments[idx + 1]["start"] * 1000) - int(segments[idx]["end"] * 1000)
+            gap_after.append(max(0, gap))
+        else:
+            gap_after.append(0)
+
     # ── 语速目标区间 ──
-    SPEED_MIN = 0.95   # 低于此值用静音填充而非极端降速
+    SPEED_MIN = 1.00   # 不降速 (降速听感比略微加速差得多)，低于此值用静音填充
     SPEED_MAX = 1.25   # 高于此值截断而非极端加速（听起来太快）
 
     print(f"     时间线对齐中 (目标语速区间: {SPEED_MIN:.2f}x ~ {SPEED_MAX:.2f}x)...")
     final_audio = PydubSegment.silent(duration=total_ms, frame_rate=16000)
-    stats = {"adjusted": 0, "skipped": 0, "padded": 0, "clamped_fast": 0, "clamped_slow": 0}
+    stats = {"adjusted": 0, "skipped": 0, "padded": 0, "clamped_fast": 0, "clamped_slow": 0, "borrowed": 0}
 
     # First pass: collect all raw speed ratios
     raw_ratios = []
@@ -2348,32 +2992,52 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
         tts_audio = PydubSegment.from_mp3(str(tts_path))
         raw_ratios.append(len(tts_audio) / target_dur)
 
-    # Compute global baseline (median of valid ratios)
+    # Compute global baseline (trimmed mean — 去掉头尾各 10% 减少离群值影响)
     valid_ratios = [r for r in raw_ratios if r is not None and r > 0]
     if valid_ratios:
-        sorted_ratios = sorted(valid_ratios)
-        median_ratio = sorted_ratios[len(sorted_ratios) // 2]
+        valid_sorted = sorted(valid_ratios)
+        trim = max(1, len(valid_sorted) // 10)
+        trimmed = valid_sorted[trim:-trim] if len(valid_sorted) > 4 else valid_sorted
+        baseline = sum(trimmed) / len(trimmed)
     else:
-        median_ratio = 1.0
+        baseline = 1.0
+    median_ratio = baseline  # 兼容后续 speed_report 输出
 
-    # Blend toward median and apply smoothing
-    BLEND_WEIGHT = 0.4  # 40% toward global median
+    # Adaptive blend toward baseline (偏离大→强拉; 偏离小→信任原值)
     SMOOTH_ALPHA = 0.3  # exponential smoothing factor
     blended_ratios = []
     for r in raw_ratios:
         if r is None:
             blended_ratios.append(None)
         else:
-            blended_ratios.append(r * (1 - BLEND_WEIGHT) + median_ratio * BLEND_WEIGHT)
+            deviation = abs(r - baseline)
+            weight = 0.2 if deviation < 0.15 else (0.6 if deviation > 0.3 else 0.4)
+            blended_ratios.append(r * (1 - weight) + baseline * weight)
 
-    # Exponential smoothing pass
-    smoothed_ratios = list(blended_ratios)
+    # Bidirectional exponential smoothing (前向+后向取平均，消除warm-up效应)
+    forward = list(blended_ratios)
     prev_valid = None
-    for i, r in enumerate(smoothed_ratios):
+    for i, r in enumerate(forward):
         if r is not None:
             if prev_valid is not None:
-                smoothed_ratios[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
-            prev_valid = smoothed_ratios[i]
+                forward[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
+            prev_valid = forward[i]
+
+    backward = list(blended_ratios)
+    prev_valid = None
+    for i in range(len(backward) - 1, -1, -1):
+        r = backward[i]
+        if r is not None:
+            if prev_valid is not None:
+                backward[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
+            prev_valid = backward[i]
+
+    smoothed_ratios = []
+    for f, b in zip(forward, backward):
+        if f is None:
+            smoothed_ratios.append(None)
+        else:
+            smoothed_ratios.append((f + b) / 2)
 
     # 钳制到目标区间 [SPEED_MIN, SPEED_MAX]
     clamped_ratios = []
@@ -2402,19 +3066,28 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
     clamped_valid = [r for r in clamped_ratios if r is not None]
     avg_speed = sum(clamped_valid) / max(1, len(clamped_valid))
     print(f"     全局语速基线: {median_ratio:.2f}x → 钳制后平均: {avg_speed:.2f}x"
-          f" (混合={BLEND_WEIGHT}, 平滑={SMOOTH_ALPHA})")
+          f" (自适应混合, 双向平滑α={SMOOTH_ALPHA})")
     if stats["clamped_fast"] or stats["clamped_slow"]:
         print(f"     钳制: {stats['clamped_fast']} 段过快被限速,"
               f" {stats['clamped_slow']} 段过慢被提速")
 
     # ── 保存调速报告（断点恢复时可查看） ──
+    import statistics as _stats_mod
+    clamped_std = round(_stats_mod.stdev(clamped_valid), 4) if len(clamped_valid) > 1 else 0.0
+    raw_valid = [r for r in raw_ratios if r is not None]
+    raw_std = round(_stats_mod.stdev(raw_valid), 4) if len(raw_valid) > 1 else 0.0
+    outlier_count = sum(1 for r in raw_valid if r > 1.4)
     speed_report = {
-        "median_ratio": round(median_ratio, 4),
+        "baseline": round(median_ratio, 4),
         "avg_clamped": round(avg_speed, 4),
+        "std_clamped": clamped_std,
+        "std_raw": raw_std,
+        "outliers_gt_1.4": outlier_count,
         "speed_range": [SPEED_MIN, SPEED_MAX],
         "total_segments": len(segments),
         "clamped_fast": stats["clamped_fast"],
         "clamped_slow": stats["clamped_slow"],
+        "gap_borrowing": gap_borrowing,
     }
     with open(output_dir / "speed_report.json", "w", encoding="utf-8") as f:
         json.dump(speed_report, f, ensure_ascii=False, indent=2)
@@ -2504,7 +3177,37 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
                 stats["adjusted"] += 1
 
         if len(tts_audio) > target_dur:
-            tts_audio = tts_audio[:target_dur]
+            overflow_ms = len(tts_audio) - target_dur
+            borrowed = False
+            # Gap Borrowing: 尝试从后方静音间隙借用时间
+            if gap_borrowing and overflow_ms <= max_borrow_ms:
+                available_gap = gap_after[idx]
+                borrow_amount = min(overflow_ms, int(available_gap * 0.6), max_borrow_ms)
+                if borrow_amount >= overflow_ms:
+                    # 确认间隙区域确实是静音
+                    gap_start_ms = int(seg["end"] * 1000)
+                    if _is_in_silence(gap_start_ms, borrow_amount, silence_regions):
+                        # 允许 TTS 延伸到间隙中，不截断
+                        borrowed = True
+                        stats["borrowed"] += 1
+            if not borrowed:
+                # Video Slowdown: 超时≤15% 且启用时，标记视频减速而非截断音频
+                overflow_ratio = overflow_ms / target_dur if target_dur > 0 else 1.0
+                if video_slowdown and overflow_ratio <= 0.15:
+                    factor = target_dur / len(tts_audio)  # < 1.0, e.g. 0.87
+                    if factor >= max_slowdown_factor:
+                        slowdown_segments.append({
+                            "idx": idx,
+                            "start": seg["start"],
+                            "end": seg["end"],
+                            "factor": round(factor, 3),
+                            "overflow_ms": overflow_ms,
+                        })
+                        # 不截断，让 TTS 保持原长（视频端会减速适配）
+                    else:
+                        tts_audio = tts_audio[:target_dur]
+                else:
+                    tts_audio = tts_audio[:target_dur]
 
         # 平滑过渡：短淡入淡出防止片段边界爆音
         CROSSFADE_MS = 30
@@ -2518,7 +3221,15 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
     final_audio.export(str(dub_path), format="wav")
     print(f"  ✅ 配音完成 (调速:{stats['adjusted']}, 填充:{stats['padded']},"
           f" 限速:{stats['clamped_fast']}, 提速:{stats['clamped_slow']},"
-          f" 跳过:{stats['skipped']}, 总:{len(segments)})")
+          f" 借用:{stats['borrowed']}, 跳过:{stats['skipped']}, 总:{len(segments)})")
+
+    # ── Video Slowdown 报告 ──
+    if slowdown_segments:
+        slowdown_path = output_dir / "slowdown_segments.json"
+        with open(slowdown_path, "w", encoding="utf-8") as f:
+            json.dump(slowdown_segments, f, ensure_ascii=False, indent=2)
+        print(f"  🐢 视频减速标记: {len(slowdown_segments)} 段 → {slowdown_path.name}")
+
     return dub_path
 
 
@@ -2535,7 +3246,7 @@ async def generate_chinese_dub(
     cpu_threads = (config or {}).get("cpu_threads", 0)
     global_speed = (config or {}).get("global_speed", 1.0)
     return _align_tts_to_timeline(segments, output_dir, cpu_threads=cpu_threads,
-                                  global_speed=global_speed)
+                                  global_speed=global_speed, config=config)
 
 
 def _build_atempo_filter(speed_ratio: float) -> str:
@@ -3293,6 +4004,17 @@ def merge_final_video(video_path: Path, dub_path: Path,
         ], capture_output=True, check=True)
 
     print(f"  ✅ 最终视频: {final_path}")
+
+    # ── Video Slowdown 提示 ──
+    slowdown_path = output_dir / "slowdown_segments.json"
+    if slowdown_path.exists():
+        with open(slowdown_path, "r", encoding="utf-8") as f:
+            slowdown_segs = json.load(f)
+        if slowdown_segs:
+            print(f"  ⚠️  {len(slowdown_segs)} 段标记需要视频减速 (factor: "
+                  f"{min(s['factor'] for s in slowdown_segs):.2f}~{max(s['factor'] for s in slowdown_segs):.2f})，"
+                  f"当前版本暂未应用 setpts 减速滤镜")
+
     return final_path
 
 
@@ -3505,6 +4227,9 @@ async def process_video(config: dict):
                     config.get("whisper_beam_size", 5),
                     cpu_threads=config.get("cpu_threads", 0))
                 raw_segments = deduplicate_segments(raw_segments)
+                # ── NLP 分句优化（可选） ──
+                if config.get("nlp_segmentation", False):
+                    raw_segments = _nlp_resegment(raw_segments)
                 # ── 保存转录中间结果（支持单独跳过 transcribe） ──
                 with open(transcribe_cache, "w", encoding="utf-8") as f:
                     json.dump(raw_segments, f, ensure_ascii=False, indent=2)
@@ -3664,6 +4389,13 @@ async def process_video(config: dict):
             _log("")
         _logger.step_end()
 
+        # ── TTS 后校准（可选）──
+        if config.get("refine", {}).get("post_tts_calibration", False) and tts_dir.exists():
+            segments = await _post_tts_calibrate(segments, tts_dir, config)
+            # 更新 cache
+            with open(output_dir / "segments_cache.json", "w", encoding="utf-8") as f:
+                json.dump(segments, f, ensure_ascii=False, indent=2)
+
         # 字幕 + 时间线对齐
         _logger.step_begin("字幕+对齐")
         step_n = _next_step()
@@ -3737,6 +4469,14 @@ async def process_video(config: dict):
             _log(f"  ⏭  使用已有 TTS 片段 ({len(tts_files)} 个)")
             _log("")
         _logger.step_end()
+
+        # ── TTS 后校准（可选，标准流程）──
+        if config.get("refine", {}).get("post_tts_calibration", False) and segments:
+            _tts_dir = output_dir / "tts_segments"
+            if _tts_dir.exists():
+                segments = await _post_tts_calibrate(segments, _tts_dir, config)
+                with open(output_dir / "segments_cache.json", "w", encoding="utf-8") as f:
+                    json.dump(segments, f, ensure_ascii=False, indent=2)
 
         # 合成
         _logger.step_begin("合成视频")

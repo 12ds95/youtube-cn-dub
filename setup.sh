@@ -68,7 +68,11 @@ VENV_PYTHON="$VENV_DIR/bin/python3"
 echo ""
 echo "[3/4] 安装 Python 依赖..."
 
-"$VENV_PIP" install --upgrade pip -q
+# 国内镜像源（加速下载，可通过 PIP_INDEX_URL 环境变量覆盖）
+PIP_MIRROR="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
+PIP_INSTALL="$VENV_PIP install -i $PIP_MIRROR --trusted-host $(echo $PIP_MIRROR | sed 's|https\?://\([^/]*\).*|\1|')"
+
+$PIP_INSTALL --upgrade pip -q
 
 PACKAGES=(
     "faster-whisper"
@@ -78,6 +82,7 @@ PACKAGES=(
     "yt-dlp"
     "httpx"
     "demucs"
+    "spacy"
 )
 
 for pkg in "${PACKAGES[@]}"; do
@@ -85,17 +90,29 @@ for pkg in "${PACKAGES[@]}"; do
         echo "  ⏭  $pkg 已安装"
     else
         echo "  📦 安装 $pkg..."
-        "$VENV_PIP" install "$pkg" -q
+        $PIP_INSTALL "$pkg" -q
         echo "  ✅ $pkg"
     fi
 done
+
+# spaCy 英文模型（NLP 断句需要）
+if "$VENV_PYTHON" -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null; then
+    echo "  ⏭  spacy en_core_web_sm 已安装"
+else
+    echo "  📦 安装 spacy en_core_web_sm 模型..."
+    # 优先用 GitHub 加速代理（国内直连 GitHub 慢）
+    $PIP_INSTALL https://ghfast.top/https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl -q 2>/dev/null || \
+        "$VENV_PYTHON" -m spacy download en_core_web_sm -q 2>/dev/null || \
+        echo "  ⚠️  en_core_web_sm 自动安装失败，请手动: $VENV_PYTHON -m spacy download en_core_web_sm"
+    echo "  ✅ en_core_web_sm"
+fi
 
 # yt-dlp-ejs (YouTube 反爬需要)
 if "$VENV_PIP" show yt-dlp-ejs >/dev/null 2>&1; then
     echo "  ⏭  yt-dlp-ejs 已安装"
 else
     echo "  📦 安装 yt-dlp-ejs..."
-    "$VENV_PIP" install yt-dlp-ejs -q
+    $PIP_INSTALL yt-dlp-ejs -q
     echo "  ✅ yt-dlp-ejs"
 fi
 

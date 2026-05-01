@@ -3,7 +3,9 @@
 # 跳过: download, extract, separate (保留已有的 original.mp4, audio.wav, 分离音频)
 #
 # 用法:
-#   bash test_pipeline.sh              # 完整测试 (transcribe → merge)
+#   bash test_pipeline.sh              # 集成测试: 全功能开启，从 transcribe 到 merge
+#   bash test_pipeline.sh --integrated # 集成测试: 全功能开启，跳过 transcribe（用缓存）
+#   bash test_pipeline.sh --baseline   # 回归测试: 全功能关闭，验证不引入回归
 #   bash test_pipeline.sh --fast       # 快速测试 (跳过 transcribe+translate，复用缓存)
 #   bash test_pipeline.sh --refine     # 仅测翻译+迭代优化 (跳过 TTS/字幕/合成)
 #   bash test_pipeline.sh --retranslate # 删除翻译缓存从翻译开始，跳过 TTS 后步骤
@@ -35,6 +37,9 @@ done
 
 MODE="full"
 case "${1:-}" in
+    --full)        MODE="full" ;;
+    --integrated)  MODE="integrated" ;;
+    --baseline)    MODE="baseline" ;;
     --fast)        MODE="fast" ;;
     --refine)      MODE="refine" ;;
     --retranslate) MODE="retranslate" ;;
@@ -59,10 +64,16 @@ rm -rf "$VIDEO_DIR/iterations"
 rm -f  "$VIDEO_DIR"/pipeline_*.log
 
 case "$MODE" in
-    full)
+    full|baseline)
         rm -f "$VIDEO_DIR/segments_cache.json"
         rm -f "$VIDEO_DIR/transcribe_cache.json"
-        echo "   完整模式: 清理所有缓存 (从 transcribe 开始)"
+        rm -f "$VIDEO_DIR/slowdown_segments.json"
+        echo "   $MODE 模式: 清理所有缓存 (从 transcribe 开始)"
+        ;;
+    integrated)
+        rm -f "$VIDEO_DIR/segments_cache.json"
+        rm -f "$VIDEO_DIR/slowdown_segments.json"
+        echo "   --integrated 模式: 保留 transcribe_cache，清理翻译缓存 (从翻译开始，全功能)"
         ;;
     fast)
         echo "   --fast 模式: 保留 segments_cache.json (跳过 transcribe + translate)"
@@ -81,9 +92,14 @@ echo ""
 
 # --- 构建临时配置 ---
 SKIP_STEPS='["download", "extract", "separate"]'
-EXTRA_SKIP=""
 
 case "$MODE" in
+    full|baseline)
+        SKIP_STEPS='["download", "extract", "separate"]'
+        ;;
+    integrated)
+        SKIP_STEPS='["download", "extract", "separate", "transcribe"]'
+        ;;
     fast)
         SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate"]'
         ;;
@@ -98,6 +114,23 @@ esac
 TMPCONFIG=$(mktemp /tmp/test_pipeline_XXXXXX.json)
 trap "rm -f '$TMPCONFIG'" EXIT
 
+# 新功能开关: baseline 模式全部关闭，其他模式全部开启
+if [ "$MODE" = "baseline" ]; then
+    TWO_PASS=false
+    NLP_SEG=false
+    POST_CAL=false
+    GAP_BORROW=false
+    VID_SLOW=false
+    FEATURE_DESC="全部关闭（回归基线）"
+else
+    TWO_PASS=true
+    NLP_SEG=true
+    POST_CAL=true
+    GAP_BORROW=true
+    VID_SLOW=true
+    FEATURE_DESC="two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown"
+fi
+
 cat > "$TMPCONFIG" <<JSONEOF
 {
   "resume_from": "$VIDEO_DIR",
@@ -107,9 +140,11 @@ cat > "$TMPCONFIG" <<JSONEOF
     "api_url": "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
     "api_key": "sk-sp-e0987ca0f8c04f969a5218dbdc6f1401",
     "model": "qwen3-coder-next",
-    "batch_size": 15,
-    "temperature": 0.3
+    "batch_size": 8,
+    "temperature": 0.3,
+    "two_pass": $TWO_PASS
   },
+  "nlp_segmentation": $NLP_SEG,
   "tts_chain": ["edge-tts", "piper", "gtts", "pyttsx3"],
   "piper": {
     "model_path": "models/piper/zh_CN-huayan-medium.onnx"
@@ -118,7 +153,15 @@ cat > "$TMPCONFIG" <<JSONEOF
   "refine": {
     "enabled": true,
     "max_iterations": 3,
-    "speed_threshold": 1.25
+    "speed_threshold": 1.25,
+    "post_tts_calibration": $POST_CAL,
+    "calibration_threshold": 1.30
+  },
+  "alignment": {
+    "gap_borrowing": $GAP_BORROW,
+    "max_borrow_ms": 300,
+    "video_slowdown": $VID_SLOW,
+    "max_slowdown_factor": 0.85
   },
   "audio_separation": {
     "enabled": true,
@@ -132,6 +175,7 @@ JSONEOF
 
 echo -e "${YELLOW}🚀 开始运行管线...${NC}"
 echo "   skip_steps: $SKIP_STEPS"
+echo "   功能: $FEATURE_DESC"
 echo "   refine: max_iterations=3"
 echo ""
 

@@ -20,9 +20,11 @@
     "api_key": "",
     "model": "deepseek-chat",
     "system_prompt": "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。要求：1)翻译准确流畅，符合中文表达习惯；2)保持技术术语的专业性；3)翻译要适合做视频配音朗读，语句通顺自然；4)只输出翻译结果，不要解释。",
-    "batch_size": 15,
+    "batch_size": 8,
     "temperature": 0.3,
-    "style": ""
+    "style": "",
+    "prompt_template": "",
+    "two_pass": false
   },
 
   "__=== TTS 配音引擎 ===__": "",
@@ -109,8 +111,20 @@
   "__=== 性能选项 ===__": "",
   "tts_concurrency": 5,
   "whisper_beam_size": 5,
+  "nlp_segmentation": false,
+  "cpu_threads": 0,
+  "global_speed": 1.0,
   "__skip_steps 说明__": "按执行顺序: download / extract / separate / transcribe / translate / refine / tts / subtitle / merge",
   "skip_steps": [],
+
+  "__=== 时间线对齐增强 ===__": "",
+  "alignment": {
+    "__说明__": "TTS 稍超目标时长时的处理策略: 间隙借用 > 视频减速 > 截断",
+    "gap_borrowing": false,
+    "max_borrow_ms": 300,
+    "video_slowdown": false,
+    "max_slowdown_factor": 0.85
+  },
 
   "__=== 迭代优化 ===__": "",
   "refine": {
@@ -118,7 +132,9 @@
     "enabled": false,
     "max_iterations": 5,
     "speed_threshold": 1.25,
-    "resume_iteration": null
+    "resume_iteration": null,
+    "post_tts_calibration": false,
+    "calibration_threshold": 1.30
   },
   "clean_iterations": false
 }

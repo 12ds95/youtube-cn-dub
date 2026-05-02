@@ -25,6 +25,10 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
+# 国内环境: UTMOSv2 依赖 facebook/wav2vec2-base，走镜像避免被墙
+if "HF_ENDPOINT" not in os.environ:
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 # ─── 配色 ─────────────────────────────────────────────────────────
 GREEN = "\033[0;32m"
 YELLOW = "\033[1;33m"
@@ -277,9 +281,13 @@ def compute_utmos(video_dir: Path, sample_size: int = 20) -> dict:
     sampled = random.sample(mp3s, min(sample_size, len(mp3s)))
 
     try:
+        import warnings
+        warnings.filterwarnings("ignore", message=".*gradient_checkpointing.*")
+        warnings.filterwarnings("ignore", message=".*torch\\.load.*")
         model = utmosv2.create_model(pretrained=True)
     except Exception as e:
-        return {"error": f"模型加载失败: {e}"}
+        msg = str(e).split('\n')[0][:80]  # 只取首行，截断长错误
+        return {"error": f"模型加载失败: {msg}"}
 
     scores = []
     for mp3 in sampled:

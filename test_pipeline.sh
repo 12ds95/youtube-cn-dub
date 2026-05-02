@@ -168,7 +168,7 @@ cat > "$TMPCONFIG" <<JSONEOF
   "refine": {
     "enabled": true,
     "max_iterations": 3,
-    "speed_threshold": 1.25,
+    "speed_threshold": 1.5,
     "post_tts_calibration": $POST_CAL,
     "calibration_threshold": 1.30
   },

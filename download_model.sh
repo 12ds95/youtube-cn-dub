@@ -61,12 +61,8 @@ download_whisper() {
     echo "📥 下载 faster-whisper-$size 模型 ($repo)..."
     echo "   目标目录: $model_dir"
 
-    # 必需文件 + 可选文件（int8 量化版可能缺少 tokenizer.json / preprocessor_config.json，
-    # faster-whisper 会自动 fallback 到 pretrained tokenizer，不影响功能）
-    local required_files="config.json vocabulary.txt model.bin"
-    local optional_files="tokenizer.json preprocessor_config.json"
-
-    for f in $required_files; do
+    # model.bin + vocabulary.txt 从原 repo 下载
+    for f in vocabulary.txt model.bin; do
         if [ -f "$model_dir/$f" ]; then
             echo "  ⏭  $f 已存在，跳过"
             continue
@@ -76,13 +72,22 @@ download_whisper() {
         echo "  ✅ $f 下载完成 ($(du -h "$model_dir/$f" | cut -f1))"
     done
 
-    for f in $optional_files; do
+    # config.json + tokenizer.json: 从 Systran 官方 repo 下载
+    # int8 量化版 config.json 缺少 alignment_heads 字段（word_timestamps 必需）
+    # int8 量化版无 tokenizer.json（缺失会导致运行时连 HuggingFace 下载，国内超时）
+    if $USE_MIRROR; then
+        local systran_base="https://hf-mirror.com/Systran/faster-whisper-$size/resolve/main"
+    else
+        local systran_base="https://huggingface.co/Systran/faster-whisper-$size/resolve/main"
+    fi
+    for f in config.json tokenizer.json; do
         if [ -f "$model_dir/$f" ]; then
             echo "  ⏭  $f 已存在，跳过"
             continue
         fi
-        # 可选文件下载失败不报错
-        _curl_download "$base/$f" "$model_dir/$f" 2>/dev/null || rm -f "$model_dir/$f"
+        echo "  📦 下载 $f (从 Systran 官方 repo)..."
+        _curl_download "$systran_base/$f" "$model_dir/$f"
+        echo "  ✅ $f 下载完成 ($(du -h "$model_dir/$f" | cut -f1))"
     done
 
     echo "🎉 Whisper 模型下载完成: $model_dir"

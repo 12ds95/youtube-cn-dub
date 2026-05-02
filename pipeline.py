@@ -312,7 +312,7 @@ DEFAULT_CONFIG = {
     "refine": {
         "enabled": False,            # 是否启用迭代优化
         "max_iterations": 5,         # 单次运行最大迭代轮次（收敛后 early stop）
-        "speed_threshold": 1.25,     # 加速倍率阈值: >1.25x 即触发精简（1.0=原速, 1.5x 已很明显）
+        "speed_threshold": 1.5,      # 加速倍率阈值: >1.5x 才触发精简（1.25 太激进会过度压缩）
         "resume_iteration": None,    # 从第 N 轮迭代恢复（大循环断点续跑）
         "post_tts_calibration": False,  # TTS 后校准: 测量实际时长，对超速段重新精简+重生成
         "calibration_threshold": 1.30,  # 后校准触发阈值 (ratio > 此值的段将被精简)

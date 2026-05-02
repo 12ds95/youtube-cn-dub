@@ -1,0 +1,32 @@
+{
+  "params": {
+    "n_1char": 212.6,
+    "n_2char": 479.9,
+    "n_3char": 679.9,
+    "n_4plus": 240.6,
+    "n_letters": 116.7,
+    "n_digits": 255.9,
+    "n_url_chars": 155.9,
+    "n_punct": 164.1,
+    "intercept": -62.7
+  },
+  "metrics": {
+    "n_samples": 1587,
+    "alpha": 0.1,
+    "r2": 0.8382,
+    "baseline": {
+      "mae_ms": 558.9,
+      "mape": 10.4,
+      "within_15pct": 78.9,
+      "within_20pct": 88.8,
+      "phase2_triggers": 335
+    },
+    "calibrated": {
+      "mae_ms": 468.2,
+      "mape": 8.7,
+      "within_15pct": 84.6,
+      "within_20pct": 92.6,
+      "phase2_triggers": 245
+    }
+  }
+}

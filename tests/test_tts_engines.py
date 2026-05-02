@@ -77,7 +77,7 @@ def test_factory_pyttsx3():
     engine = _create_tts_engine(config)
     assert isinstance(engine, Pyttsx3Engine)
     assert engine.voice_name == "Ting-Ting"
-    assert engine.rate == 200
+    assert engine.base_rate == 200
 
 
 def test_factory_gtts():
@@ -122,6 +122,16 @@ def test_offline_engines_count():
     registered = set(TTS_ENGINES.keys())
     assert len(offline & registered) >= 2, \
         f"离线引擎不足: 仅有 {offline & registered}"
+
+
+def test_supports_rate_property():
+    """支持 rate 调速的引擎应标记 supports_rate=True"""
+    rate_engines = [EdgeTTSEngine, Pyttsx3Engine]
+    no_rate_engines = [GTTSEngine, PiperTTSEngine, SherpaOnnxEngine]
+    for cls in rate_engines:
+        assert cls.supports_rate is True, f"{cls.name} 应支持 rate 调速"
+    for cls in no_rate_engines:
+        assert cls.supports_rate is False, f"{cls.name} 不支持 rate 调速"
 
 
 # ── resolve_voice 测试：确保各引擎不会误用 edge-tts 的全局语音 ──

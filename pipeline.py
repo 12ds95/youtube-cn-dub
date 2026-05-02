@@ -1999,6 +1999,7 @@ class TTSEngine:
     """TTS 引擎基类"""
     name = "base"
     is_local = False  # 子类覆盖：本地引擎=True，远程引擎=False
+    supports_rate = False  # 子类覆盖：True=引擎能通过 rate 参数调速
 
     def resolve_voice(self, global_voice: str) -> str:
         """返回本引擎实际使用的语音标识。
@@ -2051,6 +2052,7 @@ class EdgeTTSEngine(TTSEngine):
     """edge-tts: 微软免费在线 TTS（默认引擎）"""
     name = "edge-tts"
     is_local = False
+    supports_rate = True
 
     async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         """合成音频，支持 rate 参数调整语速（0.85~1.20 为安全区间）
@@ -2170,10 +2172,11 @@ class Pyttsx3Engine(TTSEngine):
     """
     name = "pyttsx3"
     is_local = True
+    supports_rate = True  # 通过 WPM 调速
 
     def __init__(self, voice_name: str = None, rate: int = None):
         self.voice_name = voice_name  # 如 "Ting-Ting", "Mei-Jia"
-        self.rate = rate or 180  # 默认语速
+        self.base_rate = rate or 180  # 默认语速 (WPM)
 
     def resolve_voice(self, global_voice: str) -> str:
         """pyttsx3 使用系统语音名，忽略全局 edge-tts voice"""
@@ -2182,12 +2185,12 @@ class Pyttsx3Engine(TTSEngine):
     async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
         loop = asyncio.get_event_loop()
         vname = self.voice_name
-        rate = self.rate
+        wpm = int(self.base_rate * rate)  # 反馈闭环的 rate 倍率应用到基础语速
 
         def _gen():
             import pyttsx3
             engine = pyttsx3.init()
-            engine.setProperty('rate', rate)
+            engine.setProperty('rate', wpm)
 
             # 尝试找中文语音
             if vname:
@@ -2315,7 +2318,7 @@ async def _generate_tts_segments(
             target_dur_ms = end_ms - start_ms
             if target_dur_ms > 0:
                 # 使用 jieba 分词估算（含 URL 检测），比纯字符计数更准确
-                estimated_tts_ms = _estimate_duration_jieba(text_zh) * 1.3  # 韵律/停顿修正
+                estimated_tts_ms = _estimate_duration_jieba(text_zh)  # 校准后参数已含韵律修正
                 if estimated_tts_ms > 0:
                     raw_ratio = estimated_tts_ms / target_dur_ms
                     rate = raw_ratio
@@ -2629,6 +2632,9 @@ async def _tts_with_duration_feedback(
 
     align_cfg = (config or {}).get("alignment", {})
     if not align_cfg.get("feedback_loop", True):
+        return
+    if not getattr(engine, 'supports_rate', False):
+        print(f"     ⏭  [{engine.name}] 不支持 rate 调速，跳过 rate 反馈闭环（将由 LLM 闭环补偿）")
         return
     rate_range = align_cfg.get("tts_rate_range", [0.80, 1.35])
 
@@ -3021,8 +3027,7 @@ def _estimate_speed_ratios(
             other_chars = sum(1 for c in text_zh if c.isalnum() and not ('\u4e00' <= c <= '\u9fff'))
             estimated_ms = zh_chars * ms_per_zh_char + other_chars * ms_per_en_char
 
-        # 标点停顿 + 语句韵律延长 + 特殊符号朗读，约占 30% 额外时间
-        estimated_ms *= 1.3
+        # 校准后的 jieba 参数已含韵律/停顿修正，无需额外乘数
         ratio = estimated_ms / target_ms
         if ratio > threshold:
             status = "overfast"
@@ -3044,13 +3049,13 @@ def _estimate_duration_jieba(text_zh: str) -> float:
     """用 jieba 分词后按词粒度估算朗读时长（毫秒）。
 
     经验值（基于 edge-tts zh-CN-YunxiNeural 实测）：
-      单字词（如"的""是"）: ~200ms
-      双字词（如"今天""学习"）: ~380ms
-      三字词（如"计算机""互联网"）: ~530ms
-      四字及以上（如"人工智能"）: ~150ms/字
-      英文单词: ~150ms/字符
-      URL/域名（逐字母朗读）: ~280ms/字符
-      数字: ~120ms/字符
+      单字词（如"的""是"）: ~212ms
+      双字词（如"今天""学习"）: ~479ms
+      三字词（如"计算机""互联网"）: ~679ms
+      四字及以上（如"人工智能"）: ~240ms/字
+      英文单词: ~116ms/字符
+      URL/域名（逐字母朗读）: ~155ms/字符
+      数字: ~255ms/字符
     """
     import jieba
     import unicodedata
@@ -3066,9 +3071,9 @@ def _estimate_duration_jieba(text_zh: str) -> float:
     clean_text = text_zh
     for m in _URL_PATTERN.finditer(text_zh):
         url_str = m.group()
-        # URL 逐字母朗读：每个字母/符号约 280ms
+        # URL 逐字母朗读：每个字母/符号约 155ms
         url_chars = sum(1 for c in url_str if c.isalnum() or c in './-_:')
-        url_ms += url_chars * 280
+        url_ms += url_chars * 155
         clean_text = clean_text.replace(url_str, '', 1)
 
     words = jieba.lcut(clean_text)
@@ -3077,7 +3082,7 @@ def _estimate_duration_jieba(text_zh: str) -> float:
         # 跳过纯标点/空白
         meaningful = [c for c in word if not unicodedata.category(c).startswith(('P', 'Z', 'C'))]
         if not meaningful:
-            total_ms += 50  # 标点停顿
+            total_ms += 164  # 标点停顿
             continue
 
         zh_count = sum(1 for c in meaningful if '\u4e00' <= c <= '\u9fff')
@@ -3086,20 +3091,20 @@ def _estimate_duration_jieba(text_zh: str) -> float:
         if zh_count > 0:
             # 中文词：按词长分配
             if zh_count == 1:
-                total_ms += 200
+                total_ms += 212
             elif zh_count == 2:
-                total_ms += 380
+                total_ms += 479
             elif zh_count == 3:
-                total_ms += 530
+                total_ms += 679
             else:
-                total_ms += zh_count * 150
+                total_ms += zh_count * 240
         if other_count > 0:
             # 英文/数字：比纯中文慢（TTS 需要切换语言）
             digits = sum(1 for c in meaningful if c.isdigit())
             letters = other_count - digits
-            total_ms += letters * 150 + digits * 120
+            total_ms += letters * 116 + digits * 255
 
-    return total_ms
+    return max(0, total_ms - 63)  # 校准截距: -63ms (Ridge 回归拟合)
 
 
 def _identify_high_cps_segments(
@@ -3121,7 +3126,7 @@ def _identify_high_cps_segments(
             continue
         target_sec = target_ms / 1000.0
         estimated_cps = zh_chars / target_sec
-        estimated_ms = _estimate_duration_jieba(text_zh) * 1.1  # 含停顿
+        estimated_ms = _estimate_duration_jieba(text_zh)  # 校准后参数已含停顿
         ratio = estimated_ms / target_ms if target_ms > 0 else 0
         if estimated_cps > cps_threshold or ratio > 1.2:
             high_cps.append(i)
@@ -3147,7 +3152,7 @@ def _identify_low_cps_segments(
             continue
         target_sec = target_ms / 1000.0
         estimated_cps = zh_chars / target_sec
-        estimated_ms = _estimate_duration_jieba(text_zh) * 1.1
+        estimated_ms = _estimate_duration_jieba(text_zh)  # 校准后参数已含停顿
         ratio = estimated_ms / target_ms if target_ms > 0 else 0
         if estimated_cps < cps_threshold or ratio < 0.7:
             low_cps.append(i)
@@ -3282,7 +3287,7 @@ async def _post_tts_calibrate(
         # 计算新的 rate
         rate = 1.0
         if target_dur_ms > 0:
-            estimated_tts_ms = _estimate_duration_jieba(text_zh) * 1.3
+            estimated_tts_ms = _estimate_duration_jieba(text_zh)  # 校准后参数已含韵律修正
             if estimated_tts_ms > 0:
                 rate = estimated_tts_ms / target_dur_ms
         global_speed = config.get("global_speed", 1.0)
@@ -4509,7 +4514,7 @@ def _select_best_candidate(
         # 分词估算时长，选最接近目标的
         scored = []
         for cand in valid:
-            est_ms = _estimate_duration_jieba(cand) * 1.1  # 含停顿
+            est_ms = _estimate_duration_jieba(cand)  # 校准后参数已含停顿
             diff = abs(est_ms - target_ms)
             over = est_ms > target_ms  # 是否超出目标
             scored.append((cand, est_ms, diff, over))

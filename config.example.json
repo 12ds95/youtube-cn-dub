@@ -27,7 +27,8 @@
     "two_pass": false,
     "isometric": 0,
     "isometric_cps_threshold": 5.5,
-    "__isometric 说明__": "等时多候选翻译: 0=禁用, 3=为高CPS段生成3个长度变体自动选优（减少调速需求）"
+    "isometric_expand_cps_threshold": 3.5,
+    "__isometric 说明__": "等时多候选翻译: 0=禁用, 3=为CPS超标段生成3个长度变体自动选优。shrink(>5.5)缩短 + expand(<3.5)扩展，双向优化减少调速需求"
   },
 
   "__=== TTS 配音引擎 ===__": "",
@@ -122,7 +123,17 @@
 
   "__=== 时间线对齐增强 ===__": "",
   "alignment": {
-    "__说明__": "TTS 稍超目标时长时的处理策略: 间隙借用 > 视频减速 > 截断",
+    "__说明__": "TTS 时间轴对齐策略。atempo_disabled=true 时用 TTS 原生语速控制替代 ffmpeg atempo 后处理，消除机械调速感",
+    "atempo_disabled": true,
+    "__atempo_disabled 说明__": "true=TTS 原生 rate 控制(自然), false=ffmpeg atempo 后处理(旧模式)",
+    "tts_rate_range": [0.80, 1.35],
+    "__tts_rate_range 说明__": "TTS 原生 rate 安全区间, edge-tts 支持 0.5-2.0, 推荐 0.80-1.35",
+    "overflow_tolerance": 0.10,
+    "__overflow_tolerance 说明__": "允许 TTS 超目标时长此比例不截断 (0.10=10%)",
+    "feedback_loop": true,
+    "__feedback_loop 说明__": "试发-反馈闭环: TTS 后测实际时长, 偏差大的段用精确 rate 重生成",
+    "feedback_tolerance": 0.15,
+    "__feedback_tolerance 说明__": "闭环触发阈值: 实测偏差 >15% 时重新生成",
     "gap_borrowing": false,
     "max_borrow_ms": 300,
     "video_slowdown": false,

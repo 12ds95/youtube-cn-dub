@@ -229,9 +229,9 @@ DEFAULT_CONFIG = {
         "system_prompt": (           # 翻译 system prompt（一般无需修改）
             "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。"
             "要求：1)翻译准确流畅，符合中文表达习惯；"
-            "2)领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON、Docker、Kubernetes 等）；"
-            "3)翻译正确性优先于字数控制——宁可译文稍长，也不要为凑字数而曲解原意；"
-            "4)翻译要适合做视频配音朗读，语句通顺自然；"
+            "2)计算机领域缩写保留英文原词（如 API、SDK、HTTP、GPU 等），但不要加括号注音（禁止写成'四元数（Quaternions）'这种形式）；"
+            "3)忠实原文语义，不要为缩短字数而曲解原意，也不要过度扩充；"
+            "4)翻译要适合做视频配音朗读，语句通顺自然，短句为主；"
             "5)只输出翻译结果，不要解释。"
         ),
         "batch_size": 8,             # 每批翻译的句子数（过大可能导致幻觉重复）
@@ -241,6 +241,7 @@ DEFAULT_CONFIG = {
         "two_pass": False,           # 两步翻译: Pass1 忠实直译 → Pass2 配音改编（API 成本翻倍）
         "isometric": 0,              # 等时多候选翻译: 0=关闭, 3=为高CPS段生成3个长度变体自动选优
         "isometric_cps_threshold": 5.5,  # 估算CPS超过此值才触发多候选（自然中文 3.5-6.0）
+        "isometric_expand_cps_threshold": 3.5,  # CPS低于此值触发多候选扩展
     },
 
     # ── TTS 配音引擎 ──
@@ -302,6 +303,11 @@ DEFAULT_CONFIG = {
         "max_borrow_ms": 300,        # 最大借用时长 (ms)，防止段间重叠
         "video_slowdown": False,     # 视频减速: TTS 超时≤15%且无法借用时，对视频段施加减速而非截断音频
         "max_slowdown_factor": 0.85, # 最大减速因子 (0.85 = 视频播放速度降至 85%)
+        "atempo_disabled": True,     # 禁用 ffmpeg atempo 后处理调速，改用 TTS 原生 rate 控制
+        "tts_rate_range": [0.80, 1.35],  # TTS 原生 rate 安全区间（edge-tts 支持 0.5-2.0）
+        "overflow_tolerance": 0.10,  # 允许 TTS 超目标时长此比例不截断（0.10 = 10%）
+        "feedback_loop": True,       # 启用试发-反馈闭环：TTS 后测时长，偏差大则重生成
+        "feedback_tolerance": 0.15,  # 闭环触发阈值：实测偏差 > 15% 时重新生成
     },
     "skip_steps": [],                # 跳过指定步骤（按执行顺序）:
                                      #   标准流程(7/8步): download / extract / separate / transcribe / translate / subtitle / tts / merge
@@ -1486,8 +1492,8 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             f"一行一句，不要合并或拆分。\n"
             f"{hint_line}\n"
             f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
-            f"领域专业术语（如 API、GPU、LLM 等）保留英文原词。"
-            f"翻译正确性优先于字数匹配。\n\n{user_msg}"
+            f"计算机缩写保留英文原词，不加括号注音。"
+            f"忠实原文语义，不要曲解也不要过度扩充。\n\n{user_msg}"
         )
 
         payload = {
@@ -1635,6 +1641,13 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         else:
             print(f"  ✅ 等时翻译: 全部段 CPS 合规，无需多候选")
 
+        # ── 等时扩展：低 CPS 段多候选扩展 ──
+        expand_threshold = llm_config.get("isometric_expand_cps_threshold", 3.5)
+        low_cps = _identify_low_cps_segments(result, expand_threshold)
+        if low_cps:
+            print(f"  📐 等时扩展: {len(low_cps)}/{len(result)} 段估算 CPS < {expand_threshold}，生成多候选...")
+            result = _isometric_expand_batch(result, low_cps, llm_config)
+
     return result
 
 
@@ -1652,7 +1665,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "你是专业的英中翻译引擎。请逐句忠实翻译以下英文，要求：\n"
         "1) 保留原文所有信息点，不遗漏不添加\n"
         "2) 直译为主，保持与原文的一一对应关系\n"
-        "3) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
+        "3) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
         "4) 只输出翻译结果，不要解释"
     )
     # 清除外部模板，Pass 1 使用固定 prompt
@@ -1678,8 +1691,8 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "要求：\n"
         "1) 保持原文语义完整，不得遗漏信息\n"
         "2) 使表达更口语化、节奏更适合朗读\n"
-        "3) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
-        "4) 翻译正确性优先于字数匹配——宁可稍长，不要曲解原意\n"
+        "3) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "4) 忠实原文语义，不要为凑字数曲解也不要过度扩充\n"
         "5) 译文长度尽量匹配参考字数（用于控制配音时长）\n"
         "6) 每句保持 [编号] 格式，一行一句\n"
         "7) 不要输出解释，只输出改编结果"
@@ -1762,6 +1775,13 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         else:
             print(f"  ✅ 等时翻译: 全部段 CPS 合规，无需多候选")
 
+        # ── 等时扩展：低 CPS 段多候选扩展（Pass 2 之后）──
+        expand_threshold = llm_config.get("isometric_expand_cps_threshold", 3.5)
+        low_cps = _identify_low_cps_segments(final_results, expand_threshold)
+        if low_cps:
+            print(f"  📐 等时扩展: {len(low_cps)}/{len(final_results)} 段估算 CPS < {expand_threshold}，生成多候选...")
+            final_results = _isometric_expand_batch(final_results, low_cps, llm_config)
+
     return final_results
 
 
@@ -1778,7 +1798,7 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
         target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
         user_content = (
             f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注。"
-            f"领域专业术语保留英文原词。翻译正确性优先于字数匹配。）\n{seg['text']}"
+            f"计算机缩写保留英文原词，不加括号注音。）\n{seg['text']}"
         )
         for attempt in range(max_retries):
             try:
@@ -2396,9 +2416,11 @@ async def _generate_tts_segments(
                 if estimated_tts_ms > 0:
                     raw_ratio = estimated_tts_ms / target_dur_ms
                     rate = raw_ratio
-            # 应用全局语速倍率
+            # 应用全局语速倍率，TTS 原生 rate 区间由 alignment 配置控制
             global_speed = (config or {}).get("global_speed", 1.0)
-            rate = max(0.85, min(1.20, rate * global_speed))
+            align_cfg = (config or {}).get("alignment", {})
+            rate_range = align_cfg.get("tts_rate_range", [0.80, 1.35])
+            rate = max(rate_range[0], min(rate_range[1], rate * global_speed))
             all_items.append({
                 "idx": idx, "text_zh": text_zh, "rate": rate,
                 "raw_ratio": raw_ratio, "target_dur_ms": target_dur_ms
@@ -2642,6 +2664,19 @@ async def _generate_tts_segments(
                   + (f"，尝试下一个引擎..." if not is_last else "，引擎链已用尽"))
             print(f"     📄 失败记录: {failure_json}")
 
+    # ── 时长反馈闭环：测量实际 TTS 时长，偏差大的段用精确 rate 重生成 ──
+    if success_engine:
+        feedback_tol = (config or {}).get("alignment", {}).get("feedback_tolerance", 0.15)
+        await _tts_with_duration_feedback(
+            all_items, segments, tts_dir, engine, resolved_voice,
+            config=config, concurrency=concurrency, tolerance=feedback_tol,
+        )
+        # ── LLM 闭环：rate 仍无法补偿的段，用实测时长精确调整译文 ──
+        await _llm_duration_feedback(
+            all_items, segments, tts_dir, engine, resolved_voice,
+            config=config, concurrency=concurrency, deviation_threshold=0.20,
+        )
+
     # 最终兜底：所有引擎都失败的片段填充静音
     if not success_engine:
         silence_count = 0
@@ -2675,6 +2710,289 @@ def _backup_tts(tts_dir: Path, backup_dir: Path, all_items: List[dict]):
             count += 1
     if count:
         print(f"     💾 已备份 {count} 个 TTS 片段到 {backup_dir.name}/")
+
+
+async def _tts_with_duration_feedback(
+    items: List[dict], segments: List[dict], tts_dir: Path,
+    engine, voice: str, config: dict = None,
+    concurrency: int = 5, tolerance: float = 0.15,
+):
+    """对偏差较大的段进行 TTS 时长反馈闭环。
+
+    测量每段 TTS 实际时长，偏离目标 > tolerance 的段用精确 rate 重新生成。
+    仅重试 1 次，避免 API 过载。
+    """
+    from pydub import AudioSegment as PydubSegment
+
+    align_cfg = (config or {}).get("alignment", {})
+    if not align_cfg.get("feedback_loop", True):
+        return
+    rate_range = align_cfg.get("tts_rate_range", [0.80, 1.35])
+
+    # 测量实际时长 vs 目标时长
+    retry_items = []
+    for item in items:
+        idx = item["idx"]
+        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+        if not tts_path.exists() or tts_path.stat().st_size == 0:
+            continue
+        target_dur_ms = item.get("target_dur_ms", 0)
+        if target_dur_ms <= 0:
+            continue
+        try:
+            tts_audio = PydubSegment.from_mp3(str(tts_path))
+            actual_ms = len(tts_audio)
+        except Exception:
+            continue
+        if actual_ms <= 0:
+            continue
+        deviation = abs(actual_ms - target_dur_ms) / target_dur_ms
+        if deviation > tolerance:
+            # 计算精确 rate: actual/target = 当前倍率，需要 rate 来补偿
+            corrected_rate = actual_ms / target_dur_ms
+            corrected_rate = max(rate_range[0], min(rate_range[1], corrected_rate))
+            retry_items.append({
+                "idx": idx,
+                "text_zh": item["text_zh"],
+                "rate": corrected_rate,
+                "raw_ratio": item.get("raw_ratio", 1.0),
+                "target_dur_ms": target_dur_ms,
+                "_feedback_actual_ms": actual_ms,
+                "_feedback_deviation": round(deviation, 3),
+            })
+
+    if not retry_items:
+        return
+
+    print(f"     🔄 时长反馈闭环: {len(retry_items)} 段偏差 >{tolerance*100:.0f}%，精确 rate 重生成...")
+
+    # 删除旧文件，重新生成
+    for item in retry_items:
+        old_path = tts_dir / f"seg_{item['idx']:04d}.mp3"
+        if old_path.exists():
+            old_path.unlink()
+
+    try:
+        await engine.synthesize_batch(retry_items, tts_dir, voice, concurrency)
+    except Exception as e:
+        print(f"     ⚠️  闭环重生成部分失败: {e}")
+
+    # 统计改善效果
+    improved = 0
+    for item in retry_items:
+        tts_path = tts_dir / f"seg_{item['idx']:04d}.mp3"
+        if not tts_path.exists() or tts_path.stat().st_size == 0:
+            continue
+        try:
+            new_audio = PydubSegment.from_mp3(str(tts_path))
+            new_ms = len(new_audio)
+            new_deviation = abs(new_ms - item["target_dur_ms"]) / item["target_dur_ms"]
+            if new_deviation < item["_feedback_deviation"]:
+                improved += 1
+        except Exception:
+            pass
+
+    print(f"     ✅ 闭环完成: {improved}/{len(retry_items)} 段时长改善")
+
+    # 保存反馈审计日志
+    try:
+        audit_dir = tts_dir.parent / "audit"
+        audit_dir.mkdir(exist_ok=True)
+        feedback_log = [{
+            "idx": item["idx"],
+            "target_ms": item["target_dur_ms"],
+            "before_ms": item["_feedback_actual_ms"],
+            "deviation": item["_feedback_deviation"],
+            "corrected_rate": round(item["rate"], 3),
+        } for item in retry_items]
+        with open(audit_dir / "tts_feedback_log.json", "w", encoding="utf-8") as f:
+            json.dump(feedback_log, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+async def _llm_duration_feedback(
+    items: List[dict], segments: List[dict], tts_dir: Path,
+    engine, voice: str, config: dict = None,
+    concurrency: int = 5, deviation_threshold: float = 0.20,
+):
+    """闭环 LLM 反馈：用 TTS 实测时长驱动译文调整。
+
+    在 rate 反馈闭环之后，对仍偏差 > deviation_threshold 的段：
+    1. 测量实际 TTS 时长（精确值，非估算）
+    2. 计算目标字数 = 当前字数 × (target_ms / actual_ms)
+    3. 让 LLM 调整译文到目标字数
+    4. 用调整后的译文重新生成 TTS
+
+    比 Phase 3 预检（基于 jieba 估算）精确得多。
+    """
+    from pydub import AudioSegment as PydubSegment
+
+    align_cfg = (config or {}).get("alignment", {})
+    if not align_cfg.get("feedback_loop", True):
+        return
+
+    llm_config = (config or {}).get("llm")
+    if not llm_config:
+        return
+    api_url = llm_config.get("api_url", "").rstrip("/")
+    api_key = llm_config.get("api_key", "")
+    model = llm_config.get("model", "")
+    if not api_key or not model:
+        return
+
+    rate_range = align_cfg.get("tts_rate_range", [0.80, 1.35])
+
+    # URL 模式：含域名的文本不适合 LLM 精简
+    _url_pat = re.compile(
+        r'(?:https?://)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}'
+    )
+
+    # 重新测量所有段的实际 TTS 时长，找出仍偏差大的
+    outliers = []
+    for item in items:
+        idx = item["idx"]
+        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+        if not tts_path.exists() or tts_path.stat().st_size == 0:
+            continue
+        target_dur_ms = item.get("target_dur_ms", 0)
+        if target_dur_ms <= 0:
+            continue
+        try:
+            tts_audio = PydubSegment.from_mp3(str(tts_path))
+            actual_ms = len(tts_audio)
+        except Exception:
+            continue
+        if actual_ms <= 0:
+            continue
+        deviation = abs(actual_ms - target_dur_ms) / target_dur_ms
+        if deviation > deviation_threshold:
+            text_zh = item["text_zh"]
+            # 跳过含 URL 的超速段
+            if actual_ms > target_dur_ms and _url_pat.search(text_zh):
+                continue
+            zh_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text_zh))
+            if zh_chars < 2:
+                continue
+            # 根据实测时长精确计算目标字数
+            target_chars = max(2, int(zh_chars * target_dur_ms / actual_ms))
+            outliers.append({
+                "idx": idx,
+                "text_zh": text_zh,
+                "actual_ms": actual_ms,
+                "target_dur_ms": target_dur_ms,
+                "deviation": round(deviation, 3),
+                "current_chars": zh_chars,
+                "target_chars": target_chars,
+                "action": "精简" if actual_ms > target_dur_ms else "扩展",
+            })
+
+    if not outliers:
+        return
+
+    print(f"     🔄 LLM 时长闭环: {len(outliers)} 段偏差 >{deviation_threshold*100:.0f}%，"
+          f"用实测时长调整译文...")
+
+    import httpx
+    endpoint = f"{api_url}/chat/completions" if "/chat/completions" not in api_url else api_url
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    adjusted_count = 0
+    regen_items = []
+    for out in outliers:
+        idx = out["idx"]
+        seg = segments[idx]
+        old_zh = out["text_zh"]
+        action = out["action"]
+        actual = out["actual_ms"]
+        target = out["target_dur_ms"]
+        target_chars = out["target_chars"]
+
+        prompt = (
+            f"当前中文译文合成语音时长为 {actual}ms，目标时长为 {target}ms。\n"
+            f"请将以下译文{action}到约 {target_chars} 字，保持核心语义准确：\n{old_zh}"
+        )
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": (
+                        "你是配音字幕调整助手。根据实际语音时长反馈调整译文长度，"
+                        "输出纯文本，不要添加任何解释、引号或标点符号以外的内容。"
+                    )},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 256,
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                new_zh = resp.json()["choices"][0]["message"]["content"].strip()
+                # 多层清洗 LLM 输出 (README 踩坑 #12)
+                new_zh = _strip_think_block(new_zh)
+                new_zh = _strip_markdown(new_zh, seg.get("text_en", seg.get("text", "")))
+                if new_zh and len(new_zh) >= 2 and new_zh != old_zh:
+                    # 忠实度校验: 防止 LLM 编造内容 (devlog/2026-03-29-expand-llm-garbage.md)
+                    if not _check_refine_fidelity(old_zh, new_zh, min_overlap=0.25):
+                        print(f"        ⚠️ 段落 {idx} 忠实度不足，跳过")
+                        continue
+                    # 邻段去重: 防止 LLM 偷懒复制相邻段
+                    if _is_duplicate_of_neighbors(new_zh, idx, segments):
+                        print(f"        ⚠️ 段落 {idx} 与相邻段重复，跳过")
+                        continue
+                    # 更新 segments 和对应 item
+                    segments[idx]["text_zh"] = new_zh
+                    for item in items:
+                        if item["idx"] == idx:
+                            item["text_zh"] = new_zh
+                            break
+                    adjusted_count += 1
+                    # 准备重新生成 TTS
+                    new_est_ms = _estimate_duration_jieba(new_zh)
+                    rate = new_est_ms / target if target > 0 and new_est_ms > 0 else 1.0
+                    rate = max(rate_range[0], min(rate_range[1], rate))
+                    regen_items.append({
+                        "idx": idx,
+                        "text_zh": new_zh,
+                        "rate": rate,
+                        "target_dur_ms": target,
+                    })
+        except Exception as e:
+            print(f"        ⚠️ 段落 {idx} LLM {action}失败: {e}")
+
+    if not regen_items:
+        return
+
+    # 删除旧 TTS 并重新生成
+    for item in regen_items:
+        old_path = tts_dir / f"seg_{item['idx']:04d}.mp3"
+        if old_path.exists():
+            old_path.unlink()
+    try:
+        await engine.synthesize_batch(regen_items, tts_dir, voice, concurrency)
+    except Exception as e:
+        print(f"     ⚠️ LLM 闭环重生成部分失败: {e}")
+
+    print(f"     ✅ LLM 闭环完成: {adjusted_count} 段译文调整并重新合成")
+
+    # 保存审计日志
+    try:
+        audit_dir = tts_dir.parent / "audit"
+        audit_dir.mkdir(exist_ok=True)
+        llm_log = [{
+            "idx": out["idx"],
+            "action": out["action"],
+            "target_ms": out["target_dur_ms"],
+            "actual_ms": out["actual_ms"],
+            "deviation": out["deviation"],
+            "current_chars": out["current_chars"],
+            "target_chars": out["target_chars"],
+        } for out in outliers]
+        with open(audit_dir / "llm_duration_feedback_log.json", "w", encoding="utf-8") as f:
+            json.dump(llm_log, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 async def _smart_retry_engine(engine, count_failed_fn, tts_dir, voice,
@@ -2907,6 +3225,32 @@ def _identify_high_cps_segments(
     return high_cps
 
 
+def _identify_low_cps_segments(
+    segments: List[dict], cps_threshold: float = 3.5,
+) -> List[int]:
+    """识别估算 CPS 过低的段索引（用于等时扩展多候选优化）
+
+    使用 _estimate_duration_jieba 估算 TTS 时长，识别翻译过短的段。
+    双条件触发：CPS 低于阈值 或 估算时长/目标时长 < 0.7。
+    """
+    low_cps = []
+    for i, seg in enumerate(segments):
+        text_zh = seg.get("text_zh", "")
+        zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
+        if zh_chars < 3:
+            continue
+        target_ms = int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
+        if target_ms <= 500:
+            continue
+        target_sec = target_ms / 1000.0
+        estimated_cps = zh_chars / target_sec
+        estimated_ms = _estimate_duration_jieba(text_zh) * 1.1
+        ratio = estimated_ms / target_ms if target_ms > 0 else 0
+        if estimated_cps < cps_threshold or ratio < 0.7:
+            low_cps.append(i)
+    return low_cps
+
+
 def _measure_speed_ratios(
     segments: List[dict], tts_dir: Path, threshold: float = 1.5,
 ) -> List[dict]:
@@ -3039,7 +3383,9 @@ async def _post_tts_calibrate(
             if estimated_tts_ms > 0:
                 rate = estimated_tts_ms / target_dur_ms
         global_speed = config.get("global_speed", 1.0)
-        rate = max(0.85, min(1.20, rate * global_speed))
+        align_cfg = config.get("alignment", {})
+        rate_range = align_cfg.get("tts_rate_range", [0.80, 1.35])
+        rate = max(rate_range[0], min(rate_range[1], rate * global_speed))
         tts_items.append({"idx": idx, "text_zh": text_zh, "rate": rate})
 
     # 使用 edge-tts 逐段重新生成
@@ -3097,15 +3443,16 @@ def _is_in_silence(position_ms: int, duration_ms: int,
 def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
                            cpu_threads: int = 0, global_speed: float = 1.0,
                            config: dict = None) -> Path:
-    """阶段 C: atempo 调速 + 叠加拼接 → chinese_dub.wav
+    """阶段 C: 时间线对齐 → chinese_dub.wav
 
-    语速策略:
-      1. 收集每段 TTS 时长 / 目标时长 = raw_ratio
-      2. 计算全局中位数基线，各段按 40% 向基线混合
-      3. 指数平滑（α=0.3）消除相邻段跳变
-      4. 钳制到 [SPEED_MIN, SPEED_MAX] 区间，保证听感自然
-      5. 超出区间的片段：过短用静音居中填充，过长截断
-    断点恢复: 调速后的 seg_XXXX_adj.wav 会被缓存，重跑时自动跳过
+    两种模式（由 alignment.atempo_disabled 控制）:
+      atempo_disabled=True (默认):
+        TTS 原生 rate 已在生成阶段补偿时长偏差，这里直接叠加:
+        - 偏短段: 居中静音填充
+        - 轻微超时 (≤overflow_tolerance): 允许溢出，不截断
+        - 超时 > tolerance: Gap Borrowing → Video Slowdown → 截断
+      atempo_disabled=False (旧模式):
+        ffmpeg atempo 后处理调速，与之前行为一致
     """
     from pydub import AudioSegment as PydubSegment
 
@@ -3114,8 +3461,10 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
     original_audio = PydubSegment.from_wav(str(audio_path))
     total_ms = len(original_audio)
 
-    # ── Gap Borrowing 配置 ──
+    # ── 配置 ──
     align_cfg = (config or {}).get("alignment", {})
+    atempo_disabled = align_cfg.get("atempo_disabled", True)
+    overflow_tolerance = align_cfg.get("overflow_tolerance", 0.10)
     gap_borrowing = align_cfg.get("gap_borrowing", False)
     max_borrow_ms = align_cfg.get("max_borrow_ms", 300)
     silence_regions = []
@@ -3123,15 +3472,14 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
         silence_regions = _detect_silence_regions(audio_path)
         print(f"     间隙借用已启用 (上限 {max_borrow_ms}ms, 检测到 {len(silence_regions)} 个静音区间)")
 
-    # ── Video Slowdown 配置 ──
     video_slowdown = align_cfg.get("video_slowdown", False)
     max_slowdown_factor = align_cfg.get("max_slowdown_factor", 0.85)
-    slowdown_segments = []  # 记录需要视频减速的段: {"idx", "start", "end", "factor"}
-    borrow_events = []      # 记录借用事件用于汇总打印
-    slowdown_rejected = 0   # 超出减速上限被截断的段数
+    slowdown_segments = []
+    borrow_events = []
+    slowdown_rejected = 0
 
     # 计算段间间隙 (用于 gap borrowing)
-    gap_after = []  # gap_after[i] = segments[i+1].start - segments[i].end (ms)
+    gap_after = []
     for idx in range(len(segments)):
         if idx < len(segments) - 1:
             gap = int(segments[idx + 1]["start"] * 1000) - int(segments[idx]["end"] * 1000)
@@ -3139,15 +3487,14 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
         else:
             gap_after.append(0)
 
-    # ── 语速目标区间 ──
-    SPEED_MIN = 1.00   # 不降速 (降速听感比略微加速差得多)，低于此值用静音填充
-    SPEED_MAX = 1.25   # 高于此值截断而非极端加速（听起来太快）
-
-    print(f"     时间线对齐中 (目标语速区间: {SPEED_MIN:.2f}x ~ {SPEED_MAX:.2f}x)...")
+    mode_label = "直接叠加(无atempo)" if atempo_disabled else "atempo调速"
+    print(f"     时间线对齐中 ({mode_label})...")
     final_audio = PydubSegment.silent(duration=total_ms, frame_rate=16000)
-    stats = {"adjusted": 0, "skipped": 0, "padded": 0, "clamped_fast": 0, "clamped_slow": 0, "borrowed": 0}
+    stats = {"adjusted": 0, "skipped": 0, "padded": 0, "truncated": 0,
+             "clamped_fast": 0, "clamped_slow": 0, "borrowed": 0,
+             "within_tolerance": 0, "atempo_fallback": 0}
 
-    # First pass: collect all raw speed ratios
+    # ── 第一遍: 收集 raw_ratio 用于报告 ──
     raw_ratios = []
     for idx, seg in enumerate(segments):
         tts_path = tts_dir / f"seg_{idx:04d}.mp3"
@@ -3159,250 +3506,376 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
         tts_audio = PydubSegment.from_mp3(str(tts_path))
         raw_ratios.append(len(tts_audio) / target_dur)
 
-    # Compute global baseline (trimmed mean — 去掉头尾各 10% 减少离群值影响)
-    valid_ratios = [r for r in raw_ratios if r is not None and r > 0]
-    if valid_ratios:
-        valid_sorted = sorted(valid_ratios)
-        trim = max(1, len(valid_sorted) // 10)
-        trimmed = valid_sorted[trim:-trim] if len(valid_sorted) > 4 else valid_sorted
-        baseline = sum(trimmed) / len(trimmed)
-    else:
-        baseline = 1.0
-    median_ratio = baseline  # 兼容后续 speed_report 输出
-
-    # Adaptive blend toward baseline (偏离大→强拉; 偏离小→信任原值)
-    SMOOTH_ALPHA = 0.3  # exponential smoothing factor
-    blended_ratios = []
-    for r in raw_ratios:
-        if r is None:
-            blended_ratios.append(None)
-        else:
-            deviation = abs(r - baseline)
-            weight = 0.2 if deviation < 0.15 else (0.6 if deviation > 0.3 else 0.4)
-            blended_ratios.append(r * (1 - weight) + baseline * weight)
-
-    # Bidirectional exponential smoothing (前向+后向取平均，消除warm-up效应)
-    forward = list(blended_ratios)
-    prev_valid = None
-    for i, r in enumerate(forward):
-        if r is not None:
-            if prev_valid is not None:
-                forward[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
-            prev_valid = forward[i]
-
-    backward = list(blended_ratios)
-    prev_valid = None
-    for i in range(len(backward) - 1, -1, -1):
-        r = backward[i]
-        if r is not None:
-            if prev_valid is not None:
-                backward[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
-            prev_valid = backward[i]
-
-    smoothed_ratios = []
-    for f, b in zip(forward, backward):
-        if f is None:
-            smoothed_ratios.append(None)
-        else:
-            smoothed_ratios.append((f + b) / 2)
-
-    # 钳制到目标区间 [SPEED_MIN, SPEED_MAX]
-    clamped_ratios = []
-    for r in smoothed_ratios:
-        if r is None:
-            clamped_ratios.append(None)
-        else:
-            clamped_ratios.append(max(SPEED_MIN, min(SPEED_MAX, r)))
-
-    # 应用全局语速倍率
-    if global_speed != 1.0:
-        clamped_ratios = [
-            max(SPEED_MIN, min(SPEED_MAX, r * global_speed)) if r is not None else None
-            for r in clamped_ratios
-        ]
-
-    # 统计钳制情况
-    for i, (sm, cl) in enumerate(zip(smoothed_ratios, clamped_ratios)):
-        if sm is not None and cl is not None:
-            if sm > SPEED_MAX:
-                stats["clamped_fast"] += 1
-            elif sm < SPEED_MIN:
-                stats["clamped_slow"] += 1
-
-    # 计算钳制后的实际平均语速
-    clamped_valid = [r for r in clamped_ratios if r is not None]
-    avg_speed = sum(clamped_valid) / max(1, len(clamped_valid))
-    print(f"     全局语速基线: {median_ratio:.2f}x → 钳制后平均: {avg_speed:.2f}x"
-          f" (自适应混合, 双向平滑α={SMOOTH_ALPHA})")
-    if stats["clamped_fast"] or stats["clamped_slow"]:
-        print(f"     钳制: {stats['clamped_fast']} 段过快被限速,"
-              f" {stats['clamped_slow']} 段过慢被提速")
-
-    # ── 保存调速报告（断点恢复时可查看） ──
-    import statistics as _stats_mod
-    clamped_std = round(_stats_mod.stdev(clamped_valid), 4) if len(clamped_valid) > 1 else 0.0
+    # 统计 raw_ratio 分布
     raw_valid = [r for r in raw_ratios if r is not None]
-    raw_std = round(_stats_mod.stdev(raw_valid), 4) if len(raw_valid) > 1 else 0.0
-    outlier_count = sum(1 for r in raw_valid if r > 1.4)
-    speed_report = {
-        "baseline": round(median_ratio, 4),
-        "avg_clamped": round(avg_speed, 4),
-        "std_clamped": clamped_std,
-        "std_raw": raw_std,
-        "outliers_gt_1.4": outlier_count,
-        "speed_range": [SPEED_MIN, SPEED_MAX],
-        "total_segments": len(segments),
-        "clamped_fast": stats["clamped_fast"],
-        "clamped_slow": stats["clamped_slow"],
-        "gap_borrowing": gap_borrowing,
-        "borrow_events": borrow_events if borrow_events else [],
-        "video_slowdown": video_slowdown,
-        "slowdown_rejected": slowdown_rejected,
-    }
-    with open(_audit_dir(output_dir) / "speed_report.json", "w", encoding="utf-8") as f:
-        json.dump(speed_report, f, ensure_ascii=False, indent=2)
+    if raw_valid:
+        import statistics as _stats_mod
+        raw_mean = sum(raw_valid) / len(raw_valid)
+        raw_std = round(_stats_mod.stdev(raw_valid), 4) if len(raw_valid) > 1 else 0.0
+    else:
+        raw_mean = 1.0
+        raw_std = 0.0
 
-    # ── Phase 1: 并行 ffmpeg atempo 调速 ──
-    # 收集需要调速的任务，然后用 ThreadPoolExecutor 并行执行
-    def _run_atempo(tts_path: Path, adjusted_path: Path, speed: float):
-        """在线程中执行单个 ffmpeg atempo 调速"""
-        if adjusted_path.exists():
-            return True
-        filt = _build_atempo_filter(speed)
-        try:
-            subprocess.run([
-                "ffmpeg", "-i", str(tts_path), "-filter:a", filt,
-                "-ar", "16000", "-ac", "1", str(adjusted_path), "-y"
-            ], capture_output=True, check=True, timeout=30)
-            return True
-        except Exception:
-            return False
+    if atempo_disabled:
+        # ══════════════════════════════════════════════════════════
+        # 新模式: 直接叠加，不做 atempo 后处理
+        # ══════════════════════════════════════════════════════════
+        within_115 = sum(1 for r in raw_valid if 0.85 <= r <= 1.15)
+        within_115_pct = round(within_115 / max(1, len(raw_valid)) * 100, 1)
+        print(f"     raw_ratio 分布: 均值 {raw_mean:.3f}, 标准差 {raw_std},"
+              f" [0.85-1.15] 合规 {within_115_pct}%")
 
-    atempo_tasks = []  # (idx, tts_path, adjusted_path, speed_ratio)
-    for idx, seg in enumerate(segments):
-        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
-        if not tts_path.exists() or tts_path.stat().st_size == 0:
-            continue
-        target_start = int(seg["start"] * 1000)
-        target_dur = int(seg["end"] * 1000) - target_start
-        if target_dur <= 0:
-            continue
-        speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else 1.0
-        raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
-        adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
-        if raw_ratio < SPEED_MIN and speed_ratio < 0.98:
-            atempo_tasks.append((idx, tts_path, adjusted, speed_ratio))
-        elif 0.5 < speed_ratio and speed_ratio != 1.0:
-            atempo_tasks.append((idx, tts_path, adjusted, speed_ratio))
+        for idx, seg in enumerate(segments):
+            tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+            if not tts_path.exists() or tts_path.stat().st_size == 0:
+                stats["skipped"] += 1
+                continue
 
-    # 并行执行所有 atempo 调速（每个都是独立的 ffmpeg subprocess，不受 GIL 影响）
-    max_threads = cpu_threads if cpu_threads > 0 else (os.cpu_count() or 4)
-    atempo_workers = min(max_threads, len(atempo_tasks)) if atempo_tasks else 1
-    atempo_results = {}  # idx -> bool
-    if atempo_tasks:
-        print(f"     并行调速: {len(atempo_tasks)} 段, {atempo_workers} 线程")
-        with ThreadPoolExecutor(max_workers=atempo_workers) as pool:
-            futures = {
-                pool.submit(_run_atempo, tp, ap, sp): idx
-                for idx, tp, ap, sp in atempo_tasks
-            }
-            for future in futures:
-                idx = futures[future]
-                atempo_results[idx] = future.result()
+            tts_audio = PydubSegment.from_mp3(str(tts_path))
+            target_start = int(seg["start"] * 1000)
+            target_dur = int(seg["end"] * 1000) - target_start
 
-    # ── Phase 2: 串行 overlay 拼接 ──
-    for idx, seg in enumerate(segments):
-        tts_path = tts_dir / f"seg_{idx:04d}.mp3"
-        if not tts_path.exists() or tts_path.stat().st_size == 0:
-            stats["skipped"] += 1
-            continue
+            if target_dur <= 0:
+                stats["skipped"] += 1
+                continue
 
-        tts_audio = PydubSegment.from_mp3(str(tts_path))
-        target_start = int(seg["start"] * 1000)
-        target_dur = int(seg["end"] * 1000) - target_start
+            tts_len = len(tts_audio)
 
-        if target_dur <= 0:
-            stats["skipped"] += 1
-            continue
+            if tts_len <= target_dur:
+                # TTS 偏短或刚好: 居中填充静音
+                gap = target_dur - tts_len
+                if gap > 0:
+                    pad_front = gap // 2
+                    padded = PydubSegment.silent(duration=target_dur, frame_rate=16000)
+                    padded = padded.overlay(tts_audio, position=pad_front)
+                    tts_audio = padded
+                    stats["padded"] += 1
+                else:
+                    stats["within_tolerance"] += 1
+            else:
+                # TTS 超时
+                overflow_ms = tts_len - target_dur
+                overflow_ratio = overflow_ms / target_dur
 
-        speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else (len(tts_audio) / target_dur)
-        raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
+                if overflow_ratio <= overflow_tolerance:
+                    # 轻微超时在容忍范围内，不截断
+                    stats["within_tolerance"] += 1
+                else:
+                    # 超出容忍范围，尝试 Gap Borrowing → Video Slowdown → 截断
+                    handled = False
+                    if gap_borrowing and overflow_ms <= max_borrow_ms:
+                        available_gap = gap_after[idx]
+                        borrow_amount = min(overflow_ms, int(available_gap * 0.6), max_borrow_ms)
+                        if borrow_amount >= overflow_ms:
+                            gap_start_ms = int(seg["end"] * 1000)
+                            if _is_in_silence(gap_start_ms, borrow_amount, silence_regions):
+                                handled = True
+                                stats["borrowed"] += 1
+                                borrow_events.append({"idx": idx, "overflow_ms": overflow_ms,
+                                                      "borrow_ms": borrow_amount})
+                    if not handled:
+                        if video_slowdown and overflow_ratio <= 0.15:
+                            factor = target_dur / tts_len
+                            if factor >= max_slowdown_factor:
+                                slowdown_segments.append({
+                                    "idx": idx, "start": seg["start"],
+                                    "end": seg["end"], "factor": round(factor, 3),
+                                    "overflow_ms": overflow_ms,
+                                })
+                                handled = True
+                            else:
+                                slowdown_rejected += 1
+                        if not handled:
+                            # 最后手段分级: per-segment atempo 降级 → 截断
+                            speed_needed = tts_len / target_dur
+                            if speed_needed <= 1.35:
+                                # 溢出在 atempo 安全范围内，仅对该段做 atempo 调速
+                                adj_path = tts_dir / f"seg_{idx:04d}_adj.wav"
+                                filt = _build_atempo_filter(speed_needed)
+                                try:
+                                    subprocess.run([
+                                        "ffmpeg", "-i", str(tts_path),
+                                        "-filter:a", filt, "-ar", "16000",
+                                        "-ac", "1", str(adj_path), "-y"
+                                    ], capture_output=True, check=True, timeout=30)
+                                    tts_audio = PydubSegment.from_wav(str(adj_path))
+                                    stats["atempo_fallback"] += 1
+                                    handled = True
+                                except Exception:
+                                    pass
+                            if not handled:
+                                tts_audio = tts_audio[:target_dur]
+                                stats["truncated"] += 1
 
-        if raw_ratio < SPEED_MIN and len(tts_audio) > 0:
-            if speed_ratio < 0.98:
+            # 平滑过渡
+            CROSSFADE_MS = 30
+            if len(tts_audio) > CROSSFADE_MS * 2:
+                tts_audio = tts_audio.fade_in(CROSSFADE_MS).fade_out(CROSSFADE_MS)
+
+            if target_start < total_ms:
+                final_audio = final_audio.overlay(tts_audio, position=target_start)
+
+        # 保存速度报告 (无 atempo 模式)
+        outlier_count = sum(1 for r in raw_valid if r > 1.4)
+        speed_report = {
+            "atempo_disabled": True,
+            "baseline": round(raw_mean, 4),
+            "avg_clamped": round(raw_mean, 4),  # 无钳制，等于 raw
+            "std_clamped": 0.0,  # 无 atempo 调速
+            "std_raw": raw_std,
+            "raw_ratio_mean": round(raw_mean, 4),
+            "raw_ratio_within_115_pct": within_115_pct,
+            "outliers_gt_1.4": outlier_count,
+            "overflow_tolerance": overflow_tolerance,
+            "speed_range": [0, 0],  # 无 atempo
+            "total_segments": len(segments),
+            "clamped_fast": 0,
+            "clamped_slow": 0,
+            "padded": stats["padded"],
+            "truncated": stats["truncated"],
+            "atempo_fallback": stats["atempo_fallback"],
+            "within_tolerance": stats["within_tolerance"],
+            "gap_borrowing": gap_borrowing,
+            "borrow_events": borrow_events if borrow_events else [],
+            "video_slowdown": video_slowdown,
+            "slowdown_rejected": slowdown_rejected,
+        }
+        with open(_audit_dir(output_dir) / "speed_report.json", "w", encoding="utf-8") as f:
+            json.dump(speed_report, f, ensure_ascii=False, indent=2)
+
+    else:
+        # ══════════════════════════════════════════════════════════
+        # 旧模式: ffmpeg atempo 后处理调速 (atempo_disabled=False)
+        # ══════════════════════════════════════════════════════════
+        SPEED_MIN = 1.00
+        SPEED_MAX = 1.25
+
+        # Compute global baseline (trimmed mean)
+        if raw_valid:
+            valid_sorted = sorted(raw_valid)
+            trim = max(1, len(valid_sorted) // 10)
+            trimmed = valid_sorted[trim:-trim] if len(valid_sorted) > 4 else valid_sorted
+            baseline = sum(trimmed) / len(trimmed)
+        else:
+            baseline = 1.0
+        median_ratio = baseline
+
+        # Adaptive blend toward baseline
+        SMOOTH_ALPHA = 0.3
+        blended_ratios = []
+        for r in raw_ratios:
+            if r is None:
+                blended_ratios.append(None)
+            else:
+                deviation = abs(r - baseline)
+                weight = 0.2 if deviation < 0.15 else (0.6 if deviation > 0.3 else 0.4)
+                blended_ratios.append(r * (1 - weight) + baseline * weight)
+
+        # Bidirectional exponential smoothing
+        forward = list(blended_ratios)
+        prev_valid = None
+        for i, r in enumerate(forward):
+            if r is not None:
+                if prev_valid is not None:
+                    forward[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
+                prev_valid = forward[i]
+        backward = list(blended_ratios)
+        prev_valid = None
+        for i in range(len(backward) - 1, -1, -1):
+            r = backward[i]
+            if r is not None:
+                if prev_valid is not None:
+                    backward[i] = SMOOTH_ALPHA * prev_valid + (1 - SMOOTH_ALPHA) * r
+                prev_valid = backward[i]
+        smoothed_ratios = []
+        for f, b in zip(forward, backward):
+            if f is None:
+                smoothed_ratios.append(None)
+            else:
+                smoothed_ratios.append((f + b) / 2)
+
+        # Clamp to [SPEED_MIN, SPEED_MAX]
+        clamped_ratios = []
+        for r in smoothed_ratios:
+            if r is None:
+                clamped_ratios.append(None)
+            else:
+                clamped_ratios.append(max(SPEED_MIN, min(SPEED_MAX, r)))
+        if global_speed != 1.0:
+            clamped_ratios = [
+                max(SPEED_MIN, min(SPEED_MAX, r * global_speed)) if r is not None else None
+                for r in clamped_ratios
+            ]
+
+        for i, (sm, cl) in enumerate(zip(smoothed_ratios, clamped_ratios)):
+            if sm is not None and cl is not None:
+                if sm > SPEED_MAX:
+                    stats["clamped_fast"] += 1
+                elif sm < SPEED_MIN:
+                    stats["clamped_slow"] += 1
+
+        clamped_valid = [r for r in clamped_ratios if r is not None]
+        avg_speed = sum(clamped_valid) / max(1, len(clamped_valid))
+        print(f"     全局语速基线: {median_ratio:.2f}x → 钳制后平均: {avg_speed:.2f}x"
+              f" (自适应混合, 双向平滑α={SMOOTH_ALPHA})")
+        if stats["clamped_fast"] or stats["clamped_slow"]:
+            print(f"     钳制: {stats['clamped_fast']} 段过快被限速,"
+                  f" {stats['clamped_slow']} 段过慢被提速")
+
+        # Save speed report (legacy mode)
+        import statistics as _stats_mod
+        clamped_std = round(_stats_mod.stdev(clamped_valid), 4) if len(clamped_valid) > 1 else 0.0
+        outlier_count = sum(1 for r in raw_valid if r > 1.4)
+        speed_report = {
+            "atempo_disabled": False,
+            "baseline": round(median_ratio, 4),
+            "avg_clamped": round(avg_speed, 4),
+            "std_clamped": clamped_std,
+            "std_raw": raw_std,
+            "outliers_gt_1.4": outlier_count,
+            "speed_range": [SPEED_MIN, SPEED_MAX],
+            "total_segments": len(segments),
+            "clamped_fast": stats["clamped_fast"],
+            "clamped_slow": stats["clamped_slow"],
+            "gap_borrowing": gap_borrowing,
+            "borrow_events": borrow_events if borrow_events else [],
+            "video_slowdown": video_slowdown,
+            "slowdown_rejected": slowdown_rejected,
+        }
+        with open(_audit_dir(output_dir) / "speed_report.json", "w", encoding="utf-8") as f:
+            json.dump(speed_report, f, ensure_ascii=False, indent=2)
+
+        # Phase 1: ffmpeg atempo
+        def _run_atempo(tts_path: Path, adjusted_path: Path, speed: float):
+            if adjusted_path.exists():
+                return True
+            filt = _build_atempo_filter(speed)
+            try:
+                subprocess.run([
+                    "ffmpeg", "-i", str(tts_path), "-filter:a", filt,
+                    "-ar", "16000", "-ac", "1", str(adjusted_path), "-y"
+                ], capture_output=True, check=True, timeout=30)
+                return True
+            except Exception:
+                return False
+
+        atempo_tasks = []
+        for idx, seg in enumerate(segments):
+            tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+            if not tts_path.exists() or tts_path.stat().st_size == 0:
+                continue
+            target_start = int(seg["start"] * 1000)
+            target_dur = int(seg["end"] * 1000) - target_start
+            if target_dur <= 0:
+                continue
+            speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else 1.0
+            raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
+            adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
+            if raw_ratio < SPEED_MIN and speed_ratio < 0.98:
+                atempo_tasks.append((idx, tts_path, adjusted, speed_ratio))
+            elif 0.5 < speed_ratio and speed_ratio != 1.0:
+                atempo_tasks.append((idx, tts_path, adjusted, speed_ratio))
+
+        max_threads = cpu_threads if cpu_threads > 0 else (os.cpu_count() or 4)
+        atempo_workers = min(max_threads, len(atempo_tasks)) if atempo_tasks else 1
+        if atempo_tasks:
+            print(f"     并行调速: {len(atempo_tasks)} 段, {atempo_workers} 线程")
+            with ThreadPoolExecutor(max_workers=atempo_workers) as pool:
+                futures = {
+                    pool.submit(_run_atempo, tp, ap, sp): idx
+                    for idx, tp, ap, sp in atempo_tasks
+                }
+                for future in futures:
+                    idx = futures[future]
+
+        # Phase 2: overlay
+        for idx, seg in enumerate(segments):
+            tts_path = tts_dir / f"seg_{idx:04d}.mp3"
+            if not tts_path.exists() or tts_path.stat().st_size == 0:
+                stats["skipped"] += 1
+                continue
+            tts_audio = PydubSegment.from_mp3(str(tts_path))
+            target_start = int(seg["start"] * 1000)
+            target_dur = int(seg["end"] * 1000) - target_start
+            if target_dur <= 0:
+                stats["skipped"] += 1
+                continue
+
+            speed_ratio = clamped_ratios[idx] if clamped_ratios[idx] is not None else (len(tts_audio) / target_dur)
+            raw_ratio = raw_ratios[idx] if raw_ratios[idx] is not None else speed_ratio
+
+            if raw_ratio < SPEED_MIN and len(tts_audio) > 0:
+                if speed_ratio < 0.98:
+                    adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
+                    if adjusted.exists():
+                        tts_audio = PydubSegment.from_wav(str(adjusted))
+                gap = target_dur - len(tts_audio)
+                if gap > 0:
+                    pad_front = gap // 2
+                    padded = PydubSegment.silent(duration=target_dur, frame_rate=16000)
+                    padded = padded.overlay(tts_audio, position=pad_front)
+                    tts_audio = padded
+                stats["padded"] += 1
+            elif 0.5 < speed_ratio and speed_ratio != 1.0:
                 adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
                 if adjusted.exists():
                     tts_audio = PydubSegment.from_wav(str(adjusted))
-            gap = target_dur - len(tts_audio)
-            if gap > 0:
-                pad_front = gap // 2
-                padded = PydubSegment.silent(duration=target_dur, frame_rate=16000)
-                padded = padded.overlay(tts_audio, position=pad_front)
-                tts_audio = padded
-            stats["padded"] += 1
-        elif 0.5 < speed_ratio and speed_ratio != 1.0:
-            adjusted = tts_dir / f"seg_{idx:04d}_adj.wav"
-            if adjusted.exists():
-                tts_audio = PydubSegment.from_wav(str(adjusted))
-                stats["adjusted"] += 1
+                    stats["adjusted"] += 1
 
-        if len(tts_audio) > target_dur:
-            overflow_ms = len(tts_audio) - target_dur
-            borrowed = False
-            # Gap Borrowing: 尝试从后方静音间隙借用时间
-            if gap_borrowing and overflow_ms <= max_borrow_ms:
-                available_gap = gap_after[idx]
-                borrow_amount = min(overflow_ms, int(available_gap * 0.6), max_borrow_ms)
-                if borrow_amount >= overflow_ms:
-                    # 确认间隙区域确实是静音
-                    gap_start_ms = int(seg["end"] * 1000)
-                    if _is_in_silence(gap_start_ms, borrow_amount, silence_regions):
-                        # 允许 TTS 延伸到间隙中，不截断
-                        borrowed = True
-                        stats["borrowed"] += 1
-                        borrow_events.append({"idx": idx, "overflow_ms": overflow_ms,
-                                              "borrow_ms": borrow_amount})
-            if not borrowed:
-                # Video Slowdown: 超时≤15% 且启用时，标记视频减速而非截断音频
-                overflow_ratio = overflow_ms / target_dur if target_dur > 0 else 1.0
-                if video_slowdown and overflow_ratio <= 0.15:
-                    factor = target_dur / len(tts_audio)  # < 1.0, e.g. 0.87
-                    if factor >= max_slowdown_factor:
-                        slowdown_segments.append({
-                            "idx": idx,
-                            "start": seg["start"],
-                            "end": seg["end"],
-                            "factor": round(factor, 3),
-                            "overflow_ms": overflow_ms,
-                        })
-                        # 不截断，让 TTS 保持原长（视频端会减速适配）
+            if len(tts_audio) > target_dur:
+                overflow_ms = len(tts_audio) - target_dur
+                borrowed = False
+                if gap_borrowing and overflow_ms <= max_borrow_ms:
+                    available_gap = gap_after[idx]
+                    borrow_amount = min(overflow_ms, int(available_gap * 0.6), max_borrow_ms)
+                    if borrow_amount >= overflow_ms:
+                        gap_start_ms = int(seg["end"] * 1000)
+                        if _is_in_silence(gap_start_ms, borrow_amount, silence_regions):
+                            borrowed = True
+                            stats["borrowed"] += 1
+                            borrow_events.append({"idx": idx, "overflow_ms": overflow_ms,
+                                                  "borrow_ms": borrow_amount})
+                if not borrowed:
+                    overflow_ratio = overflow_ms / target_dur if target_dur > 0 else 1.0
+                    if video_slowdown and overflow_ratio <= 0.15:
+                        factor = target_dur / len(tts_audio)
+                        if factor >= max_slowdown_factor:
+                            slowdown_segments.append({
+                                "idx": idx, "start": seg["start"],
+                                "end": seg["end"], "factor": round(factor, 3),
+                                "overflow_ms": overflow_ms,
+                            })
+                        else:
+                            slowdown_rejected += 1
+                            tts_audio = tts_audio[:target_dur]
                     else:
-                        slowdown_rejected += 1
                         tts_audio = tts_audio[:target_dur]
-                else:
-                    tts_audio = tts_audio[:target_dur]
 
-        # 平滑过渡：短淡入淡出防止片段边界爆音
-        CROSSFADE_MS = 30
-        if len(tts_audio) > CROSSFADE_MS * 2:
-            tts_audio = tts_audio.fade_in(CROSSFADE_MS).fade_out(CROSSFADE_MS)
+            CROSSFADE_MS = 30
+            if len(tts_audio) > CROSSFADE_MS * 2:
+                tts_audio = tts_audio.fade_in(CROSSFADE_MS).fade_out(CROSSFADE_MS)
+            if target_start < total_ms:
+                final_audio = final_audio.overlay(tts_audio, position=target_start)
 
-        if target_start < total_ms:
-            final_audio = final_audio.overlay(tts_audio, position=target_start)
-
+    # ── 写出最终配音 ──
     dub_path = output_dir / "chinese_dub.wav"
     final_audio.export(str(dub_path), format="wav")
 
     # 间隙借用汇总
     if borrow_events:
-        total_ms = sum(e["borrow_ms"] for e in borrow_events)
+        total_borrow_ms = sum(e["borrow_ms"] for e in borrow_events)
         max_e = max(borrow_events, key=lambda e: e["borrow_ms"])
         print(f"     间隙借用: {len(borrow_events)} 段, "
-              f"总 {total_ms}ms, 最大 #{max_e['idx']} {max_e['borrow_ms']}ms")
+              f"总 {total_borrow_ms}ms, 最大 #{max_e['idx']} {max_e['borrow_ms']}ms")
 
-    print(f"  ✅ 配音完成 (调速:{stats['adjusted']}, 填充:{stats['padded']},"
-          f" 限速:{stats['clamped_fast']}, 提速:{stats['clamped_slow']},"
-          f" 借用:{stats['borrowed']}, 跳过:{stats['skipped']}, 总:{len(segments)})")
+    if atempo_disabled:
+        print(f"  ✅ 配音完成 (填充:{stats['padded']}, 容忍:{stats['within_tolerance']},"
+              f" atempo降级:{stats['atempo_fallback']}, 截断:{stats['truncated']},"
+              f" 借用:{stats['borrowed']}, 跳过:{stats['skipped']}, 总:{len(segments)})")
+    else:
+        print(f"  ✅ 配音完成 (调速:{stats['adjusted']}, 填充:{stats['padded']},"
+              f" 限速:{stats['clamped_fast']}, 提速:{stats['clamped_slow']},"
+              f" 借用:{stats['borrowed']}, 跳过:{stats['skipped']}, 总:{len(segments)})")
 
     # ── Video Slowdown 报告 ──
     if slowdown_segments:
@@ -3546,7 +4019,8 @@ async def run_refinement_loop(
         if not overfast:
             if underslow and not getattr(run_refinement_loop, '_expand_done', False):
                 print(f"     🔄 扩展 {len(underslow)} 个过短片段...")
-                new_segments = _expand_with_llm(segments, underslow, llm_config)
+                underslow_indices = [item["idx"] for item in underslow]
+                new_segments = _isometric_expand_batch(segments, underslow_indices, llm_config)
                 # 统计扩展变更
                 expand_changed = 0
                 for item in underslow:
@@ -3768,8 +4242,8 @@ def _refine_with_llm(
         "1) 必须忠实翻译英文原文，不得偏离原文含义\n"
         "2) 每个 [编号] 的精简版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
         "3) 精简是缩短同一句话，不是替换成其他句子——精简结果必须与当前翻译含义一致\n"
-        "4) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
-        "5) 翻译正确性优先于缩短幅度——宁可少缩短一些，不要为凑字数而曲解原意\n"
+        "4) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "5) 忠实原文语义，不要为凑字数而曲解原意\n"
         "6) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
         "7) 适合配音朗读，语句自然\n"
         "8) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
@@ -3933,10 +4407,10 @@ def _clean_refine_artifacts(text: str) -> str:
     """
     if not text:
         return text
-    # 去除行首的 markdown/列表标记 + [轻]/[中]/[短] 标签
-    text = re.sub(r"^[-*]*\s*\*{0,2}\[([轻中短])\]\*{0,2}\s*", "", text.strip())
+    # 去除行首的 markdown/列表标记 + [轻]/[中]/[短]/[轻扩]/[中扩]/[重扩] 标签
+    text = re.sub(r"^[-*]*\s*\*{0,2}\[(轻|中|短|轻扩|中扩|重扩)\]\*{0,2}\s*", "", text.strip())
     # 如果整行都是系统指令回显（如"以下为每段翻译的三个精简版本..."），返回空
-    if re.search(r"[轻中短].*[/／].*[轻中短]", text):
+    if re.search(r"(轻扩?|中扩?|短|重扩).*[/／].*(轻扩?|中扩?|短|重扩)", text):
         return ""
     return text.strip()
 
@@ -4007,20 +4481,85 @@ def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]
     return results[:expected_count]
 
 
+def _parse_expand_candidates(content: str, expected_count: int) -> List[List[str]]:
+    """解析 LLM 多候选扩展结果。
+
+    预期格式：
+      [1]
+      [轻扩] xxx
+      [中扩] xxx
+      [重扩] xxx
+      [2]
+      ...
+
+    也兼容 markdown 加粗、列表符号等变体。
+    返回: [[候选1, 候选2, 候选3], [候选1, ...], ...]
+    """
+    results = []
+    current_candidates = []
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        # 跳过 LLM 回显系统指令的行
+        if re.search(r"(轻扩|中扩|重扩).*[/／].*(轻扩|中扩|重扩)", line):
+            continue
+
+        # 新段落标记 [N] 或 **[N]**
+        if re.match(r"^\*{0,2}\[(\d+)\]\*{0,2}$", line) or re.match(r"^(\d+)\.", line):
+            if current_candidates:
+                results.append(current_candidates)
+            current_candidates = []
+            continue
+
+        # 匹配 [轻扩]/[中扩]/[重扩] 标签
+        tag_match = re.match(
+            r"^[-*]*\s*\*{0,2}\[(轻扩|中扩|重扩)\]\*{0,2}\s*(.+)$", line)
+        if tag_match:
+            text = tag_match.group(2).strip()
+            text = _strip_think_block(text) if '<think>' in text else text
+            text = _clean_refine_artifacts(text)
+            if text:
+                current_candidates.append(text)
+            continue
+
+        # 降级：没有标签的行
+        clean = _strip_numbered_prefix(line) if re.match(r"^\[\d+\]", line) else line
+        clean = _clean_refine_artifacts(clean)
+        if clean and len(clean) >= 2:
+            current_candidates.append(clean)
+
+    if current_candidates:
+        results.append(current_candidates)
+
+    while len(results) < expected_count:
+        results.append([])
+
+    return results[:expected_count]
+
+
 def _select_best_candidate(
     candidates: List[str], target_ms: int, original_zh: str,
     idx: int, segments: List[dict],
     allow_same_length: bool = False,
+    mode: str = "shrink",
+    fidelity_threshold: float = 0.25,
 ) -> str:
-    """从多个精简候选中选最接近目标时长的，同时排除不合格候选。
+    """从多个候选中选最接近目标时长的，同时排除不合格候选。
+
+    mode:
+      "shrink" — 精简方向：候选须比原文短（或同等长度），选最接近 target 的
+      "fill"   — 扩展方向：候选须比原文长，选最长且不超 target 的
 
     选择策略：
       1. 排除与相邻段重复的候选
-      2. 排除比原文更长的候选（allow_same_length=True 时允许同等长度）
+      2. 长度过滤（取决于 mode）
       3. 排除与原文语义忠实度过低的候选（防止跨段内容污染）
       4. 用 jieba 分词估算每个候选的朗读时长
-      5. 选时长最接近 target_ms 且不超出的
-      6. 都超出则选最短的
+      5. shrink: 选时长最接近 target_ms 且不超出的；都超出则选最短的
+         fill:   选时长最接近 target_ms 且不超出的**最长**候选；都超出则选最短的
     """
     if not candidates:
         return ""
@@ -4039,8 +4578,14 @@ def _select_best_candidate(
         cand = _clean_refine_artifacts(cand)
         if not cand or len(cand) < 2:
             continue
-        # 长度过滤：等时模式允许同等长度，仅排除超过原文 110% 的
-        if allow_same_length:
+        # 长度过滤
+        if mode == "fill":
+            # 扩展模式：候选必须比原文长，且不超过 2 倍
+            if len(cand) <= len(original_zh):
+                continue
+            if len(cand) > len(original_zh) * 2.0:
+                continue
+        elif allow_same_length:
             if len(cand) > len(original_zh) * 1.1:
                 continue
         else:
@@ -4050,7 +4595,7 @@ def _select_best_candidate(
         if _is_duplicate_of_neighbors(cand, idx, segments):
             continue
         # 排除与原文语义忠实度过低的候选（防止 LLM 跨段内容混淆）
-        if not _check_refine_fidelity(original_zh, cand):
+        if not _check_refine_fidelity(original_zh, cand, min_overlap=fidelity_threshold):
             continue
         valid.append(cand)
 
@@ -4066,14 +4611,19 @@ def _select_best_candidate(
             over = est_ms > target_ms  # 是否超出目标
             scored.append((cand, est_ms, diff, over))
 
-        # 优先选不超出的；都超出选最接近的
         not_over = [s for s in scored if not s[3]]
-        if not_over:
-            # 不超出目标的里面，选最接近的
-            best = min(not_over, key=lambda s: s[2])
+        if mode == "fill":
+            # 扩展方向：选不超出目标的最长候选（尽量填满时间窗）
+            if not_over:
+                best = max(not_over, key=lambda s: s[1])
+            else:
+                best = min(scored, key=lambda s: s[1])
         else:
-            # 都超出了，选最短的
-            best = min(scored, key=lambda s: s[1])
+            # 精简方向：选不超出目标的最接近候选
+            if not_over:
+                best = min(not_over, key=lambda s: s[2])
+            else:
+                best = min(scored, key=lambda s: s[1])
         return best[0]
     else:
         # 降级：选字符长度最接近 target 的（粗估 250ms/字）
@@ -4130,8 +4680,8 @@ def _isometric_translate_batch(
         "规则：\n"
         "1) 三个版本都必须忠实翻译英文原文，不得偏离原文含义\n"
         "2) 每个 [编号] 的版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
-        "3) 领域专业术语保留英文原词不翻译（如 API、SDK、HTTP、GPU、LLM、RAG、JSON 等）\n"
-        "4) 翻译正确性优先于长度匹配——宁可稍长，不要为缩短而曲解原意\n"
+        "3) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "4) 忠实原文语义，不要为缩短而曲解原意\n"
         "5) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
         "6) 适合配音朗读，语句自然，短句为主\n"
         "7) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
@@ -4215,6 +4765,139 @@ def _isometric_translate_batch(
         print(f"     等时进度: {min(i + batch_size, len(items))}/{len(items)}")
 
     print(f"     等时翻译完成: {adopted}/{len(items)} 段已优化")
+    return result
+
+
+def _isometric_expand_batch(
+    segments: List[dict], low_cps_indices: List[int], llm_config: dict,
+) -> List[dict]:
+    """等时扩展：为低 CPS 段生成多候选扩展变体并选优
+
+    在翻译完成后运行，对估算 CPS 过低的段生成 [轻扩]/[中扩]/[重扩] 三个扩展变体，
+    用 jieba 分词估算时长选最接近目标的候选。
+
+    复用现有基础设施:
+      - _parse_expand_candidates() 解析 [轻扩]/[中扩]/[重扩]
+      - _select_best_candidate(mode="fill") 候选选择（扩展方向）
+      - _estimate_duration_jieba() 时长估算
+    """
+    import httpx
+    import copy
+
+    result = copy.deepcopy(segments)
+    CHARS_PER_SEC = 4.5
+
+    api_url = llm_config["api_url"].rstrip("/")
+    api_key = llm_config["api_key"]
+    model = llm_config["model"]
+    temperature = llm_config.get("temperature", 0.3)
+    batch_size = min(llm_config.get("batch_size", 15), 5)
+
+    endpoint = (api_url if "/chat/completions" in api_url
+                else f"{api_url}/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    CONTEXT_TRUNCATE = 30
+
+    system_prompt = (
+        "你是专业的英中视频配音翻译专家。以下英文已有初始中文翻译，"
+        "但翻译朗读时长远短于原始时间窗口，需要适度扩展。\n"
+        "请为每段生成 3 个不同长度的扩展版本：\n"
+        "  [轻扩] 轻度扩展（约增加 15-20%）：补充修饰语使表达更完整自然\n"
+        "  [中扩] 中度扩展（约增加 30-40%）：基于英文原文补充细节和修饰\n"
+        "  [重扩] 重度扩展（约增加 50-60%）：充分展开英文原文的含义\n\n"
+        "规则：\n"
+        "1) 扩展必须严格基于对应编号的英文原文含义，严禁引入英文中没有的信息\n"
+        "2) 每个 [编号] 的扩展版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
+        "3) 必须保留原译文的核心词汇，只在原译文基础上补充修饰语或使表达更完整\n"
+        "4) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "5) 不要为凑字数而加入原文没有的信息\n"
+        "6) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
+        "7) 适合配音朗读，语句自然，短句为主\n"
+        "8) 输出格式：每段先 [编号]，然后分行输出 [轻扩]/[中扩]/[重扩] 三个版本"
+    )
+
+    # 构建待处理列表
+    items = []
+    for idx in low_cps_indices:
+        seg = segments[idx]
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+        zh_chars = sum(1 for c in seg.get("text_zh", "") if '\u4e00' <= c <= '\u9fff')
+        items.append({
+            "idx": idx,
+            "text_en": seg.get("text_en", seg.get("text", "")),
+            "text_zh": seg.get("text_zh", ""),
+            "zh_chars": zh_chars,
+            "target_chars": target_chars,
+            "dur_sec": dur_sec,
+        })
+
+    adopted = 0
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+        lines = []
+        for j, item in enumerate(batch):
+            idx = item["idx"]
+            prev_zh = segments[idx - 1]["text_zh"][:CONTEXT_TRUNCATE] if idx > 0 else ""
+            next_zh = (segments[idx + 1]["text_zh"][:CONTEXT_TRUNCATE]
+                       if idx < len(segments) - 1 else "")
+            context_hint = ""
+            if prev_zh:
+                context_hint += f"  上文摘要（仅供参考，不要从中取内容）: {prev_zh}...\n"
+            if next_zh:
+                context_hint += f"  下文摘要（仅供参考，不要从中取内容）: {next_zh}..."
+            lines.append(
+                f"[{j+1}]\n"
+                f"  英文: {item['text_en']}\n"
+                f"  当前翻译({item['zh_chars']}字): {item['text_zh']}\n"
+                f"  目标≈{item['target_chars']}字 (时间窗口 {item['dur_sec']:.1f}秒)\n"
+                + (context_hint if context_hint else "")
+            )
+
+        user_msg = (
+            f"请为以下 {len(batch)} 段翻译各生成 [轻扩]/[中扩]/[重扩] 三个扩展版本：\n\n"
+            + "\n\n".join(lines)
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": temperature,
+            "max_tokens": 4096,
+        }
+
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+
+            candidates_per_item = _parse_expand_candidates(content, len(batch))
+
+            for item, candidates in zip(batch, candidates_per_item):
+                idx = item["idx"]
+                target_ms = int((segments[idx]["end"] - segments[idx]["start"]) * 1000)
+
+                best_zh = _select_best_candidate(
+                    candidates, target_ms, item["text_zh"], idx, result,
+                    mode="fill", fidelity_threshold=0.15)
+
+                if best_zh:
+                    result[idx]["text_zh"] = best_zh
+                    adopted += 1
+        except Exception as e:
+            print(f"     ⚠️  等时扩展批次 {i//batch_size+1} 失败: {e}")
+
+        print(f"     扩展进度: {min(i + batch_size, len(items))}/{len(items)}")
+
+    print(f"     等时扩展完成: {adopted}/{len(items)} 段已优化")
     return result
 
 

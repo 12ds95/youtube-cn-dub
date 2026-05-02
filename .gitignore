@@ -30,6 +30,7 @@ config.scratch.json
 # ─── IDE / 编辑器 ─────────────────────────────────
 .vscode/
 .idea/
+.qoder/
 *.swp
 *.swo
 *~

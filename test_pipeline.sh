@@ -117,6 +117,8 @@ if [ "$MODE" = "baseline" ]; then
     POST_CAL=false
     GAP_BORROW=false
     VID_SLOW=false
+    ATEMPO_DISABLED=false
+    FEEDBACK_LOOP=false
     FEATURE_DESC="全部关闭（回归基线）"
 else
     TWO_PASS=true
@@ -124,7 +126,9 @@ else
     POST_CAL=true
     GAP_BORROW=true
     VID_SLOW=true
-    FEATURE_DESC="two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown"
+    ATEMPO_DISABLED=true
+    FEEDBACK_LOOP=true
+    FEATURE_DESC="two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop"
 fi
 
 cat > "$TMPCONFIG" <<JSONEOF
@@ -138,7 +142,9 @@ cat > "$TMPCONFIG" <<JSONEOF
     "model": "qwen3-coder-next",
     "batch_size": 8,
     "temperature": 0.3,
-    "two_pass": $TWO_PASS
+    "two_pass": $TWO_PASS,
+    "isometric": 3,
+    "isometric_cps_threshold": 5.5
   },
   "nlp_segmentation": $NLP_SEG,
   "tts_chain": ["edge-tts", "piper", "gtts", "pyttsx3"],
@@ -154,6 +160,8 @@ cat > "$TMPCONFIG" <<JSONEOF
     "calibration_threshold": 1.30
   },
   "alignment": {
+    "atempo_disabled": $ATEMPO_DISABLED,
+    "feedback_loop": $FEEDBACK_LOOP,
     "gap_borrowing": $GAP_BORROW,
     "max_borrow_ms": 300,
     "video_slowdown": $VID_SLOW,
@@ -287,6 +295,15 @@ else
         echo -e "  ${RED}❌${NC} tts_segments/ — 无 TTS 片段"
         PASS=false
     fi
+
+    # 自动质量评分
+    echo ""
+    echo -e "${YELLOW}📊 自动质量评分:${NC}"
+    VENV_PYTHON="venv/bin/python3"
+    if [ ! -f "$VENV_PYTHON" ]; then
+        VENV_PYTHON="python3"
+    fi
+    "$VENV_PYTHON" score_videos.py "$VIDEO_DIR" --compare || true
 fi
 
 echo ""

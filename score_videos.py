@@ -42,6 +42,8 @@ THRESHOLDS = {
     "utmos_mean":  {"warn": 3.5, "fail": 3.0, "direction": "lower_is_bad"},
     "jitter_mean": {"warn": 0.025, "fail": 0.050},
     "iso_compliance": {"warn": 50.0, "fail": 40.0, "direction": "lower_is_bad"},
+    "no_atempo_compliance": {"warn": 60.0, "fail": 40.0, "direction": "lower_is_bad"},
+    "raw_ratio_std": {"warn": 0.15, "fail": 0.25},
 }
 
 # ─── 回归检测阈值 ─────────────────────────────────────────────
@@ -57,6 +59,8 @@ REGRESSION_METRICS = [
     ("cps",     "isometric_compliance_pct", "等时合规率",    "lower_is_bad"),
     ("atempo",  "mean",                   "Atempo 均值",    "higher_is_bad"),
     ("atempo",  "std",                    "Atempo 标准差",  "higher_is_bad"),
+    ("naturalness", "no_atempo_compliance_pct", "无调速合规率", "lower_is_bad"),
+    ("naturalness", "raw_ratio_std",      "原始时长比标准差", "higher_is_bad"),
     ("utmos",   "mean",                   "UTMOS 均值",     "lower_is_bad"),
     ("prosody", "mean_jitter",            "Jitter 均值",    "higher_is_bad"),
 ]
@@ -204,15 +208,61 @@ def compute_atempo(video_dir: Path) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Speed Naturalness 评分 — 衡量不需要 atempo 的程度
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_speed_naturalness(video_dir: Path) -> dict:
+    """评估语速自然度 — TTS 原音速匹配时间窗的程度。
+
+    从 speed_report.json 读取数据，计算:
+    - no_atempo_compliance_pct: raw_ratio 在 [0.85, 1.15] 的段占比
+    - raw_ratio_mean/std: 原始时长比的均值/标准差
+    - atempo_disabled: 是否已禁用 atempo
+    """
+    for candidate in [video_dir / "audit" / "speed_report.json",
+                      video_dir / "speed_report.json"]:
+        if candidate.exists():
+            rpt = json.loads(candidate.read_text(encoding="utf-8"))
+            atempo_disabled = rpt.get("atempo_disabled", False)
+            result = {
+                "atempo_disabled": atempo_disabled,
+            }
+
+            # 新模式直接从 speed_report 读取
+            if atempo_disabled:
+                result.update({
+                    "no_atempo_compliance_pct": rpt.get("raw_ratio_within_115_pct", 0),
+                    "raw_ratio_mean": rpt.get("raw_ratio_mean", rpt.get("baseline", 0)),
+                    "raw_ratio_std": rpt.get("std_raw", 0),
+                    "padded": rpt.get("padded", 0),
+                    "truncated": rpt.get("truncated", 0),
+                    "atempo_fallback": rpt.get("atempo_fallback", 0),
+                    "within_tolerance": rpt.get("within_tolerance", 0),
+                    "overflow_tolerance": rpt.get("overflow_tolerance", 0.10),
+                    "total_segments": rpt.get("total_segments", 0),
+                })
+            else:
+                # 旧模式: 从 raw std 推算
+                result.update({
+                    "no_atempo_compliance_pct": 0,  # 旧模式无此数据
+                    "raw_ratio_mean": rpt.get("baseline", 0),
+                    "raw_ratio_std": rpt.get("std_raw", 0),
+                    "total_segments": rpt.get("total_segments", 0),
+                })
+            return result
+    return {"error": "speed_report.json 不存在"}
+
+
+# ═══════════════════════════════════════════════════════════════════
 # UTMOS 评分 (可选)
 # ═══════════════════════════════════════════════════════════════════
 
 def compute_utmos(video_dir: Path, sample_size: int = 20) -> dict:
-    """神经网络 MOS 预测，抽样评分"""
+    """神经网络 MOS 预测，抽样评分（UTMOSv2）"""
     try:
-        import utmos
+        import utmosv2
     except ImportError:
-        return {"skipped": True, "reason": "utmos 未安装 (pip install utmos)"}
+        return {"skipped": True, "reason": "utmosv2 未安装 (pip install git+https://github.com/sarulab-speech/UTMOSv2.git)"}
 
     tts_dir = video_dir / "tts_segments"
     if not tts_dir.exists():
@@ -226,12 +276,16 @@ def compute_utmos(video_dir: Path, sample_size: int = 20) -> dict:
     random.seed(42)
     sampled = random.sample(mp3s, min(sample_size, len(mp3s)))
 
-    model = utmos.Score()
+    try:
+        model = utmosv2.create_model(pretrained=True)
+    except Exception as e:
+        return {"error": f"模型加载失败: {e}"}
+
     scores = []
     for mp3 in sampled:
         try:
-            score = model.calculate_wav_file(str(mp3))
-            scores.append(round(score, 3))
+            score = model.predict(input_path=str(mp3))
+            scores.append(round(float(score), 3))
         except Exception:
             continue
 
@@ -319,6 +373,7 @@ def score_video(video_dir: Path) -> dict:
         "timestamp": datetime.now().isoformat(),
         "cps": compute_cps(video_dir),
         "atempo": compute_atempo(video_dir),
+        "naturalness": compute_speed_naturalness(video_dir),
         "utmos": compute_utmos(video_dir),
         "prosody": compute_prosody(video_dir),
     }
@@ -386,6 +441,34 @@ def print_scores(scores: dict, gate_mode: bool = False) -> bool:
                 t = THRESHOLDS[f"atempo_{key}"]
                 if val > t["fail"]:
                     passed = False
+
+    # Speed Naturalness
+    nat = scores.get("naturalness", {})
+    if "error" in nat:
+        print(f"\n  {YELLOW}自然度: {nat['error']}{NC}")
+    else:
+        mode = "无atempo" if nat.get("atempo_disabled") else "atempo模式"
+        print(f"\n  {BOLD}【语速自然度 — {mode}】{NC}")
+        compliance = nat.get("no_atempo_compliance_pct", 0)
+        icon_c, color_c = _status(compliance, "no_atempo_compliance")
+        print(f"    {icon_c} 无调速合规率 [0.85-1.15]: {color_c}{compliance}%{NC}")
+        raw_mean = nat.get("raw_ratio_mean", 0)
+        print(f"       原始时长比均值: {raw_mean:.4f} (理想=1.0)")
+        raw_std = nat.get("raw_ratio_std", 0)
+        icon_s, color_s = _status(raw_std, "raw_ratio_std")
+        print(f"    {icon_s} 原始时长比标准差: {color_s}{raw_std}{NC} (理想→0)")
+        if nat.get("atempo_disabled"):
+            print(f"       填充:{nat.get('padded', 0)}"
+                  f" 容忍:{nat.get('within_tolerance', 0)}"
+                  f" atempo降级:{nat.get('atempo_fallback', 0)}"
+                  f" 截断:{nat.get('truncated', 0)}")
+        print(f"       总段数: {nat.get('total_segments', 0)}")
+
+        if gate_mode:
+            if compliance < THRESHOLDS["no_atempo_compliance"]["fail"]:
+                passed = False
+            if raw_std > THRESHOLDS["raw_ratio_std"]["fail"]:
+                passed = False
 
     # UTMOS
     utmos_s = scores["utmos"]
@@ -457,7 +540,7 @@ def save_baseline(scores: dict, video_dir: Path):
         baseline["git_commit"] = result.stdout.strip()
     except Exception:
         pass
-    for category in ("cps", "atempo", "utmos", "prosody"):
+    for category in ("cps", "atempo", "naturalness", "utmos", "prosody"):
         data = scores.get(category, {})
         if "error" in data or data.get("skipped"):
             continue

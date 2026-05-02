@@ -26,23 +26,17 @@ def test_expand_not_called_in_refinement_loop():
 
 
 def test_underslow_segments_unchanged_after_refine_loop():
-    """模拟：underslow 片段的 text_zh 在迭代中不应被修改"""
-    # 模拟 3 个片段，#1 是 underslow
-    segments = [
-        {"start": 0, "end": 5, "text_en": "Hello world", "text_zh": "你好世界"},
-        {"start": 5, "end": 15, "text_en": "The only rule to remember is...",
-         "text_zh": "唯一需要记住的规则是……"},  # underslow: TTS 远短于 10s 窗口
-        {"start": 15, "end": 20, "text_en": "That's it", "text_zh": "就是这样"},
-    ]
-    import copy
-    original = copy.deepcopy(segments)
-
-    # 即使 #1 是 underslow，当前代码不应调用 LLM 扩展
-    # 验证方式：确认 refine loop 源码中 expand 已被跳过
+    """确认 refine loop 使用 _isometric_expand_batch 而非 _expand_with_llm"""
     import pipeline
     source = inspect.getsource(pipeline.run_refinement_loop)
-    assert '_expand_with_llm(new_segments' not in source.replace(' ', '').replace('#', 'COMMENT'), \
-        "_expand_with_llm 仍在 run_refinement_loop 中被活跃调用"
+    # 应使用 _isometric_expand_batch 替代 _expand_with_llm
+    found_isometric = False
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if '_isometric_expand_batch' in stripped and not stripped.startswith('#'):
+            found_isometric = True
+    assert found_isometric, \
+        "run_refinement_loop 应使用 _isometric_expand_batch 进行过短片段扩展"
 
 
 def test_expand_with_llm_function_still_exists():

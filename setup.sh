@@ -85,6 +85,7 @@ PACKAGES=(
     "spacy"
     "jieba"
     "pypinyin"
+    "sentencepiece"
 )
 
 for pkg in "${PACKAGES[@]}"; do

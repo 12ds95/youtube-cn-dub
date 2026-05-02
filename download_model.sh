@@ -183,6 +183,77 @@ download_sherpa() {
     ls -lh "$model_dir/$model_name/"
 }
 
+
+# ── NLLB 翻译模型 ────────────────────────────────────────────
+download_nllb() {
+    local model_dir="$SCRIPT_DIR/models/nllb-200-distilled-600M-ct2-int8"
+    mkdir -p "$model_dir"
+
+    if $USE_MIRROR; then
+        local base="https://hf-mirror.com/JustFrederik/nllb-200-distilled-600M-ct2-int8/resolve/main"
+    else
+        local base="https://huggingface.co/JustFrederik/nllb-200-distilled-600M-ct2-int8/resolve/main"
+    fi
+
+    echo "📥 下载 NLLB-200 翻译模型 (int8, ~618MB)..."
+    echo "   目标目录: $model_dir"
+
+    local files="model.bin sentencepiece.bpe.model config.json shared_vocabulary.txt tokenizer.json"
+    for f in $files; do
+        if [ -f "$model_dir/$f" ]; then
+            echo "  ⏭  $f 已存在，跳过"
+            continue
+        fi
+        echo "  📦 下载 $f..."
+        _curl_download "$base/$f" "$model_dir/$f"
+        echo "  ✅ $f ($(du -h "$model_dir/$f" | cut -f1))"
+    done
+
+    echo "🎉 NLLB 翻译模型下载完成: $model_dir"
+    ls -lh "$model_dir/"
+}
+
+
+# ── VITS 中文男声 TTS 模型 ───────────────────────────────────
+download_vits_male() {
+    local model_dir="$SCRIPT_DIR/models/vits-zh-hf-fanchen-wnj"
+    mkdir -p "$model_dir/dict/pos_dict"
+
+    if $USE_MIRROR; then
+        local base="https://hf-mirror.com/csukuangfj/vits-zh-hf-fanchen-wnj/resolve/main"
+    else
+        local base="https://huggingface.co/csukuangfj/vits-zh-hf-fanchen-wnj/resolve/main"
+    fi
+
+    echo "📥 下载 VITS 中文男声模型 (fanchen-wnj, 16kHz, ~115MB)..."
+    echo "   目标目录: $model_dir"
+
+    # 主文件
+    for f in vits-zh-hf-fanchen-wnj.onnx lexicon.txt tokens.txt date.fst number.fst phone.fst new_heteronym.fst; do
+        if [ -f "$model_dir/$f" ]; then
+            echo "  ⏭  $f 已存在，跳过"
+            continue
+        fi
+        echo "  📦 下载 $f..."
+        _curl_download "$base/$f" "$model_dir/$f"
+        echo "  ✅ $f ($(du -h "$model_dir/$f" | cut -f1))"
+    done
+
+    # dict 目录
+    for f in dict/hmm_model.utf8 dict/idf.utf8 dict/jieba.dict.utf8 dict/stop_words.utf8 dict/user.dict.utf8 dict/pos_dict/char_state_tab.utf8 dict/pos_dict/prob_emit.utf8 dict/pos_dict/prob_start.utf8 dict/pos_dict/prob_trans.utf8; do
+        if [ -f "$model_dir/$f" ]; then
+            echo "  ⏭  $f 已存在，跳过"
+            continue
+        fi
+        echo "  📦 下载 $f..."
+        _curl_download "$base/$f" "$model_dir/$f"
+    done
+
+    echo "🎉 VITS 男声模型下载完成: $model_dir"
+    ls -lh "$model_dir/"
+}
+
+
 # ── 入口 ─────────────────────────────────────────────────────
 case "$COMPONENT" in
     whisper)
@@ -194,12 +265,22 @@ case "$COMPONENT" in
     sherpa|sherpa-onnx)
         download_sherpa
         ;;
+    nllb)
+        download_nllb
+        ;;
+    vits-male)
+        download_vits_male
+        ;;
     all)
         download_whisper "${2:-medium}"
         echo ""
         download_piper
         echo ""
         download_sherpa
+        echo ""
+        download_nllb
+        echo ""
+        download_vits_male
         ;;
     tiny|base|small|medium|large-v3-turbo)
         # 兼容旧用法: bash download_model.sh small
@@ -211,6 +292,8 @@ case "$COMPONENT" in
         echo "                                  # Whisper 语音识别模型（默认 medium）"
         echo "  bash download_model.sh piper [huayan|chaowen|xiao_ya]   # Piper TTS 中文模型（CPU）"
         echo "  bash download_model.sh sherpa                           # sherpa-onnx MeloTTS 中文模型（CPU）"
+        echo "  bash download_model.sh nllb                             # NLLB-200 本地翻译模型（CPU）"
+        echo "  bash download_model.sh vits-male                        # VITS 中文男声 TTS（CPU, 16kHz）"
         echo "  bash download_model.sh all                              # 下载全部模型"
         echo ""
         echo "选项:"

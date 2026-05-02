@@ -265,11 +265,11 @@ DEFAULT_CONFIG = {
     "piper": {                       # Piper 本地 ONNX TTS（需 bash download_model.sh piper 下载模型）
         "model_path": None,          # 模型路径: 如 "models/piper/zh_CN-huayan-medium.onnx"
     },
-    "sherpa_onnx": {                 # sherpa-onnx MeloTTS（需 bash download_model.sh sherpa 下载模型）
-        "model": "",                 # 模型文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/model.onnx"
-        "lexicon": "",               # 词典文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/lexicon.txt"
-        "tokens": "",                # tokens 文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/tokens.txt"
-        "dict_dir": "",              # 词典目录（可选）
+    "sherpa_onnx": {                 # sherpa-onnx VITS 本地 TTS（需 bash download_model.sh vits-male 下载模型）
+        "model": "",                 # 模型文件: "models/vits-zh-hf-fanchen-wnj/vits-zh-hf-fanchen-wnj.onnx"
+        "lexicon": "",               # 词典文件: "models/vits-zh-hf-fanchen-wnj/lexicon.txt"
+        "tokens": "",                # tokens 文件: "models/vits-zh-hf-fanchen-wnj/tokens.txt"
+        "dict_dir": "",              # 词典目录: "models/vits-zh-hf-fanchen-wnj/dict"
         "speaker_id": 0,             # 说话人 ID（多人模型时选择）
     },
 
@@ -1056,6 +1056,8 @@ def translate_segments(segments: List[dict], config: dict) -> List[dict]:
         if llm_cfg.get("two_pass", False):
             return _translate_llm_two_pass(segments, llm_cfg, video_title, output_dir=output_dir)
         return _translate_llm(segments, llm_cfg, video_title, output_dir=output_dir)
+    elif engine == "nllb":
+        return _translate_nllb(segments)
     else:
         return _translate_google(segments)
 
@@ -1090,6 +1092,103 @@ def _translate_google(segments: List[dict], batch_size: int = 20) -> List[dict]:
             time.sleep(1)
     print(f"  ✅ 翻译完成")
     return result
+
+
+def _translate_nllb(segments: List[dict], batch_size: int = 32) -> List[dict]:
+    """NLLB-200 本地翻译引擎（ctranslate2 int8, 离线可用）"""
+    import ctranslate2
+    import sentencepiece as spm
+
+    model_dir = Path(__file__).resolve().parent / "models" / "nllb-200-distilled-600M-ct2-int8"
+    if not (model_dir / "model.bin").exists():
+        raise FileNotFoundError(f"NLLB 模型未找到: {model_dir}")
+
+    print(f"  🔤 NLLB 本地翻译 ({len(segments)} 段)...")
+    translator = ctranslate2.Translator(str(model_dir), device="cpu", compute_type="int8")
+    sp = spm.SentencePieceProcessor()
+    sp.Load(str(model_dir / "sentencepiece.bpe.model"))
+
+    result = []
+    for i in range(0, len(segments), batch_size):
+        batch = segments[i:i + batch_size]
+        texts = [s["text"] for s in batch]
+
+        # NLLB ct2 格式: tokens + ['</s>', 'eng_Latn'] → target_prefix [['zho_Hans']]
+        source_batch = []
+        for t in texts:
+            tokens = sp.Encode(t, out_type=str)
+            source_batch.append(tokens + ["</s>", "eng_Latn"])
+
+        try:
+            translations_raw = translator.translate_batch(
+                source_batch,
+                target_prefix=[["zho_Hans"]] * len(batch),
+                beam_size=4,
+                max_decoding_length=200,
+            )
+            translations = []
+            for r in translations_raw:
+                toks = r.hypotheses[0]
+                out_toks = [t for t in toks if t not in ("</s>", "zho_Hans")]
+                translations.append(sp.Decode(out_toks))
+        except Exception as e:
+            print(f"     ⚠️  NLLB 批量翻译失败 ({e})，逐句重试...")
+            translations = []
+            for t in texts:
+                try:
+                    tokens = sp.Encode(t, out_type=str)
+                    r = translator.translate_batch(
+                        [tokens + ["</s>", "eng_Latn"]],
+                        target_prefix=[["zho_Hans"]],
+                        beam_size=4,
+                        max_decoding_length=200,
+                    )
+                    out_toks = [tk for tk in r[0].hypotheses[0] if tk not in ("</s>", "zho_Hans")]
+                    translations.append(sp.Decode(out_toks))
+                except Exception:
+                    translations.append(t)
+
+        for seg, zh in zip(batch, translations):
+            text_zh = zh if (zh and len(zh.strip()) >= 2) else seg["text"]
+            result.append({
+                "start": seg["start"], "end": seg["end"],
+                "text_en": seg["text"], "text_zh": text_zh,
+            })
+        print(f"     进度: {min(i + batch_size, len(segments))}/{len(segments)}")
+
+    print(f"  ✅ NLLB 翻译完成")
+    return result
+
+
+def _translate_nllb_fallback(texts: List[str]) -> List[str]:
+    """NLLB 单次 fallback 翻译（供 LLM/Google 失败时调用，不构造 segment 结构）"""
+    import ctranslate2
+    import sentencepiece as spm
+
+    model_dir = Path(__file__).resolve().parent / "models" / "nllb-200-distilled-600M-ct2-int8"
+    if not (model_dir / "model.bin").exists():
+        return texts  # 模型不存在则原样返回
+
+    translator = ctranslate2.Translator(str(model_dir), device="cpu", compute_type="int8")
+    sp = spm.SentencePieceProcessor()
+    sp.Load(str(model_dir / "sentencepiece.bpe.model"))
+
+    source_batch = []
+    for t in texts:
+        tokens = sp.Encode(t, out_type=str)
+        source_batch.append(tokens + ["</s>", "eng_Latn"])
+
+    results_raw = translator.translate_batch(
+        source_batch,
+        target_prefix=[["zho_Hans"]] * len(texts),
+        beam_size=4,
+        max_decoding_length=200,
+    )
+    out = []
+    for r in results_raw:
+        toks = [t for t in r.hypotheses[0] if t not in ("</s>", "zho_Hans")]
+        out.append(sp.Decode(toks))
+    return out
 
 
 def _detect_translation_style(segments: List[dict], video_title: str,
@@ -1581,9 +1680,26 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 else:
                     still_failed.append(j)
 
-            # ── 第二层兜底：Google Translate（仅 LLM 逐条也失败的段） ──
+            # ── 第二层兜底：NLLB 本地翻译 → Google Translate ──
             if still_failed:
-                print(f"     ⚠️  {len(still_failed)} 段 LLM 逐条重试仍失败，回退 Google Translate")
+                # 先尝试 NLLB 本地翻译（无需网络）
+                try:
+                    nllb_texts = [batch[j]["text"] for j in still_failed]
+                    nllb_results = _translate_nllb_fallback(nllb_texts)
+                    nllb_remaining = []
+                    for k, j in enumerate(still_failed):
+                        zh = nllb_results[k]
+                        if zh and len(zh.strip()) >= 2:
+                            batch_results[j]["text_zh"] = zh.strip()
+                            print(f"       ✅ NLLB 本地翻译: \"{batch[j]['text'][:30]}\"")
+                        else:
+                            nllb_remaining.append(j)
+                    still_failed = nllb_remaining
+                except Exception:
+                    pass  # NLLB 不可用，继续 Google
+
+            if still_failed:
+                print(f"     ⚠️  {len(still_failed)} 段 NLLB 也失败，回退 Google Translate")
                 try:
                     from deep_translator import GoogleTranslator
                     gt = GoogleTranslator(source="en", target="zh-CN")
@@ -2125,9 +2241,10 @@ class PiperTTSEngine(TTSEngine):
 
 
 class SherpaOnnxEngine(TTSEngine):
-    """sherpa-onnx: 本地 ONNX 推理（含 MeloTTS 中文模型），无需 GPU"""
+    """sherpa-onnx: 本地 ONNX 推理（VITS 中文模型），无需 GPU"""
     name = "sherpa-onnx"
     is_local = True
+    supports_rate = True
 
     def __init__(self, model_config: dict = None):
         self.model_config = model_config or {}
@@ -2153,7 +2270,7 @@ class SherpaOnnxEngine(TTSEngine):
                 max_num_sentences=1,
             )
             tts = sherpa_onnx.OfflineTts(tts_config)
-            audio = tts.generate(text, sid=int(cfg.get("speaker_id", 0)), speed=1.0)
+            audio = tts.generate(text, sid=int(cfg.get("speaker_id", 0)), speed=rate)
             import wave
             wav_path = path.replace(".mp3", ".wav")
             with wave.open(wav_path, "w") as wf:

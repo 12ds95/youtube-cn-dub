@@ -126,8 +126,8 @@ def test_offline_engines_count():
 
 def test_supports_rate_property():
     """支持 rate 调速的引擎应标记 supports_rate=True"""
-    rate_engines = [EdgeTTSEngine, Pyttsx3Engine]
-    no_rate_engines = [GTTSEngine, PiperTTSEngine, SherpaOnnxEngine]
+    rate_engines = [EdgeTTSEngine, Pyttsx3Engine, SherpaOnnxEngine]
+    no_rate_engines = [GTTSEngine, PiperTTSEngine]
     for cls in rate_engines:
         assert cls.supports_rate is True, f"{cls.name} 应支持 rate 调速"
     for cls in no_rate_engines:

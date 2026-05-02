@@ -93,57 +93,42 @@ ls -lh models/nllb-200-distilled-600M-ct2-int8/
 # -rw-r--r--   17M  tokenizer.json
 ```
 
-## 4. 使用方式 (待集成)
+## 4. 实施结果
 
-### 4.1 ctranslate2 调用示例
+### 4.1 关键发现: ct2 tokenization 格式
 
-```python
-import ctranslate2
+NLLB ct2 的正确格式（与 HuggingFace transformers 不同）:
+- 源: `sp.Encode(text) + ['</s>', 'eng_Latn']`
+- 目标前缀: `[['zho_Hans']]`
 
-# 加载模型
-translator = ctranslate2.Translator("models/nllb-200-distilled-600M-ct2-int8")
+错误格式（如 `['eng_Latn'] + tokens`）会产生重复垃圾输出。
 
-# 英译中
-# NLLB 语言代码: eng_Latn (英文) → zho_Hans (简体中文)
-source_text = "Hello, how are you?"
-result = translator.translate_batch(
-    [["eng_Latn", source_text]],
-    target_lang="zho_Hans"
-)
-print(result[0].hypotheses[0])  # "你好，你好吗？"
-```
+### 4.2 翻译质量实测
 
-### 4.2 语言代码映射
-
-| 语言 | NLLB 代码 |
+| 英文 | NLLB 翻译 |
 |------|-----------|
-| English | `eng_Latn` |
-| 简体中文 | `zho_Hans` |
-| 繁体中文 | `zho_Hant` |
-| 日语 | `jpn_Jpan` |
+| In this video, we will explore the fundamental concepts of calculus. | 在这段视频中,我们将探讨计算的基本概念. |
+| The derivative measures the rate of change of a function. | 衍生品衡量函数的变化速度. |
+| Neural networks learn by adjusting weights through backpropagation. | 神经网络通过向后传播调整重量来学习. |
+| Consider a simple example where we have a circle with radius r. | 举一个简单的例子,我们有一个半径r的圆形. |
 
-### 4.3 集成建议
+**评价**: 通用翻译质量可接受，领域术语翻译不够专业（derivative→衍生品 应为 导数，weights→重量 应为 权重）。作为 fallback 够用。
 
-修改 `pipeline.py` 翻译模块，添加 `"nllb"` 选项：
+### 4.3 代码集成
 
-```json
-{
-  "translator": "nllb",
-  "nllb_model": "models/nllb-200-distilled-600M-ct2-int8"
-}
-```
+- `_translate_nllb()`: 独立翻译引擎，`translator: "nllb"` 直接调用
+- `_translate_nllb_fallback()`: 轻量 fallback 函数，供 LLM/Google 失败时调用
+- LLM fallback 链: LLM batch → LLM single → **NLLB** → Google Translate → 保留原文
+- `download_model.sh nllb`: 一键下载
+- `setup.sh`: 添加 `sentencepiece` 依赖
 
-或在 `_translate_google()` 中作为 fallback：
+### 4.4 性能
 
-```python
-def _translate_google(segments):
-    try:
-        # 尝试 Google Translate
-        ...
-    except Exception:
-        # 网络失败时 fallback 到 NLLB
-        return _translate_nllb(segments)
-```
+| 指标 | 实测值 |
+|------|--------|
+| 模型加载 | ~1.3s |
+| 批量翻译 (5句) | ~2.5s (500ms/句) |
+| 内存占用 | ~700MB |
 
 ## 5. 性能预估
 

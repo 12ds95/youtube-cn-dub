@@ -13,7 +13,7 @@
   "resume_from": null,
 
   "__=== 翻译引擎 ===__": "",
-  "__translator 说明__": "google = 免费无需配置; llm = 质量更好，需填 llm.api_key",
+  "__translator 说明__": "google = 免费无需配置; llm = 质量更好，需填 llm.api_key; nllb = 本地离线翻译（需先 bash download_model.sh nllb）",
   "translator": "google",
   "llm": {
     "__说明__": "当 translator=llm 或 refine.enabled=true 时需要。支持 DeepSeek / Qwen / Moonshot / GPT 等 OpenAI 兼容 API",
@@ -82,11 +82,11 @@
   },
 
   "sherpa_onnx": {
-    "__说明__": "sherpa-onnx MeloTTS 中英混合模型（CPU 友好，~110MB）。先运行: bash download_model.sh sherpa",
-    "model": "models/sherpa-onnx/vits-melo-tts-zh_en/model.onnx",
-    "lexicon": "models/sherpa-onnx/vits-melo-tts-zh_en/lexicon.txt",
-    "tokens": "models/sherpa-onnx/vits-melo-tts-zh_en/tokens.txt",
-    "dict_dir": "",
+    "__说明__": "sherpa-onnx VITS 中文男声（16kHz, ~115MB）。先运行: bash download_model.sh vits-male",
+    "model": "models/vits-zh-hf-fanchen-wnj/vits-zh-hf-fanchen-wnj.onnx",
+    "lexicon": "models/vits-zh-hf-fanchen-wnj/lexicon.txt",
+    "tokens": "models/vits-zh-hf-fanchen-wnj/tokens.txt",
+    "dict_dir": "models/vits-zh-hf-fanchen-wnj/dict",
     "speaker_id": 0
   },
 

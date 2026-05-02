@@ -94,15 +94,35 @@ ls -lh models/vits-zh-aishell3/
 # -rw-r--r--  38M  vits-aishell3.int8.onnx
 ```
 
-## 4. 待完成事项
+## 4. 实施结果
 
-1. **查找 speaker_id ↔ gender 对应表**
-   - AISHELL-3 数据集包含性别标注, 需下载 `spkrs.gender` 文件
-   - 或从 sherpa-onnx 文档查找预设 ID
+### 4.1 aishell3 模型评估
 
-2. **代码集成**
-   - 修改 TTS 引擎支持多说话人选择
-   - 配置文件添加 speaker_id 字段
+**结论: 不可用** — 实测 sample_rate 仅 8kHz（电话级音质），无法用于视频配音。
+
+### 4.2 替代方案: vits-zh-hf-fanchen-wnj
+
+| 属性 | 值 |
+|------|-----|
+| 模型 | `csukuangfj/vits-zh-hf-fanchen-wnj` |
+| 采样率 | **16kHz** |
+| 说话人 | 1 (男声) |
+| 模型大小 | ~115MB |
+| 速度控制 | 支持 (speed 参数) |
+| 生成速度 | ~5s/句 (CPU) |
+
+已下载到 `models/vits-zh-hf-fanchen-wnj/`:
+- `vits-zh-hf-fanchen-wnj.onnx` (115MB)
+- `lexicon.txt`, `tokens.txt`, FST 文件
+- `dict/` 分词词典
+
+### 4.3 代码集成
+
+- 复用现有 `SherpaOnnxEngine`，无需新引擎类
+- 添加 `supports_rate = True`，`speed=rate` 传递
+- `config.json` 中 `sherpa_onnx.model` 指向新模型路径
+- `download_model.sh vits-male` 一键下载
+- tts_chain 中作为本地兜底: `["edge-tts", "sherpa-onnx", "piper", "pyttsx3"]`
 
 ## 5. 参考资料
 

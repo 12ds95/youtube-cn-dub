@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 集成测试脚本: 对 10 个视频执行全功能管线测试
-# 全功能开启: two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown
+# 全功能开启: two_pass, nlp_segmentation, isometric, post_tts_calibration,
+#   gap_borrowing, video_slowdown, atempo_disabled, feedback_loop
 # 用途: 收集 TTS 时长校准数据 + 回归测试
 # 覆盖领域: 微积分、计算机科学、微分方程、神经网络、分析、概率
 
@@ -15,23 +16,17 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-# 从 config.json 读取 LLM 配置（避免硬编码 API Key）
-if [ ! -f "config.json" ]; then
-    echo -e "${RED}❌ config.json 不存在，请先从 config.example.json 复制并配置${NC}"
-    exit 1
-fi
-LLM_API_URL=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_url',''))")
-LLM_API_KEY=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_key',''))")
-LLM_MODEL=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('model',''))")
-if [ -z "$LLM_API_KEY" ]; then
-    echo -e "${RED}❌ config.json 中 llm.api_key 为空${NC}"
-    exit 1
-fi
-
 VIDEOS=(
     "d4EgbgTm0Bg"
     "kCc8FmEb1nY"
     "zjMuIxRvygQ"
+    "Calculus/WUvTyaaNkzM"
+    "Computer Science/03_But_how_does_bitcoin_actually_work_"
+    "Computer Science/05_Simulating_an_epidemic"
+    "Differential Equations/01_Differential_equations,_studying_the_unsolvable"
+    "Neural Networks/aircAruvnKk"
+    "Analysis/02_But_what_is_the_Fourier_Transform__A_visual_introduction."
+    "Probability/06_But_what_is_the_Central_Limit_Theorem_"
 )
 
 run_video() {
@@ -80,9 +75,9 @@ run_video() {
   "voice": "zh-CN-YunxiNeural",
   "translator": "llm",
   "llm": {
-    "api_url": "$LLM_API_URL",
-    "api_key": "$LLM_API_KEY",
-    "model": "$LLM_MODEL",
+    "api_url": "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
+    "api_key": "sk-sp-e0987ca0f8c04f969a5218dbdc6f1401",
+    "model": "qwen3-coder-next",
     "batch_size": 8,
     "temperature": 0.3,
     "two_pass": true,
@@ -98,7 +93,7 @@ run_video() {
   "refine": {
     "enabled": true,
     "max_iterations": 20,
-    "speed_threshold": 1.25,
+    "speed_threshold": 1.5,
     "post_tts_calibration": true,
     "calibration_threshold": 1.30
   },
@@ -106,7 +101,10 @@ run_video() {
     "gap_borrowing": true,
     "max_borrow_ms": 300,
     "video_slowdown": true,
-    "max_slowdown_factor": 0.85
+    "max_slowdown_factor": 0.85,
+    "atempo_disabled": true,
+    "feedback_loop": true,
+    "feedback_tolerance": 0.15
   },
   "audio_separation": {
     "enabled": true,
@@ -120,7 +118,7 @@ JSONEOF
 
     echo -e "${YELLOW}🚀 开始运行管线...${NC}"
     echo "   skip_steps: $SKIP_STEPS"
-    echo "   功能: two_pass, nlp_segmentation, isometric, post_tts_calibration, gap_borrowing, video_slowdown"
+    echo "   功能: two_pass, nlp_segmentation, isometric, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop"
     echo ""
 
     local START_TIME

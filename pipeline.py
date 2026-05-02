@@ -1352,14 +1352,11 @@ def _default_translation_rules() -> str:
     """通用翻译保护规则，无论主题识别是否成功都会注入"""
     return (
         "\n通用翻译规则（始终遵守）:"
-        "\n  - 禁止使用任何 Markdown 格式：不要使用 **加粗**、*斜体*、`反引号`、# 标题等标记"
-        "\n  - 代码相关词汇（函数名、变量名、类名等）直接用中文描述或保留原文，不要用反引号包裹"
-        "\n  - 数学符号（i, e, π, θ 等）在数学/科学语境中保持为专业术语，不可翻译为日常用语（如 i→'我'）"
-        "\n  - 负号'-'在数学/科学语境中必须翻译为'负'，不可省略（字幕'-3'应读作'负三'）"
-        "\n  - 英文倒装句（there be, 状语前置等）翻译时需调整为中文习惯语序"
-        "\n  - 翻译结果用于语音配音朗读，需通顺自然，适合听觉理解，输出纯文本"
-        "\n  - 前后文语义连贯，避免相邻段之间出现语义断裂或内容重复"
-        "\n  - 译文长度应与原文时长匹配：短句译文要简洁，长句可适当展开，避免配音时语速异常"
+        "\n  - 禁止使用 Markdown 格式（不用 **加粗**、`反引号`、# 标题等标记）"
+        "\n  - 数学符号（i, e, π, θ 等）在数学/科学语境中保持专业含义，不译为日常用语"
+        "\n  - 负号'-'在数学语境中翻译为'负'，如'-3'读作'负三'"
+        "\n  - 译文用于语音朗读，必须通顺自然，适合听觉理解"
+        "\n  - 宁可译文稍长，也不要为省字数而删减原文信息"
     )
 
 
@@ -1505,7 +1502,17 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     api_url = llm_config["api_url"].rstrip("/")
     api_key = llm_config["api_key"]
     model = llm_config["model"]
-    system_prompt = llm_config.get("system_prompt", "将英文翻译为中文，只输出翻译结果。")
+    system_prompt = llm_config.get("system_prompt",
+        "你是专业的英中视频翻译员，负责将YouTube教育视频的英文旁白翻译为自然流畅的中文配音稿。\n"
+        "翻译原则：\n"
+        "1) 忠实传达原文全部信息，不遗漏、不添加、不曲解\n"
+        "2) 译文用于语音朗读，必须通顺自然，符合中文口语表达习惯\n"
+        "3) 保持与原文相近的语气和情感（教学、惊叹、幽默等）\n"
+        "4) 计算机/数学术语保留通用英文缩写（API、GPU、3x3等），不加括号注音\n"
+        "5) 避免翻译腔：不生硬直译，也不过度意译丢失原意\n"
+        "6) 每句译文长度应与原文时长匹配，不要过度压缩也不要冗余扩充\n"
+        "7) 只输出翻译结果，不输出解释或注释"
+    )
     batch_size = llm_config.get("batch_size", 15)
     temperature = llm_config.get("temperature", 0.3)
     style = llm_config.get("style", "")
@@ -1550,7 +1557,7 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
         batch = segments[i:i + batch_size]
         # 构造批量翻译请求：每行一句，用编号标记
-        CHARS_PER_SEC = 4.5  # TTS 中文语速：约 4.5 字/秒
+        CHARS_PER_SEC = 4.0  # TTS 中文语速：约 4 字/秒（宽松值，减少小模型过度压缩）
         lines = []
         char_hints = []
         for j, seg in enumerate(batch):
@@ -1582,15 +1589,12 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             context_hint += f"下文预览：{'；'.join(next_preview)}\n"
 
         batch_prompt = (
-            f"{system_prompt}\n\n"
-            + (f"{context_hint}\n" if context_hint else "")
-            + f"前文和下文仅供理解语境，翻译只针对当前批次编号内容。\n"
-            f"请翻译以下 {len(batch)} 句话，每句保持 [编号] 格式，"
-            f"一行一句，不要合并或拆分。\n"
+            (f"{context_hint}\n" if context_hint else "")
+            + f"请翻译以下 {len(batch)} 句英文，每句用 [编号] 格式输出，一行一句，不要合并或拆分。\n"
             f"{hint_line}\n"
             f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
-            f"计算机缩写保留英文原词，不加括号注音。"
-            f"忠实原文语义，不要曲解也不要过度扩充。\n\n{user_msg}"
+            f"宁可稍长也不要为凑字数而截断语义。"
+            f"计算机缩写保留英文原词，不加括号注音。\n\n{user_msg}"
         )
 
         payload = {
@@ -1776,11 +1780,13 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     # 使用修改后的 system_prompt 强调忠实性
     pass1_config = copy.deepcopy(llm_config)
     pass1_config["system_prompt"] = (
-        "你是专业的英中翻译引擎。请逐句忠实翻译以下英文，要求：\n"
-        "1) 保留原文所有信息点，不遗漏不添加\n"
-        "2) 直译为主，保持与原文的一一对应关系\n"
-        "3) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
-        "4) 只输出翻译结果，不要解释"
+        "你是专业的英中翻译引擎，正在为教育视频制作字幕翻译。请逐句忠实翻译以下英文。\n"
+        "要求：\n"
+        "1) 完整保留原文所有信息点，一个都不能遗漏\n"
+        "2) 忠实直译为主，保持与原文的一一对应关系\n"
+        "3) 译文必须是通顺的中文，不要逐词硬译\n"
+        "4) 计算机/数学缩写保留英文原词（如 API、SDK、HTTP、GPU、3x3 等），不加括号注音\n"
+        "5) 只输出翻译结果，不要解释"
     )
     # 清除外部模板，Pass 1 使用固定 prompt
     pass1_config["prompt_template"] = ""
@@ -1799,17 +1805,22 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     endpoint = api_url if "/chat/completions" in api_url else f"{api_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    CHARS_PER_SEC = 4.5
+    CHARS_PER_SEC = 4.0
     adapt_system = (
-        "你是视频配音翻译改编专家。将直译版改写为适合口语配音朗读的自然中文。\n"
-        "要求：\n"
-        "1) 保持原文语义完整，不得遗漏信息\n"
-        "2) 使表达更口语化、节奏更适合朗读\n"
-        "3) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
-        "4) 忠实原文语义，不要为凑字数曲解也不要过度扩充\n"
-        "5) 译文长度尽量匹配参考字数（用于控制配音时长）\n"
+        "你是视频配音翻译润色专家。在忠实直译的基础上做轻度润色，使之更适合口语朗读。\n"
+        "核心原则——保留全部信息，只调表达：\n"
+        "1) 直译版的每一个信息点都必须保留，绝不能为省字数而删减内容\n"
+        "2) 只做表达润色：调整语序使之更口语化、拆分长从句、替换书面词为口语词\n"
+        "3) 保持原文的语气和情感基调（教学讲解风格，不要变成网络口水话）\n"
+        "4) 计算机/数学缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "5) 译文长度尽量匹配参考字数，但宁可稍长也不要截断语义\n"
         "6) 每句保持 [编号] 格式，一行一句\n"
-        "7) 不要输出解释，只输出改编结果"
+        "7) 只输出润色结果，不要解释\n\n"
+        "错误示范（不要这样做）：\n"
+        "  原文: 'viewers of this channel would certainly enjoy his content, so do check it out'\n"
+        "  直译: '本频道的观众一定会喜欢他的内容，所以一定去看看'\n"
+        "  ✗ 错误润色: '他频道超赞，别错过' ← 删掉了'本频道观众'和'一定会喜欢'的信息\n"
+        "  ✓ 正确润色: '咱频道的观众肯定也会喜欢他的内容，大家一定去看看'"
     )
 
     print(f"  🎙️  Pass 2: 配音改编...")
@@ -1830,7 +1841,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
             )
 
         user_msg = (
-            f"请将以下 {len(batch)} 段直译改编为配音用自然中文，"
+            f"请对以下 {len(batch)} 段直译做轻度口语化润色，保留全部信息，"
             f"每句用 [编号] 格式输出：\n\n" + "\n\n".join(lines)
         )
 
@@ -1863,7 +1874,13 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
                 if adapted and len(adapted.strip()) >= 2:
                     clean = _strip_numbered_prefix(adapted) if re.match(r"^\[\d+\]", adapted) else adapted
                     clean = _strip_markdown(clean, seg["text_en"])
-                    # 语义校验: 改编结果不应与直译完全无关
+                    # 质量守卫: 润色后不应比直译短太多（短 40% 以上说明删了内容）
+                    pass1_zh = seg["text_zh"]
+                    if len(clean) >= 2 and len(pass1_zh) > 4:
+                        shrink_ratio = len(clean) / len(pass1_zh)
+                        if shrink_ratio < 0.6:
+                            pass2_fallback += 1
+                            continue  # 保持 Pass 1 结果，拒绝过度压缩
                     if len(clean) >= 2:
                         final_results[i + j]["text_zh"] = clean
                         pass2_adapted += 1
@@ -1903,7 +1920,7 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                           max_retries: int = 3):
     """逐条 LLM 翻译（降级方案），带重试"""
     import httpx
-    CHARS_PER_SEC = 4.5
+    CHARS_PER_SEC = 4.0
     results = []
     for seg in batch:
         zh = None
@@ -1911,8 +1928,8 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
         target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
         user_content = (
-            f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注。"
-            f"计算机缩写保留英文原词，不加括号注音。）\n{seg['text']}"
+            f"（译文约{target_chars}字，宁可稍长也不要截断语义。"
+            f"不要在译文中输出字数标注。）\n{seg['text']}"
         )
         for attempt in range(max_retries):
             try:

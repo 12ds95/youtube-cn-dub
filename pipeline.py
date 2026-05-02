@@ -3269,7 +3269,8 @@ def _identify_high_cps_segments(
         estimated_cps = zh_chars / target_sec
         estimated_ms = _estimate_duration_jieba(text_zh)  # 校准后参数已含停顿
         ratio = estimated_ms / target_ms if target_ms > 0 else 0
-        if estimated_cps > cps_threshold or ratio > 1.2:
+        # 仅当 CPS 明确超标时触发（ratio 辅助验证，避免 jieba 估算误差导致的误触发）
+        if estimated_cps > cps_threshold and ratio > 1.15:
             high_cps.append(i)
     return high_cps
 
@@ -4613,10 +4614,14 @@ def _select_best_candidate(
             if len(cand) > len(original_zh) * 2.0:
                 continue
         elif allow_same_length:
-            if len(cand) > len(original_zh) * 1.1:
+            if len(cand) > len(original_zh) * 1.15:
                 continue
         else:
             if len(cand) >= len(original_zh):
+                continue
+        # 质量守卫: 拒绝过度压缩（<60%原文长度说明删了信息而非精练表达）
+        if mode != "fill" and len(original_zh) > 4:
+            if len(cand) < len(original_zh) * 0.6:
                 continue
         # 排除与邻段重复的
         if _is_duplicate_of_neighbors(cand, idx, segments):
@@ -4680,7 +4685,7 @@ def _isometric_translate_batch(
     import copy
 
     result = copy.deepcopy(segments)
-    CHARS_PER_SEC = 4.5
+    CHARS_PER_SEC = 4.0
 
     api_url = llm_config["api_url"].rstrip("/")
     api_key = llm_config["api_key"]
@@ -4699,19 +4704,18 @@ def _isometric_translate_batch(
 
     system_prompt = (
         "你是专业的英中视频配音翻译专家。以下英文已有初始中文翻译，"
-        "但翻译朗读时长可能不匹配原始时间窗口。\n"
+        "但翻译朗读时长超出原始时间窗口，需要精简。\n"
         "请为每段生成 3 个不同长度的中文翻译版本：\n"
-        "  [轻] 标准版（接近初始翻译长度，微调表达使其更适合朗读）\n"
-        "  [中] 紧凑版（缩短约 15-20%，精简表达但保留完整信息）\n"
-        "  [短] 精简版（缩短约 30-40%，只保留核心语义）\n\n"
-        "规则：\n"
-        "1) 三个版本都必须忠实翻译英文原文，不得偏离原文含义\n"
-        "2) 每个 [编号] 的版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
-        "3) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
-        "4) 忠实原文语义，不要为缩短而曲解原意\n"
-        "5) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
-        "6) 适合配音朗读，语句自然，短句为主\n"
-        "7) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
+        "  [轻] 微调版（去除冗余修饰词，保留全部信息）\n"
+        "  [中] 紧凑版（缩短约 15%，简化句式但保留全部信息点）\n"
+        "  [短] 精简版（缩短约 25%，用更简练的表达传达全部信息）\n\n"
+        "核心规则：三个版本都必须保留原文的全部信息点，区别只在于表达的精炼程度。\n"
+        "1) 忠实翻译英文原文，不得偏离原文含义\n"
+        "2) 不要删除信息来省字数——要靠更精练的表达来缩短\n"
+        "3) 计算机缩写保留英文原词，不加括号注音\n"
+        "4) 严禁重复上下文内容\n"
+        "5) 译文自然流畅，适合朗读\n"
+        "6) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
     )
 
     # 构建待处理列表
@@ -4812,7 +4816,7 @@ def _isometric_expand_batch(
     import copy
 
     result = copy.deepcopy(segments)
-    CHARS_PER_SEC = 4.5
+    CHARS_PER_SEC = 4.0
 
     api_url = llm_config["api_url"].rstrip("/")
     api_key = llm_config["api_key"]

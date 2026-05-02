@@ -32,11 +32,10 @@
   },
 
   "__=== TTS 配音引擎 ===__": "",
-  "__TTS 说明__": "7 个引擎各有独立语音配置，voice 字段仅影响 edge-tts。tts_chain 定义引擎优先级，第一个为主引擎，后面按顺序做整体回退",
+  "__TTS 说明__": "5 个引擎各有独立语音配置，voice 字段仅影响 edge-tts。tts_chain 定义引擎优先级，第一个为主引擎，后面按顺序做整体回退",
   "__tts_chain 推荐配置__": {
     "纯在线（最省事）": ["edge-tts", "gtts", "pyttsx3"],
     "在线优先+离线兜底":  ["edge-tts", "gtts", "piper", "pyttsx3"],
-    "最佳音质优先":       ["siliconflow", "edge-tts", "pyttsx3"],
     "纯离线（无需网络）": ["piper", "sherpa-onnx", "pyttsx3"]
   },
   "tts_chain": ["edge-tts", "gtts", "pyttsx3"],
@@ -70,13 +69,6 @@
 
   "__=== 各引擎专属配置 ===__": "",
 
-  "siliconflow": {
-    "__说明__": "硅基流动 CosyVoice2 云端推理（中文音质最佳，免费额度）。注册: https://cloud.siliconflow.cn",
-    "api_key": "",
-    "model": "FunAudioLLM/CosyVoice2-0.5B",
-    "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
-  },
-
   "pyttsx3": {
     "__说明__": "系统自带 TTS（完全离线零依赖）。macOS 需在 系统设置 → 辅助功能 → 朗读内容 → 管理声音 中下载中文语音",
     "voice_name": null,
@@ -95,11 +87,6 @@
     "tokens": "models/sherpa-onnx/vits-melo-tts-zh_en/tokens.txt",
     "dict_dir": "",
     "speaker_id": 0
-  },
-
-  "cosyvoice": {
-    "__说明__": "CosyVoice 阿里开源 TTS（需 GPU + 本地部署，支持声音克隆）",
-    "model_path": "CosyVoice-300M"
   },
 
   "__=== 人声/背景音分离 ===__": "",

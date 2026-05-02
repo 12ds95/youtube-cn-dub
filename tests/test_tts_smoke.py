@@ -7,8 +7,6 @@ TTS 引擎冒烟测试 — 真实合成验证。
   - 在线引擎(edge-tts, gtts)需要网络
   - 本地引擎(piper, sherpa-onnx)需要已下载模型
   - pyttsx3 需要系统中文语音包
-  - siliconflow 需要有效 API Key（无 key 则跳过）
-  - cosyvoice 需要 GPU + 本地部署（默认跳过）
 """
 import sys
 import os
@@ -148,43 +146,6 @@ def test_sherpa_onnx_real_synthesis():
         _run(engine.synthesize(TEST_TEXT, path, voice))
         size = os.path.getsize(path)
         assert size > 100, f"sherpa-onnx 产出文件太小: {size} bytes"
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
-
-
-# ── siliconflow ──
-
-def test_siliconflow_real_synthesis():
-    """SiliconFlow 真实合成（需有效 API Key + 余额）：生成 mp3 文件且 > 0 字节"""
-    import json
-    config_path = os.path.join(PROJECT_ROOT, "config.json")
-    api_key = ""
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            cfg = json.load(f)
-        api_key = cfg.get("siliconflow", {}).get("api_key", "")
-    if not api_key or len(api_key) < 10:
-        raise unittest_skip("SiliconFlow API Key 未配置，跳过")
-    from pipeline import SiliconFlowTTSEngine
-    engine = SiliconFlowTTSEngine(api_key=api_key)
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-        path = f.name
-    try:
-        voice = engine.resolve_voice("zh-CN-YunxiNeural")
-        try:
-            _run_network(engine.synthesize(TEST_TEXT, path, voice), "siliconflow")
-        except unittest_skip:
-            raise  # 网络问题已被 _run_network 处理为 skip
-        except Exception as e:
-            err_msg = str(e).lower()
-            # 余额不足 / 认证失败 / 权限不够 → 当作跳过而非失败
-            if any(kw in err_msg for kw in ("401", "403", "balance", "insufficient",
-                                             "quota", "unauthorized", "forbidden")):
-                raise unittest_skip(f"SiliconFlow API 不可用（余额/权限）: {e}")
-            raise
-        size = os.path.getsize(path)
-        assert size > 100, f"siliconflow 产出文件太小: {size} bytes"
     finally:
         if os.path.exists(path):
             os.unlink(path)

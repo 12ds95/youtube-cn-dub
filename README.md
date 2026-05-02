@@ -142,17 +142,15 @@ bash run.sh --config config.json
 
 ### TTS 配音引擎
 
-支持 7 个 TTS 引擎，通过 `tts_chain` 定义引擎优先级链。单引擎失败时整体回退到下一个引擎重新生成全部片段，保证语音一致性。远程引擎自动阶梯降并发重试（正常→半→1，连续 3 轮无改善才放弃），本地引擎失败即放弃。切换引擎前自动备份到 `tts_backup_{engine}/`，支持从 `tts_failure.json` 断点恢复。
+支持 5 个 TTS 引擎，通过 `tts_chain` 定义引擎优先级链。单引擎失败时整体回退到下一个引擎重新生成全部片段，保证语音一致性。远程引擎自动阶梯降并发重试（正常→半→1，连续 3 轮无改善才放弃），本地引擎失败即放弃。切换引擎前自动备份到 `tts_backup_{engine}/`，支持从 `tts_failure.json` 断点恢复。
 
 | 引擎 | 类型 | 中文质量 | 需要 | 说明 |
 |------|------|---------|------|------|
 | `edge-tts` | 远程免费 | 优秀 | 网络 | 默认引擎，微软免费 API，6+ 中文音色 |
-| `siliconflow` | 远程免费 | 最佳 | API Key | 硅基流动 CosyVoice2，注册送额度 |
 | `gtts` | 远程免费 | 良好 | 网络 | Google Translate TTS，单音色 |
 | `pyttsx3` | 本地离线 | 一般 | 无 | 系统自带 TTS，零依赖终极兜底 |
 | `piper` | 本地离线 | 良好 | 下载模型(~70MB) | ONNX 推理，CPU 友好 |
 | `sherpa-onnx` | 本地离线 | 良好 | 下载模型(~110MB) | MeloTTS 中英混合模型，CPU 友好 |
-| `cosyvoice` | 本地部署 | 最佳 | GPU | 阿里开源，支持声音克隆 |
 
 每个引擎有独立的语音配置（通过 `resolve_voice()` 方法），`voice` 字段仅影响 edge-tts，其他引擎会忽略它并使用各自的配置。
 
@@ -164,9 +162,6 @@ bash run.sh --config config.json
 
 # 在线优先 + 离线兜底
 "tts_chain": ["edge-tts", "gtts", "piper", "pyttsx3"]
-
-# 最佳音质优先（需 SiliconFlow API Key）
-"tts_chain": ["siliconflow", "edge-tts", "pyttsx3"]
 
 # 纯离线（完全无需网络，需先下载模型）
 "tts_chain": ["piper", "sherpa-onnx", "pyttsx3"]
@@ -184,25 +179,6 @@ bash run.sh --config config.json
 | `zh-CN-YunxiaNeural` | 男 | 偏年轻 |
 
 **各引擎专属配置：**
-
-使用 SiliconFlow CosyVoice2（注册 https://cloud.siliconflow.cn 获取免费 API Key）：
-
-```json
-{
-  "tts_chain": ["siliconflow", "edge-tts", "pyttsx3"],
-  "siliconflow": {
-    "api_key": "sk-xxx",
-    "model": "FunAudioLLM/CosyVoice2-0.5B",
-    "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
-  }
-}
-```
-
-| 字段 | 默认值 | 说明 |
-|------|--------|------|
-| `siliconflow.api_key` | `""` | 硅基流动 API Key |
-| `siliconflow.model` | `"FunAudioLLM/CosyVoice2-0.5B"` | 模型 ID |
-| `siliconflow.voice` | `"...CosyVoice2-0.5B:alex"` | 音色：alex / benjamin / charles / cosmo |
 
 使用本地离线引擎（需先下载模型）：
 
@@ -226,7 +202,6 @@ bash run.sh --config config.json
 | `sherpa_onnx.tokens` | `""` | tokens 文件路径 |
 | `sherpa_onnx.dict_dir` | `""` | 词典目录（可选） |
 | `sherpa_onnx.speaker_id` | `0` | 说话人 ID（多人模型时选择） |
-| `cosyvoice.model_path` | null | CosyVoice 模型路径（需 GPU） |
 
 `pyttsx3` 离线兜底需 macOS 中文语音包（系统设置 → 辅助功能 → 朗读内容 → 管理声音 → 下载 Ting-Ting）：
 

@@ -249,19 +249,14 @@ DEFAULT_CONFIG = {
     #   也可用旧方式: tts_engine(主) + tts_fallback(回退列表)
     #   各引擎有独立语音配置（voice 字段仅影响 edge-tts），详见各引擎 resolve_voice()
     #   引擎分类:
-    #     远程: edge-tts(免费), gtts(免费), siliconflow(免费额度)
-    #     本地: pyttsx3(零依赖), piper(需下载~70MB), sherpa-onnx(需下载~110MB), cosyvoice(需GPU)
+    #     远程: edge-tts(免费), gtts(免费)
+    #     本地: pyttsx3(零依赖), piper(需下载~70MB), sherpa-onnx(需下载~110MB)
     "tts_chain": None,               # 引擎优先链: 如 ["edge-tts", "gtts", "pyttsx3"]
                                      # 为 null 时使用 tts_engine + tts_fallback 组合
     "tts_engine": "edge-tts",        # 主 TTS 引擎（tts_chain 为空时生效）
     "tts_fallback": [],              # 回退引擎列表（tts_chain 为空时生效）
 
     # 各 TTS 引擎专属配置（仅使用对应引擎时需要）
-    "siliconflow": {                 # 硅基流动 CosyVoice2（注册 https://cloud.siliconflow.cn 送额度）
-        "api_key": "",               # 硅基流动 API Key
-        "model": "FunAudioLLM/CosyVoice2-0.5B",   # 模型 ID
-        "voice": "FunAudioLLM/CosyVoice2-0.5B:alex",  # 音色: alex / benjamin / charles / cosmo
-    },
     "pyttsx3": {                     # 系统自带 TTS（完全离线，macOS=NSSpeech / Windows=SAPI5）
                                      # macOS 需先下载中文语音: 系统设置 → 辅助功能 → 朗读内容 → 管理声音
         "voice_name": None,          # 系统语音名: "Ting-Ting"(普通话女) / "Mei-Jia"(台湾女) / null=自动查找中文
@@ -276,9 +271,6 @@ DEFAULT_CONFIG = {
         "tokens": "",                # tokens 文件: 如 "models/sherpa-onnx/vits-melo-tts-zh_en/tokens.txt"
         "dict_dir": "",              # 词典目录（可选）
         "speaker_id": 0,             # 说话人 ID（多人模型时选择）
-    },
-    "cosyvoice": {                   # CosyVoice 阿里开源 TTS（需 GPU + 本地部署）
-        "model_path": None,          # 模型路径: 如 "CosyVoice-300M"
     },
 
     # ── 人声/背景音分离 ──
@@ -2171,87 +2163,6 @@ class SherpaOnnxEngine(TTSEngine):
         await loop.run_in_executor(None, _gen)
 
 
-class CosyVoiceEngine(TTSEngine):
-    """CosyVoice: 阿里开源 TTS（需 GPU，中文最佳音质）"""
-    name = "cosyvoice"
-    is_local = True
-
-    def __init__(self, model_path: str = None):
-        self.model_path = model_path
-        self._model = None
-
-    def _load_model(self):
-        if self._model is None:
-            from cosyvoice import CosyVoice
-            self._model = CosyVoice(self.model_path or "CosyVoice-300M")
-        return self._model
-
-    def resolve_voice(self, global_voice: str) -> str:
-        """CosyVoice 使用中文语音角色名，忽略全局 edge-tts voice"""
-        return "中文女"
-
-    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
-        loop = asyncio.get_event_loop()
-        def _gen():
-            model = self._load_model()
-            output = model.inference_sft(text, voice)  # 已由 resolve_voice 转换
-            import torchaudio
-            torchaudio.save(path.replace(".mp3", ".wav"),
-                            output["tts_speech"], 22050)
-            from pydub import AudioSegment as PydubSegment
-            wav_path = path.replace(".mp3", ".wav")
-            PydubSegment.from_wav(wav_path).export(path, format="mp3")
-            os.remove(wav_path)
-        await loop.run_in_executor(None, _gen)
-
-
-class SiliconFlowTTSEngine(TTSEngine):
-    """SiliconFlow: 硅基流动云端 CosyVoice2（免费额度，OpenAI 兼容 API，中文音质最佳）
-    注册即送额度: https://cloud.siliconflow.cn
-    配置示例:
-      "siliconflow": {
-          "api_key": "sk-xxx",
-          "model": "FunAudioLLM/CosyVoice2-0.5B",
-          "voice": "FunAudioLLM/CosyVoice2-0.5B:alex"
-      }
-    """
-    name = "siliconflow"
-    is_local = False
-
-    def __init__(self, api_key: str = None, model: str = None, voice_id: str = None):
-        self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY", "")
-        self.model = model or "FunAudioLLM/CosyVoice2-0.5B"
-        self.voice_id = voice_id or "FunAudioLLM/CosyVoice2-0.5B:alex"
-
-    def resolve_voice(self, global_voice: str) -> str:
-        """SiliconFlow 使用自己的 voice_id，忽略全局 edge-tts voice"""
-        return self.voice_id
-
-    async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
-        import httpx
-        url = "https://api.siliconflow.cn/v1/audio/speech"
-        payload = {
-            "model": self.model,
-            "input": text,
-            "voice": voice,  # 已经由 resolve_voice 转换
-            "response_format": "mp3",
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code in (401, 403):
-                raise TTSFatalError(
-                    f"SiliconFlow 认证/余额错误 ({resp.status_code}): {resp.text[:200]}")
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"SiliconFlow TTS 失败 ({resp.status_code}): {resp.text[:200]}")
-            with open(path, "wb") as f:
-                f.write(resp.content)
-
-
 class Pyttsx3Engine(TTSEngine):
     """pyttsx3: 系统自带 TTS（macOS=NSSpeech, Windows=SAPI5），完全离线零依赖
     macOS 中文语音需在 系统设置 → 辅助功能 → 朗读内容 → 管理声音 中下载。
@@ -2316,8 +2227,6 @@ TTS_ENGINES = {
     "gtts": GTTSEngine,
     "piper": PiperTTSEngine,
     "sherpa-onnx": SherpaOnnxEngine,
-    "cosyvoice": CosyVoiceEngine,
-    "siliconflow": SiliconFlowTTSEngine,
     "pyttsx3": Pyttsx3Engine,
 }
 
@@ -2332,16 +2241,10 @@ def _create_tts_engine(config: dict) -> TTSEngine:
         engine_name = "edge-tts"
 
     engine_cls = TTS_ENGINES[engine_name]
-    if engine_name in ("piper", "cosyvoice"):
+    if engine_name == "piper":
         return engine_cls(model_path=engine_config.get("model_path"))
     elif engine_name == "sherpa-onnx":
         return engine_cls(model_config=engine_config)
-    elif engine_name == "siliconflow":
-        return engine_cls(
-            api_key=engine_config.get("api_key"),
-            model=engine_config.get("model"),
-            voice_id=engine_config.get("voice"),
-        )
     elif engine_name == "pyttsx3":
         return engine_cls(
             voice_name=engine_config.get("voice_name"),

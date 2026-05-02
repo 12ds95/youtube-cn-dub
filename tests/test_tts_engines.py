@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline import (
     TTS_ENGINES, TTSEngine, _create_tts_engine,
-    EdgeTTSEngine, GTTSEngine, SiliconFlowTTSEngine,
-    Pyttsx3Engine, PiperTTSEngine, SherpaOnnxEngine, CosyVoiceEngine,
+    EdgeTTSEngine, GTTSEngine,
+    Pyttsx3Engine, PiperTTSEngine, SherpaOnnxEngine,
     _generate_tts_segments, _backup_tts, TTSFatalError,
 )
 
@@ -19,8 +19,8 @@ from pipeline import (
 def test_all_engines_registered():
     """所有引擎都应在 TTS_ENGINES 注册表中"""
     expected = {
-        "edge-tts", "gtts", "siliconflow", "pyttsx3",
-        "piper", "sherpa-onnx", "cosyvoice",
+        "edge-tts", "gtts", "pyttsx3",
+        "piper", "sherpa-onnx",
     }
     actual = set(TTS_ENGINES.keys())
     assert expected == actual, f"引擎注册表不匹配: 缺少 {expected - actual}, 多余 {actual - expected}"
@@ -63,23 +63,6 @@ def test_factory_unknown_engine_fallback():
     """未知引擎名应回退到 edge-tts"""
     engine = _create_tts_engine({"tts_engine": "nonexistent"})
     assert isinstance(engine, EdgeTTSEngine)
-
-
-def test_factory_siliconflow():
-    """SiliconFlow 引擎应正确接收配置参数"""
-    config = {
-        "tts_engine": "siliconflow",
-        "siliconflow": {
-            "api_key": "test-key",
-            "model": "test-model",
-            "voice": "test-voice",
-        },
-    }
-    engine = _create_tts_engine(config)
-    assert isinstance(engine, SiliconFlowTTSEngine)
-    assert engine.api_key == "test-key"
-    assert engine.model == "test-model"
-    assert engine.voice_id == "test-voice"
 
 
 def test_factory_pyttsx3():
@@ -126,8 +109,8 @@ def test_batch_synthesize_exists():
 
 
 def test_free_online_engines_count():
-    """应至少有 3 个免费在线引擎可选"""
-    free_online = {"edge-tts", "gtts", "siliconflow"}
+    """应至少有 2 个免费在线引擎可选"""
+    free_online = {"edge-tts", "gtts"}
     registered = set(TTS_ENGINES.keys())
     assert free_online.issubset(registered), \
         f"缺少免费在线引擎: {free_online - registered}"
@@ -147,22 +130,6 @@ def test_resolve_voice_edge_tts():
     """edge-tts 应直接使用全局 voice"""
     engine = EdgeTTSEngine()
     assert engine.resolve_voice("zh-CN-YunxiNeural") == "zh-CN-YunxiNeural"
-
-
-def test_resolve_voice_siliconflow_ignores_global():
-    """SiliconFlow 应使用自己的 voice_id，忽略全局 zh-CN-YunxiNeural"""
-    engine = SiliconFlowTTSEngine(voice_id="FunAudioLLM/CosyVoice2-0.5B:alex")
-    resolved = engine.resolve_voice("zh-CN-YunxiNeural")
-    assert resolved == "FunAudioLLM/CosyVoice2-0.5B:alex"
-    assert "YunxiNeural" not in resolved
-
-
-def test_resolve_voice_siliconflow_default():
-    """SiliconFlow 未配 voice_id 时应用默认值，而非全局 voice"""
-    engine = SiliconFlowTTSEngine()
-    resolved = engine.resolve_voice("zh-CN-YunxiNeural")
-    assert "CosyVoice2" in resolved
-    assert "YunxiNeural" not in resolved
 
 
 def test_resolve_voice_pyttsx3_ignores_global():
@@ -189,14 +156,6 @@ def test_resolve_voice_piper_ignores_global():
     assert "YunxiNeural" not in resolved
 
 
-def test_resolve_voice_cosyvoice_ignores_global():
-    """CosyVoice 应使用中文角色名，忽略全局 voice"""
-    engine = CosyVoiceEngine()
-    resolved = engine.resolve_voice("zh-CN-YunxiNeural")
-    assert resolved == "中文女"
-    assert "YunxiNeural" not in resolved
-
-
 def test_resolve_voice_sherpa_ignores_global():
     """sherpa-onnx 应使用 speaker_id，忽略全局 voice"""
     engine = SherpaOnnxEngine(model_config={"speaker_id": 3})
@@ -216,11 +175,11 @@ def test_tts_chain_primary_engine():
 
 def test_tts_chain_string_format():
     """tts_chain 应支持单字符串格式"""
-    config = {"tts_chain": "siliconflow"}
+    config = {"tts_chain": "piper"}
     chain = config["tts_chain"]
     if isinstance(chain, str):
         chain = [chain]
-    assert chain == ["siliconflow"]
+    assert chain == ["piper"]
 
 
 def test_tts_chain_overrides_tts_engine():
@@ -228,14 +187,14 @@ def test_tts_chain_overrides_tts_engine():
     config = {
         "tts_engine": "edge-tts",
         "tts_fallback": ["gtts"],
-        "tts_chain": ["siliconflow", "pyttsx3", "edge-tts"],
+        "tts_chain": ["piper", "pyttsx3", "edge-tts"],
     }
-    # tts_chain 存在时，主引擎应为 siliconflow
+    # tts_chain 存在时，主引擎应为 piper
     chain = config.get("tts_chain")
     assert chain is not None
     primary = chain[0]
     fallbacks = chain[1:]
-    assert primary == "siliconflow"
+    assert primary == "piper"
     assert fallbacks == ["pyttsx3", "edge-tts"]
 
 
@@ -363,14 +322,14 @@ def test_whole_fallback_no_voice_mixing():
 
 def test_remote_engines_is_local_false():
     """远程引擎 is_local 应为 False"""
-    remote = [EdgeTTSEngine, GTTSEngine, SiliconFlowTTSEngine]
+    remote = [EdgeTTSEngine, GTTSEngine]
     for cls in remote:
         assert cls.is_local is False, f"{cls.name} 应为远程引擎 (is_local=False)"
 
 
 def test_local_engines_is_local_true():
     """本地引擎 is_local 应为 True"""
-    local = [PiperTTSEngine, SherpaOnnxEngine, CosyVoiceEngine, Pyttsx3Engine]
+    local = [PiperTTSEngine, SherpaOnnxEngine, Pyttsx3Engine]
     for cls in local:
         assert cls.is_local is True, f"{cls.name} 应为本地引擎 (is_local=True)"
 
@@ -554,24 +513,16 @@ def test_fatal_error_skips_engine_immediately():
     assert issubclass(TTSFatalError, Exception)
     assert not issubclass(TTSFatalError, RuntimeError)
 
-    # 2. SiliconFlow 引擎 401/403 应抛出 TTSFatalError 而非 RuntimeError
+    # 2. synthesize_batch 应传播 TTSFatalError（不被 return_exceptions 吞掉）
     source_file = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "pipeline.py")
     with open(source_file) as f:
         source = f.read()
-    # 验证 SiliconFlowTTSEngine.synthesize 中有 TTSFatalError
-    sf_start = source.find("class SiliconFlowTTSEngine")
-    sf_end = source.find("\nclass ", sf_start + 1)
-    sf_body = source[sf_start:sf_end]
-    assert "TTSFatalError" in sf_body, \
-        "SiliconFlowTTSEngine 应对 401/403 抛出 TTSFatalError"
-
-    # 3. synthesize_batch 应传播 TTSFatalError（不被 return_exceptions 吞掉）
     assert "TTSFatalError" in source[source.find("async def synthesize_batch"):
                                       source.find("class EdgeTTSEngine")], \
         "synthesize_batch 应检测并传播 TTSFatalError"
 
-    # 4. _smart_retry_engine 应能处理 TTSFatalError
+    # 3. _smart_retry_engine 应能处理 TTSFatalError
     retry_fn = source[source.find("async def _smart_retry_engine"):
                        source.find("def _write_failure_json")]
     assert "TTSFatalError" in retry_fn, \

@@ -22,6 +22,19 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# 从 config.json 读取 LLM 配置（避免硬编码 API Key）
+if [ ! -f "config.json" ]; then
+    echo -e "${RED}❌ config.json 不存在，请先从 config.example.json 复制并配置${NC}"
+    exit 1
+fi
+LLM_API_URL=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_url',''))")
+LLM_API_KEY=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_key',''))")
+LLM_MODEL=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('model',''))")
+if [ -z "$LLM_API_KEY" ]; then
+    echo -e "${RED}❌ config.json 中 llm.api_key 为空${NC}"
+    exit 1
+fi
+
 if [ ! -d "$VIDEO_DIR" ]; then
     echo -e "${RED}❌ 测试视频目录不存在: $VIDEO_DIR${NC}"
     exit 1
@@ -137,9 +150,9 @@ cat > "$TMPCONFIG" <<JSONEOF
   "voice": "zh-CN-YunxiNeural",
   "translator": "llm",
   "llm": {
-    "api_url": "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
-    "api_key": "sk-sp-e0987ca0f8c04f969a5218dbdc6f1401",
-    "model": "qwen3-coder-next",
+    "api_url": "$LLM_API_URL",
+    "api_key": "$LLM_API_KEY",
+    "model": "$LLM_MODEL",
     "batch_size": 8,
     "temperature": 0.3,
     "two_pass": $TWO_PASS,

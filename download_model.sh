@@ -2,7 +2,7 @@
 # ============================================================
 # 模型下载脚本
 # 用法:
-#   bash download_model.sh whisper [tiny|base|small|medium]
+#   bash download_model.sh whisper [tiny|base|small|medium|large-v3-turbo]
 #   bash download_model.sh piper
 #   bash download_model.sh sherpa
 #   bash download_model.sh all        # 下载全部
@@ -37,21 +37,36 @@ _curl_download() {
 
 # ── Whisper 模型 ──────────────────────────────────────────────
 download_whisper() {
-    local size="${1:-small}"
+    local size="${1:-medium}"
     local model_dir="$SCRIPT_DIR/models/faster-whisper-$size"
     mkdir -p "$model_dir"
 
-    if $USE_MIRROR; then
-        local base="https://hf-mirror.com/Systran/faster-whisper-$size/resolve/main"
+    # 非 Systran 官方 repo 的模型映射（使用社区 int8 量化 / CTranslate2 转换版本）
+    # medium: rhasspy int8 量化版（749MB vs Systran float16 1.5GB），精度几乎无损
+    # large-v3-turbo: deepdml CTranslate2 转换版（Systran 未发布 turbo）
+    if [ "$size" = "medium" ]; then
+        local repo="rhasspy/faster-whisper-medium-int8"
+    elif [ "$size" = "large-v3-turbo" ]; then
+        local repo="deepdml/faster-whisper-large-v3-turbo-ct2"
     else
-        local base="https://huggingface.co/Systran/faster-whisper-$size/resolve/main"
+        local repo="Systran/faster-whisper-$size"
     fi
 
-    echo "📥 下载 faster-whisper-$size 模型..."
+    if $USE_MIRROR; then
+        local base="https://hf-mirror.com/$repo/resolve/main"
+    else
+        local base="https://huggingface.co/$repo/resolve/main"
+    fi
+
+    echo "📥 下载 faster-whisper-$size 模型 ($repo)..."
     echo "   目标目录: $model_dir"
 
-    local files="config.json vocabulary.txt tokenizer.json preprocessor_config.json model.bin"
-    for f in $files; do
+    # 必需文件 + 可选文件（int8 量化版可能缺少 tokenizer.json / preprocessor_config.json，
+    # faster-whisper 会自动 fallback 到 pretrained tokenizer，不影响功能）
+    local required_files="config.json vocabulary.txt model.bin"
+    local optional_files="tokenizer.json preprocessor_config.json"
+
+    for f in $required_files; do
         if [ -f "$model_dir/$f" ]; then
             echo "  ⏭  $f 已存在，跳过"
             continue
@@ -59,6 +74,15 @@ download_whisper() {
         echo "  📦 下载 $f ..."
         _curl_download "$base/$f" "$model_dir/$f"
         echo "  ✅ $f 下载完成 ($(du -h "$model_dir/$f" | cut -f1))"
+    done
+
+    for f in $optional_files; do
+        if [ -f "$model_dir/$f" ]; then
+            echo "  ⏭  $f 已存在，跳过"
+            continue
+        fi
+        # 可选文件下载失败不报错
+        _curl_download "$base/$f" "$model_dir/$f" 2>/dev/null || rm -f "$model_dir/$f"
     done
 
     echo "🎉 Whisper 模型下载完成: $model_dir"
@@ -162,7 +186,7 @@ download_sherpa() {
 # ── 入口 ─────────────────────────────────────────────────────
 case "$COMPONENT" in
     whisper)
-        download_whisper "${2:-small}"
+        download_whisper "${2:-medium}"
         ;;
     piper)
         download_piper "${2:-huayan}" "${3:-medium}"
@@ -171,19 +195,20 @@ case "$COMPONENT" in
         download_sherpa
         ;;
     all)
-        download_whisper "${2:-small}"
+        download_whisper "${2:-medium}"
         echo ""
         download_piper
         echo ""
         download_sherpa
         ;;
-    tiny|base|small|medium)
+    tiny|base|small|medium|large-v3-turbo)
         # 兼容旧用法: bash download_model.sh small
         download_whisper "$COMPONENT"
         ;;
     *)
         echo "用法:"
-        echo "  bash download_model.sh whisper [tiny|base|small|medium]  # Whisper 语音识别模型"
+        echo "  bash download_model.sh whisper [tiny|base|small|medium|large-v3-turbo]"
+        echo "                                  # Whisper 语音识别模型（默认 medium）"
         echo "  bash download_model.sh piper [huayan|chaowen|xiao_ya]   # Piper TTS 中文模型（CPU）"
         echo "  bash download_model.sh sherpa                           # sherpa-onnx MeloTTS 中文模型（CPU）"
         echo "  bash download_model.sh all                              # 下载全部模型"

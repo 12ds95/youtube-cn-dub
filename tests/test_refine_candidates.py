@@ -326,6 +326,29 @@ def test_polyphone_multiple_in_sentence():
     assert "条整" in result  # 调整 → 条整
 
 
+def test_polyphone_mixed_chinese_english():
+    """中英混合文本：pypinyin 对齐不错位"""
+    assert _fix_polyphones("Hello了解世界") == "Hello瞭解世界"
+    assert _fix_polyphones("Test重新启动End") == "Test虫新启动End"
+
+
+def test_polyphone_with_digits():
+    """含数字文本：数字不干扰对齐"""
+    assert _fix_polyphones("数不胜数") == "属不胜属"
+    # 行 在「第3行代码」中读 xíng，不应替换
+    assert _fix_polyphones("第3行代码") == "第3行代码"
+
+
+def test_polyphone_no_false_positive():
+    """edge-tts 默认读音正确的场景不应替换"""
+    assert _fix_polyphones("重点很重要") == "重点很重要"  # zhòng
+    assert _fix_polyphones("行走江湖") == "行走江湖"      # xíng
+    assert _fix_polyphones("调用函数") == "调用函数"      # diào
+    assert _fix_polyphones("效率很高") == "效率很高"      # lǜ
+    assert _fix_polyphones("应用场景") == "应用场景"      # yìng
+    assert _fix_polyphones("好处和坏处") == "好触和坏触"  # chù → 触
+
+
 # ── _identify_low_cps_segments 测试 ──
 
 def test_identify_low_cps_basic():

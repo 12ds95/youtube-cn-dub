@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-TTS 时长估算器校准脚本
+TTS 时长估算器校准脚本 (v2)
 
 从已有的 TTS 音频和 segments_cache.json 中提取 (text_zh, actual_duration_ms) 对,
 用 Ridge 回归拟合 _estimate_duration_jieba 的 8 个时长参数 + 1 个截距。
+v2: 修正 rate 去混淆（移除过时的 *1.3）、支持嵌套目录扫描、更大训练集。
 
 用法:
-  python calibrate_tts_duration.py                    # 自动扫描 output/*/
+  python calibrate_tts_duration.py                    # 自动扫描 output/*/ 和 output/*/*/
   python calibrate_tts_duration.py output/zjMuIxRvygQ  # 指定单个视频目录
   python calibrate_tts_duration.py --apply             # 拟合后自动写入 pipeline.py
 
@@ -96,11 +97,11 @@ def extract_features(text_zh: str) -> dict:
 FEATURE_NAMES = ["n_1char", "n_2char", "n_3char", "n_4plus",
                  "n_letters", "n_digits", "n_url_chars", "n_punct"]
 
-# 当前硬编码参数（基线）
+# 当前部署的参数（v2 校准值）
 BASELINE_PARAMS = {
-    "n_1char": 200, "n_2char": 380, "n_3char": 530, "n_4plus": 150,
-    "n_letters": 150, "n_digits": 120, "n_url_chars": 280, "n_punct": 50,
-    "intercept": 0,
+    "n_1char": 138, "n_2char": 361, "n_3char": 506, "n_4plus": 223,
+    "n_letters": 31, "n_digits": 311, "n_url_chars": 16, "n_punct": 197,
+    "intercept": 1210,
 }
 
 # ── 数据收集 ──
@@ -167,8 +168,9 @@ def collect_samples(video_dirs: list) -> list:
                 # 经过反馈闭环的段，用实际 corrected_rate
                 applied_rate = feedback_rates[idx]
             elif target_dur_ms > 0:
-                # 初始 rate = _estimate_duration_jieba(text) * 1.3 / target_ms, clamped
-                est_ms = _estimate_duration_jieba(text_zh) * 1.3
+                # 初始 rate = _estimate_duration_jieba(text) / target_ms, clamped
+                # (v1 校准已移除 * 1.3 韵律乘数)
+                est_ms = _estimate_duration_jieba(text_zh)
                 raw_ratio = est_ms / target_dur_ms if target_dur_ms > 0 else 1.0
                 applied_rate = max(0.80, min(1.35, raw_ratio))
             else:
@@ -266,7 +268,7 @@ def calibrate(samples: list, prosody_multiplier: float = 1.0) -> dict:
         natural = s["natural_ms"]
         feat = {name: s[name] for name in FEATURE_NAMES}
 
-        est_baseline = estimate_with_params(feat, BASELINE_PARAMS) * 1.3  # 当前用 * 1.3
+        est_baseline = estimate_with_params(feat, BASELINE_PARAMS)  # v1 校准参数（已无乘数）
         est_calibrated = estimate_with_params(feat, calibrated)  # 校准后不需要乘数
 
         dev_baseline = abs(est_baseline - natural) / natural
@@ -326,6 +328,9 @@ def apply_to_pipeline(params: dict, pipeline_path: str = "pipeline.py"):
         (r"(url_ms \+= url_chars \* )\d+", rf"\g<1>{int(params['n_url_chars'])}"),
         # 标点停顿
         (r"(total_ms \+= )\d+(  # 标点停顿)", rf"\g<1>{int(params['n_punct'])}\2"),
+        # 截距 (替换 'total_ms - 63' 或 'total_ms + 42' 模式)
+        (r"total_ms [+-] \d+\)  # 校准截距.*",
+         f"total_ms {'+' if params['intercept'] >= 0 else '-'} {abs(int(params['intercept']))})  # 校准截距: {int(params['intercept'])}ms (Ridge v2 拟合)"),
     ]
 
     new_content = content
@@ -372,7 +377,7 @@ def main():
     if args.video_dirs:
         video_dirs = args.video_dirs
     else:
-        video_dirs = sorted(glob.glob("output/*/"))
+        video_dirs = sorted(glob.glob("output/*/") + glob.glob("output/*/*/"))
     video_dirs = [d.rstrip("/") for d in video_dirs if os.path.isdir(d)]
 
     if not video_dirs:

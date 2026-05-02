@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 临时脚本: 对 d4EgbgTm0Bg 和 kCc8FmEb1nY 执行 --integrated 等效测试
+# 集成测试脚本: 对 10 个视频执行全功能管线测试
 # 全功能开启: two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown
-# d4EgbgTm0Bg: 无 transcribe_cache → 需要跑 transcribe
-# kCc8FmEb1nY: 有 transcribe_cache → 跳过 transcribe
+# 用途: 收集 TTS 时长校准数据 + 回归测试
+# 覆盖领域: 微积分、计算机科学、微分方程、神经网络、分析、概率
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -15,7 +15,24 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-VIDEOS=("d4EgbgTm0Bg" "kCc8FmEb1nY" "zjMuIxRvygQ")
+# 从 config.json 读取 LLM 配置（避免硬编码 API Key）
+if [ ! -f "config.json" ]; then
+    echo -e "${RED}❌ config.json 不存在，请先从 config.example.json 复制并配置${NC}"
+    exit 1
+fi
+LLM_API_URL=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_url',''))")
+LLM_API_KEY=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_key',''))")
+LLM_MODEL=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('model',''))")
+if [ -z "$LLM_API_KEY" ]; then
+    echo -e "${RED}❌ config.json 中 llm.api_key 为空${NC}"
+    exit 1
+fi
+
+VIDEOS=(
+    "d4EgbgTm0Bg"
+    "kCc8FmEb1nY"
+    "zjMuIxRvygQ"
+)
 
 run_video() {
     local VIDEO_ID="$1"
@@ -50,11 +67,12 @@ run_video() {
     echo "   清理完成"
 
     # 清理上次残留的临时配置文件 (ctrl+c 后 mktemp 模板冲突)
-    rm -f /tmp/test_${VIDEO_ID}_*.json
+    local SAFE_ID="${VIDEO_ID//\//_}"
+    rm -f /tmp/test_${SAFE_ID}_*.json
 
     # 构建临时配置
     local TMPCONFIG
-    TMPCONFIG=$(mktemp /tmp/test_${VIDEO_ID}_XXXXXX.json)
+    TMPCONFIG=$(mktemp /tmp/test_${SAFE_ID}_XXXXXX.json)
 
     cat > "$TMPCONFIG" <<JSONEOF
 {
@@ -62,9 +80,9 @@ run_video() {
   "voice": "zh-CN-YunxiNeural",
   "translator": "llm",
   "llm": {
-    "api_url": "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
-    "api_key": "sk-sp-e0987ca0f8c04f969a5218dbdc6f1401",
-    "model": "qwen3-coder-next",
+    "api_url": "$LLM_API_URL",
+    "api_key": "$LLM_API_KEY",
+    "model": "$LLM_MODEL",
     "batch_size": 8,
     "temperature": 0.3,
     "two_pass": true,
@@ -167,7 +185,7 @@ JSONEOF
 }
 
 # 主流程
-echo -e "${YELLOW}🧪 两视频集成测试 (全功能开启)${NC}"
+echo -e "${YELLOW}🧪 10 视频集成测试 (全功能开启)${NC}"
 echo "   视频: ${VIDEOS[*]}"
 echo ""
 

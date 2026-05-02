@@ -211,7 +211,7 @@ DEFAULT_CONFIG = {
                                      # 可选: YunxiNeural(默认男) / YunjianNeural(硬朗男) /
                                      #        YunyangNeural(播音男) / XiaoxiaoNeural(温柔女) /
                                      #        XiaoyiNeural(活泼女) / YunxiaNeural(年轻男)
-    "whisper_model": "small",        # Whisper 语音识别模型: tiny(75MB快) / small(500MB 推荐) / medium(1.5GB 精确)
+    "whisper_model": "medium",       # Whisper 语音识别模型: tiny(75MB) / small(461MB) / medium(749MB int8 推荐) / large-v3-turbo(1.6GB 最准)
     "volume": 0.15,                  # 原声背景音量混入比例: 0.0=静音 / 0.15=默认 / 1.0=原始音量
     "browser": "chrome",             # yt-dlp 读取 cookies 的浏览器: chrome / firefox / edge / safari
     "download_quality": "best",      # 下载画质: "best"(原始最高质量) / "1080p" / "720p" / "480p"
@@ -755,10 +755,16 @@ os._exit(0)  # 强制退出，跳过 atexit 清理
 
 
 # ─── Step 3: 语音识别 ──────────────────────────────────────────────
-def transcribe_audio(audio_path: Path, model_size: str = "small",
+def transcribe_audio(audio_path: Path, model_size: str = "medium",
                      beam_size: int = 5, cpu_threads: int = 0) -> List[dict]:
     """使用 faster-whisper 转录"""
     from faster_whisper import WhisperModel
+
+    # 非 Systran 官方 repo 的模型映射（社区 int8 量化 / CTranslate2 转换版本）
+    _HF_MODEL_MAP = {
+        "medium": "rhasspy/faster-whisper-medium-int8",
+        "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    }
 
     script_dir = Path(__file__).resolve().parent
     local_model = script_dir / "models" / f"faster-whisper-{model_size}"
@@ -766,8 +772,8 @@ def transcribe_audio(audio_path: Path, model_size: str = "small",
         model_path = str(local_model)
         print(f"  🎙  本地模型: {local_model.name}")
     else:
-        model_path = model_size
-        print(f"  🎙  从 HuggingFace 下载模型 ({model_size})...")
+        model_path = _HF_MODEL_MAP.get(model_size, model_size)
+        print(f"  🎙  从 HuggingFace 下载模型 ({model_path})...")
 
     threads = cpu_threads if cpu_threads > 0 else os.cpu_count() or 4
     model = WhisperModel(model_path, device="cpu", compute_type="int8",
@@ -3048,14 +3054,15 @@ def _estimate_speed_ratios(
 def _estimate_duration_jieba(text_zh: str) -> float:
     """用 jieba 分词后按词粒度估算朗读时长（毫秒）。
 
-    经验值（基于 edge-tts zh-CN-YunxiNeural 实测）：
-      单字词（如"的""是"）: ~212ms
-      双字词（如"今天""学习"）: ~479ms
-      三字词（如"计算机""互联网"）: ~679ms
-      四字及以上（如"人工智能"）: ~240ms/字
-      英文单词: ~116ms/字符
-      URL/域名（逐字母朗读）: ~155ms/字符
-      数字: ~255ms/字符
+    Ridge 回归校准值（6 视频 3009 样本, alpha=50, R²=0.92）：
+      单字词（如"的""是"）: ~138ms
+      双字词（如"今天""学习"）: ~361ms
+      三字词（如"计算机""互联网"）: ~506ms
+      四字及以上（如"人工智能"）: ~223ms/字
+      英文单词: ~31ms/字符
+      URL/域名（逐字母朗读）: ~16ms/字符
+      数字: ~311ms/字符
+      截距: +1210ms
     """
     import jieba
     import unicodedata
@@ -3071,9 +3078,9 @@ def _estimate_duration_jieba(text_zh: str) -> float:
     clean_text = text_zh
     for m in _URL_PATTERN.finditer(text_zh):
         url_str = m.group()
-        # URL 逐字母朗读：每个字母/符号约 155ms
+        # URL 逐字母朗读：每个字母/符号约 16ms
         url_chars = sum(1 for c in url_str if c.isalnum() or c in './-_:')
-        url_ms += url_chars * 155
+        url_ms += url_chars * 16
         clean_text = clean_text.replace(url_str, '', 1)
 
     words = jieba.lcut(clean_text)
@@ -3082,7 +3089,7 @@ def _estimate_duration_jieba(text_zh: str) -> float:
         # 跳过纯标点/空白
         meaningful = [c for c in word if not unicodedata.category(c).startswith(('P', 'Z', 'C'))]
         if not meaningful:
-            total_ms += 164  # 标点停顿
+            total_ms += 197  # 标点停顿
             continue
 
         zh_count = sum(1 for c in meaningful if '\u4e00' <= c <= '\u9fff')
@@ -3091,20 +3098,20 @@ def _estimate_duration_jieba(text_zh: str) -> float:
         if zh_count > 0:
             # 中文词：按词长分配
             if zh_count == 1:
-                total_ms += 212
+                total_ms += 138
             elif zh_count == 2:
-                total_ms += 479
+                total_ms += 361
             elif zh_count == 3:
-                total_ms += 679
+                total_ms += 506
             else:
-                total_ms += zh_count * 240
+                total_ms += zh_count * 223
         if other_count > 0:
             # 英文/数字：比纯中文慢（TTS 需要切换语言）
             digits = sum(1 for c in meaningful if c.isdigit())
             letters = other_count - digits
-            total_ms += letters * 116 + digits * 255
+            total_ms += letters * 31 + digits * 311
 
-    return max(0, total_ms - 63)  # 校准截距: -63ms (Ridge 回归拟合)
+    return max(0, total_ms + 1210)  # 校准截距: +1210ms (Ridge v2 拟合, 6 视频 3009 样本)
 
 
 def _identify_high_cps_segments(
@@ -4226,82 +4233,60 @@ def _refine_with_llm(
     return refined
 
 
-# ── 多音字同音替换词典 ──────────────────────────────────────────
-# edge-tts 不支持 SSML phoneme 标签，只能通过文本级同音字替换
-# 来纠正高频误读。格式: (正则模式, 替换文本)
-# 仅覆盖 TTS 高频误读场景，不做全量多音字处理。
-_POLYPHONE_RULES: List[tuple] = [
-    # ── 了 (le/liǎo) ──
-    # "了解/了然/了不起/了无/了如指掌/了结/了事/了断/了却" → liǎo
-    # edge-tts 默认读 le，需替换为同音字 "瞭"
-    (re.compile(r"了(解|然|不起|无|如指掌|结|事|断|却|得|望)"), r"瞭\1"),
-    # ── 得 (de/dé/děi) ──
-    # "获得/取得/得到/得出/得益/得分/得力/心得" → dé
-    # edge-tts 在这些词中可能误读为轻声 de
-    (re.compile(r"(获|取|觉|值|舍|记)(得)"), r"\1\2"),  # 这些通常读对，保留
-    (re.compile(r"得(亏|靠)"), r"得\1"),  # děi，通常读对
-    # ── 行 (háng/xíng) ──
-    # "行业/银行/行列/行情/行号/行距/同行/内行/外行" → háng
-    (re.compile(r"(银|央|商|投|同|内|外|在)(行)(?![动进走为驶驰了])"), r"\1杭"),
-    (re.compile(r"行(业|列|情|号|距|家|当|规)"), r"杭\1"),
-    # ── 数 (shù/shǔ) ──
-    # "数据/数量/数字/数组/数值/参数/变数/常数/函数" → shù (名词)
-    # "数一数二/数不胜数" → shǔ (动词)
-    (re.compile(r"数(一数二|不胜数|落|说)"), r"属\1"),
-    # ── 重 (zhòng/chóng) ──
-    # "重新/重复/重建/重启/重来/重试/重置/重写" → chóng
-    (re.compile(r"重(新|复|建|启|来|试|置|写|装|做|现|返|叠|演|申|审|组|设|排|整|定义|命名|构|塑|回|制|载|开|发|拨|提|归)"), r"虫\1"),
-    # ── 处 (chù/chǔ) ──
-    # "处理/处于/相处/处置/处罚/处分" → chǔ
-    # "到处/各处/用处/好处/坏处/长处/短处/何处/深处" → chù
-    (re.compile(r"(到|各|用|好|坏|长|短|何|深|远|近|随|四|别|妙|益)(处)"), r"\1触"),
-    # ── 调 (diào/tiáo) ──
-    # "调用/调试/调度/调配" → diào
-    # "调整/调节/调解/调和/协调" → tiáo
-    (re.compile(r"(协)(调)"), r"\1条"),
-    (re.compile(r"调(整|节|解|和|配|谐|制|控|理|频|幅)"), r"条\1"),
-    # ── 率 (lǜ/shuài) ──
-    # "效率/频率/概率/比率/速率/利率/税率/汇率" → lǜ
-    # "率领/率先/率队" → shuài
-    (re.compile(r"率(领|先|队|部|军|众|性|直|真)"), r"帅\1"),
-    # ── 量 (liàng/liáng) ──
-    # "测量/丈量/量体裁衣" → liáng (动词)
-    # "数量/质量/流量" → liàng (名词，通常读对)
-    (re.compile(r"(测|丈|衡|估|计|度|称)(量)"), r"\1良"),
-    # ── 传 (chuán/zhuàn) ──
-    # "传记/自传/外传/列传/经传" → zhuàn
-    (re.compile(r"(自|外|列|内|经|别|正|小|评)(传)(?![输送播递达承感染导])"), r"\1撰"),
-    # ── 应 (yīng/yìng) ──
-    # "应该/应当/应有" → yīng
-    # "应用/应对/响应/适应/反应" → yìng (通常读对)
-    (re.compile(r"应(该|当|有尽有|许|属|予)"), r"英\1"),
-    # ── 乐 (lè/yuè) ──
-    # "音乐/乐器/乐曲/乐队/乐谱/乐章" → yuè
-    (re.compile(r"(音)(乐)(?!趣|观)"), r"\1月"),
-    (re.compile(r"乐(器|曲|队|谱|章|团|坛|理|律|感|手)"), r"月\1"),
-    # ── 的 (de/dí/dì) ──
-    # "的确/的当" → dí，edge-tts 常误读为 de
-    (re.compile(r"的(确|当)"), r"滴\1"),
-    # ── 差 (chā/chà/chāi) ──
-    # "差异/差距/差别/偏差/误差/温差/时差/落差" → chā
-    # "差不多/差点" → chà (通常读对)
-    # "出差/差事/差遣" → chāi
-    (re.compile(r"(出)(差)(?!异|距|别|值|额|价|分|评|错)"), r"\1拆"),
-    (re.compile(r"差(遣|事|役|使)"), r"拆\1"),
-]
+# ── 多音字同音替换（pypinyin 驱动）──────────────────────────────
+# edge-tts 不支持 SSML phoneme 标签，只能通过文本级同音字替换纠正误读。
+# pypinyin 短语级消歧自动判定每个多音字的上下文读音，
+# 仅当正确读音 ≠ edge-tts 默认读音时，替换为同音字。
+# 格式: {多音字: {需替换的拼音: 同音替换字}}
+_POLYPHONE_HOMOPHONE_MAP: Dict[str, Dict[str, str]] = {
+    '了': {'liǎo': '瞭'},     # edge-tts 默认 le → liǎo 时替换为 瞭
+    '行': {'háng': '杭'},      # edge-tts 默认 xíng → háng 时替换为 杭
+    '重': {'chóng': '虫'},     # edge-tts 默认 zhòng → chóng 时替换为 虫
+    '调': {'tiáo': '条'},      # edge-tts 默认 diào → tiáo 时替换为 条
+    '率': {'shuài': '帅'},     # edge-tts 默认 lǜ → shuài 时替换为 帅
+    '量': {'liáng': '良'},     # edge-tts 默认 liàng → liáng 时替换为 良
+    '传': {'zhuàn': '撰'},     # edge-tts 默认 chuán → zhuàn 时替换为 撰
+    '应': {'yīng': '英'},      # edge-tts 默认 yìng → yīng 时替换为 英
+    '乐': {'yuè': '月'},       # edge-tts 默认 lè → yuè 时替换为 月
+    '的': {'dí': '滴'},        # edge-tts 默认 de → dí 时替换为 滴
+    '差': {'chāi': '拆'},      # edge-tts 默认 chā → chāi 时替换为 拆
+    '数': {'shǔ': '属'},       # edge-tts 默认 shù → shǔ 时替换为 属
+    '处': {'chù': '触'},       # edge-tts 默认 chǔ → chù 时替换为 触
+}
 
 
 def _fix_polyphones(text: str) -> str:
     """对 TTS 输入文本做多音字同音替换，纠正 edge-tts 高频误读。
 
-    仅处理有明确上下文规则的高频多音字，不做全量替换。
-    替换字为同音字（读音一致、字形不同），不影响语义理解。
+    使用 pypinyin 短语级消歧确定每个多音字的正确读音，
+    仅在 edge-tts 默认读音与正确读音不一致时替换为同音字。
     """
     if not text:
         return text
-    for pattern, repl in _POLYPHONE_RULES:
-        text = pattern.sub(repl, text)
-    return text
+    if not any(c in _POLYPHONE_HOMOPHONE_MAP for c in text):
+        return text
+    try:
+        from pypinyin import pinyin, Style
+        py_result = pinyin(text, style=Style.TONE, heteronym=False)
+    except Exception:
+        return text
+    chars = list(text)
+    text_pos = 0
+    for py_entry in py_result:
+        if text_pos >= len(chars):
+            break
+        c = chars[text_pos]
+        is_cjk = '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf'
+        if is_cjk:
+            if c in _POLYPHONE_HOMOPHONE_MAP:
+                replacement = _POLYPHONE_HOMOPHONE_MAP[c].get(py_entry[0])
+                if replacement:
+                    chars[text_pos] = replacement
+            text_pos += 1
+        else:
+            # pypinyin 将连续非汉字合并为单条目，按条目文本长度跳过
+            text_pos += len(py_entry[0])
+    return ''.join(chars)
 
 
 def _clean_refine_artifacts(text: str) -> str:
@@ -5561,7 +5546,7 @@ def main():
     parser.add_argument("--output", "-o", default=None, help="输出根目录 (默认: output)")
     parser.add_argument("--voice", "-v", default=None, help="TTS 语音")
     parser.add_argument("--whisper-model", "-m", default=None, dest="whisper_model",
-                        choices=["tiny", "base", "small", "medium"], help="Whisper 模型")
+                        choices=["tiny", "base", "small", "medium", "large-v3-turbo"], help="Whisper 模型")
     parser.add_argument("--volume", type=float, default=None, help="原声背景音量 0.0-1.0")
     parser.add_argument("--browser", "-b", default=None, help="读取 cookies 的浏览器")
     parser.add_argument("--rename", default=None, help="完成后重命名输出目录")

@@ -102,11 +102,11 @@ asyncio.run(test())
         fail_test "edge-tts 语音合成失败（需要网络连接）"
     fi
 
-    if [ -d "$SCRIPT_DIR/models/faster-whisper-small" ] || [ -d "$SCRIPT_DIR/models/faster-whisper-tiny" ]; then
+    if [ -d "$SCRIPT_DIR/models/faster-whisper-medium" ] || [ -d "$SCRIPT_DIR/models/faster-whisper-small" ] || [ -d "$SCRIPT_DIR/models/faster-whisper-tiny" ]; then
         MODELS=$(ls -d "$SCRIPT_DIR/models/faster-whisper-"* 2>/dev/null | xargs -I{} basename {})
         pass_test "本地 Whisper 模型: $MODELS"
     else
-        warn_test "无本地 Whisper 模型，首次运行将自动下载（或运行 bash download_model.sh small）"
+        warn_test "无本地 Whisper 模型，首次运行将自动下载（或运行 bash download_model.sh whisper）"
     fi
 
     # Piper 模型

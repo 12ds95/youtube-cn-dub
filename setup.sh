@@ -83,6 +83,8 @@ PACKAGES=(
     "httpx"
     "demucs"
     "spacy"
+    "jieba"
+    "pypinyin"
 )
 
 for pkg in "${PACKAGES[@]}"; do

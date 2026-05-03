@@ -19,9 +19,10 @@ from pathlib import Path
 import httpx
 import jieba
 
-# ── 从 pipeline.py 导入工具函数 ──
+# ── 共享工具函数 ──
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pipeline import _strip_think_block, _estimate_duration_jieba
+from text_utils import normalize_llm_output, strip_parenthetical_annotations
+from duration_estimator import estimate_duration as _estimate_duration_jieba
 
 
 # ─────────────────────────────────────────────────────────
@@ -36,6 +37,24 @@ def count_hanzi(text: str) -> int:
 def extract_budgets(segments: list) -> list[int]:
     """从 Phase 1 的 text_zh 提取每段汉字数作为 budget"""
     return [count_hanzi(seg["text_zh"]) for seg in segments]
+
+
+def extract_budgets_jieba(segments: list) -> list[int]:
+    """用 jieba 时长估算器计算 budget（时长校准版）。
+
+    原理：Phase 1 text_zh 的 jieba 估算时长反映真实 TTS 节奏，
+    将时长按全局汉字/ms 比率换算回汉字数，作为 DP 的 budget。
+    相同字数但含英文/数字/URL 的段会获得更大 budget（因为 TTS 读得慢）。
+    """
+    durations = [_estimate_duration_jieba(seg["text_zh"]) for seg in segments]
+    hanzi_counts = [count_hanzi(seg["text_zh"]) for seg in segments]
+    total_hanzi = sum(hanzi_counts)
+    total_dur = sum(durations)
+    if total_dur <= 0 or total_hanzi <= 0:
+        return hanzi_counts  # fallback
+    # 全局 ms/hanzi 比率
+    ms_per_hanzi = total_dur / total_hanzi
+    return [max(1, round(dur / ms_per_hanzi)) for dur in durations]
 
 
 # ─────────────────────────────────────────────────────────
@@ -61,9 +80,7 @@ def call_llm(
         resp = client.post(endpoint, json=payload, headers=headers)
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
-        if "<think>" in content:
-            content = _strip_think_block(content)
-        return content.strip()
+        return normalize_llm_output(content)
 
 
 CANDIDATE_CONFIGS = [
@@ -75,7 +92,7 @@ CANDIDATE_CONFIGS = [
 ]
 
 BASE_SYSTEM_PROMPT = (
-    "你是专业的英中视频翻译专家。请将以下英文视频旁白完整翻译为自然流畅的中文。\n"
+    "你是专业的英中视频翻译专家。请将以下英文视频内容完整翻译为自然流畅的中文。\n"
     "要求：\n"
     "1) 完整保留原文全部信息，不遗漏、不添加\n"
     "2) 译文通顺自然，符合中文表达习惯，适合配音朗读\n"
@@ -88,10 +105,13 @@ BASE_SYSTEM_PROMPT = (
 def generate_candidates(
     full_english: str, endpoint: str, headers: dict, model: str,
     n_candidates: int = 5, max_tokens: int = 8192,
+    total_budget: int = 0,
 ) -> list[str]:
     """生成多个全文翻译候选"""
     candidates = []
     configs = CANDIDATE_CONFIGS[:n_candidates]
+
+    budget_hint = f"\n（译文总字数请控制在 {total_budget} 字左右）" if total_budget > 0 else ""
 
     for i, cfg in enumerate(configs):
         sys_prompt = BASE_SYSTEM_PROMPT
@@ -105,7 +125,7 @@ def generate_candidates(
         try:
             text = call_llm(
                 endpoint, headers, model,
-                sys_prompt, f"请翻译以下英文视频旁白：\n\n{full_english}",
+                sys_prompt, f"请翻译以下英文视频内容：{budget_hint}\n\n{full_english}",
                 temperature=cfg["temperature"],
                 max_tokens=max_tokens,
             )
@@ -128,12 +148,17 @@ def generate_candidates(
 PRIORITY_SENTENCE_END = 1   # 。！？
 PRIORITY_CLAUSE = 2         # ，；：、
 PRIORITY_WORD = 3           # 普通词边界
+PRIORITY_BAD_START = 4      # 下一词是虚词（的/地/了等），不宜作句首
 
 SPLIT_PENALTY = {
     PRIORITY_SENTENCE_END: 0,
     PRIORITY_CLAUSE: 1,
     PRIORITY_WORD: 4,
+    PRIORITY_BAD_START: 20,
 }
+
+# 不宜出现在句首的虚词/助词/连词
+_BAD_START_WORDS = frozenset("的地了着过得是和与而且也都就又")
 
 
 def find_split_points(text_zh: str) -> list[tuple[int, int]]:
@@ -146,7 +171,7 @@ def find_split_points(text_zh: str) -> list[tuple[int, int]]:
     points = []
     pos = 0
 
-    for word in words:
+    for i, word in enumerate(words):
         pos += len(word)
         # 不在开头或末尾切分
         if pos <= 0 or pos >= len(text_zh):
@@ -160,6 +185,12 @@ def find_split_points(text_zh: str) -> list[tuple[int, int]]:
             priority = PRIORITY_CLAUSE
         else:
             priority = PRIORITY_WORD
+
+        # 前瞻：如果下一词首字是虚词，不宜在此切分
+        if i + 1 < len(words):
+            next_first = words[i + 1][0] if words[i + 1] else ""
+            if next_first in _BAD_START_WORDS and priority == PRIORITY_WORD:
+                priority = PRIORITY_BAD_START
 
         points.append((pos, priority))
 
@@ -518,21 +549,31 @@ def main():
     with open(cache_path, encoding="utf-8") as f:
         segments = json.load(f)
 
-    budgets = extract_budgets(segments)
-    total_budget = sum(budgets)
+    budgets_hanzi = extract_budgets(segments)
+    budgets_jieba = extract_budgets_jieba(segments)
+    total_hanzi = sum(budgets_hanzi)
+    total_jieba = sum(budgets_jieba)
     full_english = " ".join(seg["text_en"] for seg in segments)
 
     print(f"Phase 2 全文翻译质量优化")
     print(f"  目录: {output_dir}")
     print(f"  段数: {len(segments)}")
     print(f"  英文: {len(full_english)} 字符 (~{len(full_english)//4} tokens)")
-    print(f"  Phase 1 总汉字: {total_budget}")
-    print(f"  Budget 范围: {min(budgets)}-{max(budgets)} (avg={total_budget/len(budgets):.1f})")
+    print(f"  Budget (hanzi): 总{total_hanzi}, 范围 {min(budgets_hanzi)}-{max(budgets_hanzi)} (avg={total_hanzi/len(budgets_hanzi):.1f})")
+    print(f"  Budget (jieba): 总{total_jieba}, 范围 {min(budgets_jieba)}-{max(budgets_jieba)} (avg={total_jieba/len(budgets_jieba):.1f})")
+
+    # 打印两种 budget 差异较大的段
+    diffs = [(i, budgets_hanzi[i], budgets_jieba[i]) for i in range(len(segments))
+             if abs(budgets_hanzi[i] - budgets_jieba[i]) >= 3]
+    if diffs:
+        print(f"  Budget 差异 ≥3 的段 ({len(diffs)}段):")
+        for i, bh, bj in diffs[:5]:
+            print(f"    [{i}] hanzi={bh} jieba={bj} ({bj-bh:+d}) | {segments[i]['text_zh'][:40]}...")
     print()
 
     # Token 估算检查
     est_input_tokens = len(full_english) // 4
-    est_output_tokens = total_budget * 2
+    est_output_tokens = total_hanzi * 2
     est_total = est_input_tokens + est_output_tokens
     if est_total > 28000:
         print(f"  ⚠️  预估 token 数 {est_total} 较大，可能需要分批（当前仍一次性发送）")
@@ -542,7 +583,8 @@ def main():
     candidates = generate_candidates(
         full_english, endpoint, headers, model,
         n_candidates=args.candidates,
-        max_tokens=max(8192, total_budget * 3),
+        max_tokens=max(8192, total_hanzi * 3),
+        total_budget=total_hanzi,
     )
     if not candidates:
         print("❌ 所有候选生成失败")
@@ -554,7 +596,7 @@ def main():
     valid_candidates = []
     for i, cand in enumerate(candidates):
         cand_hanzi = count_hanzi(cand)
-        deviation_pct = abs(cand_hanzi - total_budget) / total_budget * 100
+        deviation_pct = abs(cand_hanzi - total_hanzi) / total_hanzi * 100
         if deviation_pct > 40:
             print(f"  候选 {i+1}: {cand_hanzi}字 (偏差 {deviation_pct:.0f}%) — 跳过")
         else:
@@ -565,46 +607,60 @@ def main():
         print("❌ 所有候选字数偏差过大")
         sys.exit(1)
 
-    # DP 切分 + 评分
-    print(f"\n🔪 DP 切分 + 评分...")
-    best_score = None
-    best_segments = None
-    best_idx = -1
+    # DP 切分 + 评分（两种 budget 各跑一次）
+    budget_modes = [
+        ("hanzi", budgets_hanzi),
+        ("jieba", budgets_jieba),
+    ]
+    best_results = {}  # mode -> (score, segments, idx)
 
-    for orig_idx, cand in valid_candidates:
-        split_result = split_text_by_budgets(cand, budgets)
-        sc = score_candidate(split_result, budgets)
-        print(f"  候选 {orig_idx+1}: MSE={sc['mse']:.1f}, MAE={sc['mae']:.1f}, "
-              f"max_dev={sc['max_dev']}, empty={sc['empty']}, total={sc['total']:.1f}")
+    for mode_name, mode_budgets in budget_modes:
+        print(f"\n🔪 DP 切分 + 评分 [{mode_name} budget]...")
+        best_score = None
+        best_segments = None
+        best_idx = -1
 
-        if best_score is None or sc["total"] < best_score["total"]:
-            best_score = sc
-            best_segments = split_result
-            best_idx = orig_idx
+        for orig_idx, cand in valid_candidates:
+            cand_clean = normalize_llm_output(cand)
+            cand_clean = strip_parenthetical_annotations(cand_clean)
+            split_result = split_text_by_budgets(cand_clean, mode_budgets)
+            sc = score_candidate(split_result, mode_budgets)
+            print(f"  候选 {orig_idx+1}: MSE={sc['mse']:.1f}, MAE={sc['mae']:.1f}, "
+                  f"max_dev={sc['max_dev']}, empty={sc['empty']}, total={sc['total']:.1f}")
 
-    print(f"\n  ✅ 选中候选 {best_idx+1} (total_score={best_score['total']:.1f})")
+            if best_score is None or sc["total"] < best_score["total"]:
+                best_score = sc
+                best_segments = split_result
+                best_idx = orig_idx
 
-    # 构建 Phase 2 输出
-    phase2_segments = []
-    for seg, new_zh in zip(segments, best_segments):
-        phase2_segments.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text_en": seg["text_en"],
-            "text_zh": new_zh.strip() if new_zh else seg["text_zh"],
-        })
+        print(f"  ✅ [{mode_name}] 选中候选 {best_idx+1} (total_score={best_score['total']:.1f})")
+        best_results[mode_name] = (best_score, best_segments, best_idx)
 
-    # 对比报告
-    print_comparison(segments, best_segments, budgets, best_score)
+    # 构建两种 Phase 2 输出
+    for mode_name, mode_budgets in budget_modes:
+        best_score, best_segments, best_idx = best_results[mode_name]
 
-    # 写文件
-    if args.dry_run:
-        print(f"\n  (dry-run 模式，未写文件)")
-    else:
-        out_path = output_dir / "segments_cache_phase2.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(phase2_segments, f, ensure_ascii=False, indent=2)
-        print(f"\n  ✅ 已写入: {out_path}")
+        phase2_segments = []
+        for seg, new_zh in zip(segments, best_segments):
+            phase2_segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text_en": seg["text_en"],
+                "text_zh": normalize_llm_output(new_zh) if new_zh else seg["text_zh"],
+            })
+
+        # 对比报告
+        print_comparison(segments, best_segments, mode_budgets, best_score)
+
+        # 写文件
+        if args.dry_run:
+            print(f"\n  (dry-run 模式，未写文件)")
+        else:
+            suffix = "" if mode_name == "hanzi" else f"_{mode_name}"
+            out_path = output_dir / f"segments_cache_phase2{suffix}.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(phase2_segments, f, ensure_ascii=False, indent=2)
+            print(f"\n  ✅ [{mode_name}] 已写入: {out_path}")
 
 
 if __name__ == "__main__":

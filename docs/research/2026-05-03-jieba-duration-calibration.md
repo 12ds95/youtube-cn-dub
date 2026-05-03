@@ -1,7 +1,7 @@
 # Jieba TTS 时长估算器 Ridge 回归校准
 
 **日期**: 2026-05-03
-**状态**: 已实施
+**状态**: 已被 v2 取代 → 见 `docs/research/2025-06-06-jieba-estimator-v2-exploration.md`
 **关联 commit**: `abae2fd`
 
 ## 1. 问题背景

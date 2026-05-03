@@ -185,7 +185,7 @@ def evaluate_video(video_id: str, segments: list, gt_entries: list = None) -> di
     if jieba_ratios:
         metrics["jieba_ratio_mean"] = statistics.mean(jieba_ratios)
         metrics["jieba_ratio_median"] = statistics.median(jieba_ratios)
-        metrics["jieba_gt130"] = sum(1 for r in jieba_ratios if r > 1.3)
+        metrics["jieba_gt150"] = sum(1 for r in jieba_ratios if r > 1.5)
         metrics["jieba_085_115"] = sum(1 for r in jieba_ratios if 0.85 <= r <= 1.15)
         metrics["jieba_count"] = len(jieba_ratios)
 
@@ -259,11 +259,11 @@ def print_report(video_id: str, metrics: dict, show_worst: int = 5):
         jm = metrics["jieba_ratio_mean"]
         jmed = metrics["jieba_ratio_median"]
         j_ok = metrics["jieba_085_115"]
-        j_over = metrics["jieba_gt130"]
+        j_over = metrics["jieba_gt150"]
         pct_ok = j_ok / jc * 100 if jc else 0
         print(f"\n  jieba时长拟合 ({jc} 段):")
         print(f"    ratio mean={jm:.2f} med={jmed:.2f}")
-        print(f"    [0.85-1.15]: {j_ok} ({pct_ok:.0f}%)  >1.30: {j_over}")
+        print(f"    [0.85-1.15]: {j_ok} ({pct_ok:.0f}%)  >1.50: {j_over}")
 
     if has_gt:
         print(f"\n  GT 对比 (对齐 {metrics['gt_aligned_count']} 段):")
@@ -369,7 +369,6 @@ def main():
             if "llm" not in config:
                 config["llm"] = {}
             config["llm"]["two_pass"] = True
-            config["llm"]["isometric"] = 3
         else:
             print("ERROR: config.json not found")
             sys.exit(1)

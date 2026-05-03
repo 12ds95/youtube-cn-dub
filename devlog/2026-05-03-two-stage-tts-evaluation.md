@@ -40,14 +40,12 @@ async def synthesize(self, text: str, path: str, voice: str, rate: float = 1.0):
 
 **piper** (`pipeline.py:2101-2118`): **无 rate 参数**。通过 subprocess 调用 `piper` 二进制，命令行参数只有 `--model` 和 `--output_file`，没有速度控制。
 
-**sherpa-onnx** (`pipeline.py:2131-2148`): **硬编码 1.0**。第 2148 行 `speed=1.0` 写死：
-```python
-audio = tts.generate(text, sid=int(cfg.get("speaker_id", 0)), speed=1.0)
-```
+**sherpa-onnx** (`pipeline.py:2131-2148`): ~~硬编码 1.0~~ **已修复** — `speed=rate` 参数透传 + `supports_rate = True`。现在支持 Phase 2 rate 反馈闭环。
+> 修复详见 `docs/research/2026-05-03-vits-zh-aishell3-tts-model.md`
 
 **gtts** (`pipeline.py:2080-2087`): **无 rate 参数**。`gTTS` 库不支持语速控制。
 
-**结论**: 5 个引擎中只有 edge-tts 支持 rate 控制。Draft 阶段用本地引擎测出的 corrected_rate 传给 pyttsx3/piper/sherpa-onnx 都会被忽略。
+**结论**: 5 个引擎中 edge-tts、pyttsx3（修复后）、sherpa-onnx（修复后）支持 rate 控制。piper 和 gtts 不支持，Phase 2 对其跳过，由 Phase 3 LLM 补偿。
 
 ### 实验 3: 审计日志分析 — 实际反馈闭环数据
 
@@ -123,9 +121,9 @@ Draft 阶段的时长测量对 Final 引擎无用（韵律模型不同），Fina
 
 不同引擎韵律模型完全不相关。jieba 估算器已校准 edge-tts，仍有段偏差达 87.7%（idx=53）。跨引擎预测只会更差。
 
-### 2. 本地引擎不支持 rate 控制
+### 2. 本地引擎 rate 控制有限（评估时已修复部分）
 
-5 个引擎中仅 edge-tts 支持 rate。Draft 阶段算出的 corrected_rate 传给本地引擎直接被忽略（pyttsx3 参数遮蔽、piper 无参数、sherpa-onnx 硬编码）。
+评估时仅 edge-tts 支持 rate。后续修复了 pyttsx3 参数遮蔽 + sherpa-onnx `speed=rate` 透传，3/5 引擎已支持。但两阶段方案的核心缺陷（跨引擎韵律不可迁移 + 总调用量增加）不受此影响。
 
 ### 3. 总调用量反增 72%
 

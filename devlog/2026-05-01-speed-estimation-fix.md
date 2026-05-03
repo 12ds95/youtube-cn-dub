@@ -1,7 +1,7 @@
 # 语速估算修复 — 测试反馈循环记录
 
-日期: 2026-05-01
-方法: test→feedback→fix→test 循环 (max 5 iterations)
+日期: 2026-05-01 → 2025-06-06 (持续迭代)
+方法: test→feedback→fix→test 循环
 
 ## 迭代 1: 问题发现
 
@@ -58,14 +58,81 @@ bash test_pipeline.sh --fast
 剩余 7 段 >1.25x (max 1.44x) 均为 **转录分句边界问题**:
 - Whisper 在长句中间切分，导致英文跨段而中文翻译无法完整覆盖
 - 这些段由 atempo 调速处理（非硬截断），听感可接受
-- 根本解决需要 P0.4 (NLP 智能断句) 或完整重新翻译
 
-## 结论
+## 迭代 3: Ridge 回归校准 (v1)
 
-**循环在第 2 次迭代后收敛** — 代码层面的估算问题已解决，剩余问题属于数据层面（转录分句质量），需要架构级改进（NLP 断句/重翻译）才能进一步优化。
+> 详见 `docs/research/2026-05-03-jieba-duration-calibration.md`
 
-修改文件: `pipeline.py`
-- `_estimate_duration_jieba`: +URL 检测 +英文 150ms +数字 120ms
-- `_generate_tts_segments`: 预检改用 jieba 估算 + 1.3x 韵律因子
-- `_generate_tts_segments`: URL 段跳过 LLM 精简
-- `_estimate_speed_ratios`: 韵律因子 1.1→1.3
+**方法**: 从 3 个视频收集 1587 样本，用 Ridge 回归 (alpha=0.1) 拟合 8 维特征权重 + 截距，替代手动硬编码参数。关键设计: rate 去混淆（反推 natural_ms = actual_ms × applied_rate）。
+
+**结果**:
+- R² = 0.84
+- MAE: 558.9 → 468.2 ms (-16%)
+- Phase 2 触发: 335/1587 → 245/1587 (-27%)
+- 韵律乘数 `* 1.3` 被校准参数吸收，从代码中移除
+
+## 迭代 4: Ridge v2 校准 + rate 去混淆 bug 修复
+
+> 详见 `docs/research/2025-06-06-jieba-estimator-v2-exploration.md`
+
+**改进**:
+1. 修复 `calibrate_tts_duration.py` 中残留的 `* 1.3` 旧乘数（rate 去混淆 bug）
+2. 训练数据从 3 视频 1587 样本扩展到 6 视频 3009 样本
+3. 正则化 alpha 从 0.1 提高到 50（防止过拟合新视频）
+4. 非线性特征探索（二次项/交互项/Huber 回归）→ CV 验证均过拟合，放弃
+
+**当前校准参数** (`pipeline.py:_estimate_duration_jieba`):
+
+| 特征 | 初始手动值 | v1 校准 | v2 校准 (当前) |
+|------|-----------|---------|---------------|
+| 单字词 | 200ms | 212ms | **138ms** |
+| 双字词 | 380ms | 479ms | **361ms** |
+| 三字词 | 530ms | 679ms | **506ms** |
+| 四字+/字 | 150ms | 240ms | **223ms** |
+| 英文字母 | 150ms | 116ms | **31ms** |
+| 数字 | 120ms | 255ms | **311ms** |
+| URL字符 | 280ms | 155ms | **16ms** |
+| 标点停顿 | 50ms | 164ms | **197ms** |
+| 截距 | 0ms | -63ms | **+1210ms** |
+| 韵律乘数 | ×1.3 | 移除 | 移除 |
+
+**R² = 0.92**, Phase 2 触发率 CV 最优 18.2%
+
+## 迭代 5: speed_threshold 1.25→1.5 + 句子碎片标注
+
+> 详见 `docs/research/2026-05-04-translation-quality-optimization.md`
+
+**speed_threshold 调整**:
+- 1.25 过于激进，导致 LLM 过度压缩译文为电报体
+- 调整到 1.5，只精简真正超速的段，翻译质量显著恢复
+
+**句子碎片标注** (`_group_sentence_fragments`):
+- 检测 Whisper 跨句切分的碎片段（< 6 词 AND < 2 秒）
+- 在 LLM batch prompt 中用 `{续}` 标注续接关系
+- 仅影响翻译质量，不改变段数（annotation-only，不做 merge+split）
+- info_ratio 改善 20-37%（最差视频）
+
+## 当前状态
+
+**`_estimate_duration_jieba`**: Ridge v2 校准参数 (6 视频 3009 样本, alpha=50, R²=0.92)，无额外韵律乘数。
+
+**`_estimate_speed_ratios`**: 直接用 `_estimate_duration_jieba` 计算 ratio，阈值 1.5（default），0.7 以下为 underslow。注释: "校准后的 jieba 参数已含韵律/停顿修正，无需额外乘数"。
+
+**`_generate_tts_segments` Phase 3 预检**: ratio 超出 (0.70, 1.35) 时 LLM 调整译文。URL 段仍跳过 LLM 精简。
+
+**`speed_threshold`**: 1.5（DEFAULT_CONFIG、test_pipeline.sh、test_two_videos.sh 均已对齐）。
+
+**句子碎片**: `_group_sentence_fragments` 保守合并 + `{续}` 标注，已在生产 prompt 中启用。
+
+## 修改文件总览
+
+| 文件 | 变更 |
+|------|------|
+| `pipeline.py:_estimate_duration_jieba` | 迭代 1→4: URL 检测→Ridge v1→v2 校准参数 (138/361/506/223/31/311/16/197/+1210) |
+| `pipeline.py:_estimate_speed_ratios` | 移除额外韵律乘数，threshold 默认 1.5 |
+| `pipeline.py:_generate_tts_segments` | Phase 3 预检用 jieba 估算，URL 段跳过 LLM |
+| `pipeline.py:_group_sentence_fragments` | 句子碎片检测 + `{续}` 标注 |
+| `pipeline.py` DEFAULT_CONFIG | speed_threshold: 1.25→1.5 |
+| `calibrate_tts_duration.py` | Ridge 校准脚本，修复 rate 去混淆 bug，支持嵌套目录 |
+| `test_pipeline.sh` | speed_threshold 1.5，API key 从 config.json 读取 |
+| `test_two_videos.sh` | 10 视频，API key 从 config.json 读取，sherpa-onnx 支持 |

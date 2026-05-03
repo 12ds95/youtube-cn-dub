@@ -1,38 +1,29 @@
 # Project Guidelines
 
-## 运行环境
+## 环境约束 (CRITICAL)
 
-**必须使用项目 venv 运行所有 Python 脚本**，系统 Python 缺少 jieba 等依赖且 SSL 不可用。
+**运行 Python 脚本必须使用 venv**，系统 Python 缺少依赖且 SSL 不可用。
 
-```bash
-# 正确
-/Users/caixin/Desktop/youtube-cn-dub/venv/bin/python3 test_translate_only.py --compare-only --all
-
-# 错误 — 不要用系统 python3
-python3 test_translate_only.py
+```
+VENV_PATH: /Users/caixin/Desktop/youtube-cn-dub/venv/bin/python3
+PYTHON_VERSION: 3.11.15
+PACKAGES: 294
+KEY_DEPS: torch 2.2.2, jieba 0.42.1, demucs 4.0.1, faster-whisper 1.2.1, edge-tts 7.2.8, pytest 9.0.2
 ```
 
-## API Key 安全规则
+正确用法: `venv/bin/python3 <script.py>`
+错误用法: `python3 <script.py>` (会失败)
 
-**绝对禁止**在脚本、代码、文档中硬编码真实 API Key。
+## API Key 安全
 
-- `config.json` 已在 `.gitignore` 中，所有 API Key 只能存放在 `config.json`
-- Shell 脚本需要 API Key 时，必须从 `config.json` 动态读取：
-  ```bash
-  LLM_API_KEY=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_key',''))")
-  ```
-- 生成临时配置文件时，用变量引用 `$LLM_API_KEY`，不写明文
-- `config.example.json` 中用 `""` 或 `"sk-your-key-here"` 作为占位符
-- 如果发现已泄漏的 Key，提醒用户立即轮换
+- 真实 API Key 只存放于 `config.json` (已在 .gitignore)
+- 禁止硬编码、禁止写入临时文件、禁止提交到 git
+- Shell 读取: `LLM_API_KEY=$(python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_key',''))")`
 
-## 文档归档规则
+## 文档归档
 
-WebSearch 调研、plan mode 计划、研究型探索实验等工作，必须将细节归档记录到 `docs/` 目录下，方便回顾：
-
-- `docs/research/` — WebSearch 调研、算法设计、实验过程与结论
-- `docs/plan/` — 实施计划、架构设计
-- `docs/spec/` — 功能规格、路线图
-
-命名格式: `YYYY-MM-DD-<topic-slug>.md`
-
-归档内容应包含：问题背景、调研的方案对比、选择理由、算法/实现细节、实验数据与结论。
+研究/计划类工作归档到 `docs/`:
+- `docs/research/` — 调研、实验
+- `docs/plan/` — 实施计划
+- `docs/spec/` — 功能规格
+命名: `YYYY-MM-DD-<topic>.md`

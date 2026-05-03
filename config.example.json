@@ -133,7 +133,7 @@
     "__说明__": "自动检测配音过长片段，调用 LLM 精简翻译，循环直到语速自然。需配置 llm.api_key",
     "enabled": false,
     "max_iterations": 5,
-    "speed_threshold": 1.25,
+    "speed_threshold": 1.5,
     "resume_iteration": null,
     "post_tts_calibration": false,
     "calibration_threshold": 1.30

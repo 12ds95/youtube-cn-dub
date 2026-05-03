@@ -420,7 +420,7 @@ def main():
     print(f"  {'intercept':<12} {'0':>8} {params['intercept']:>8.1f} {params['intercept']:>+8.1f}")
 
     print(f"\n精度对比:")
-    print(f"  {'指标':<24} {'原始(*1.3)':>12} {'校准后':>12}")
+    print(f"  {'指标':<24} {'原始(v2基线)':>12} {'校准后':>12}")
     print(f"  {'-'*50}")
     b, c = metrics["baseline"], metrics["calibrated"]
     print(f"  {'MAE (ms)':<24} {b['mae_ms']:>12.1f} {c['mae_ms']:>12.1f}")

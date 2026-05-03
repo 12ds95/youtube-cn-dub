@@ -60,6 +60,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
+from text_utils import (
+    _strip_think_block,
+    _strip_markdown,
+    _strip_numbered_prefix,
+    _clean_refine_artifacts,
+    normalize_llm_output,
+    strip_parenthetical_annotations,
+)
+from duration_estimator import estimate_duration as _estimate_duration_jieba
+
 
 # ─── 审计目录 ──────────────────────────────────────────────────────
 def _audit_dir(output_dir: Path) -> Path:
@@ -1503,7 +1513,7 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     api_key = llm_config["api_key"]
     model = llm_config["model"]
     system_prompt = llm_config.get("system_prompt",
-        "你是专业的英中视频翻译员，负责将YouTube教育视频的英文旁白翻译为自然流畅的中文配音稿。\n"
+        "你是专业的英中视频翻译员，负责将YouTube视频的英文内容翻译为自然流畅的中文配音稿。\n"
         "翻译原则：\n"
         "1) 忠实传达原文全部信息，不遗漏、不添加、不曲解\n"
         "2) 译文用于语音朗读，必须通顺自然，符合中文口语表达习惯\n"
@@ -1898,7 +1908,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     # 使用修改后的 system_prompt 强调忠实性
     pass1_config = copy.deepcopy(llm_config)
     pass1_config["system_prompt"] = (
-        "你是专业的英中翻译引擎，正在为教育视频制作字幕翻译。请逐句忠实翻译以下英文。\n"
+        "你是专业的英中翻译引擎，正在为视频制作字幕翻译。请逐句忠实翻译以下英文。\n"
         "要求：\n"
         "1) 完整保留原文所有信息点，一个都不能遗漏\n"
         "2) 忠实直译为主，保持与原文的一一对应关系\n"
@@ -2073,66 +2083,8 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
     return results
 
 
-def _strip_think_block(content: str) -> str:
-    """去除 Qwen3 等模型返回的 <think>...</think> 推理块"""
-    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
-def _strip_markdown(text: str, original: str = "") -> str:
-    """去除翻译文本中 LLM 额外添加的 Markdown 格式标记。
-
-    只清除原文中不存在的 markdown 符号，保留原文本身就有的字符。
-    例如原文 "3 * 4 = 12" 中的 * 是乘号，翻译后应保留。
-
-    参数:
-        text:     翻译后的中文文本
-        original: 对应的英文原文（用于判断哪些符号是原文自带的）
-    """
-    if not text:
-        return text
-    # ── 兜底：清除 LLM 回显的字数提示和翻译指令泄漏 ──
-    # 英文原文不可能包含中文字数提示，无需像 markdown 那样检查 original
-    # 1. 括号包裹的字数提示（各种变体）:
-    #    (≈26字) （约26个字） [≈26字] (目标约26字左右) (约20-30字) 等
-    text = re.sub(
-        r'[(\uff08\[]\s*(?:目标)?(?:约|≈)\s*\d+[\s\-~～]*(?:\d+)?\s*(?:个)?(?:中文)?字\s*(?:左右|以内)?\s*[)\uff09\]]',
-        '', text)
-    # 2. 行尾裸露的字数提示（无括号）: ...译文≈26字 / 约26字
-    text = re.sub(r'\s*(?:约|≈)\s*\d+\s*(?:个)?字\s*$', '', text)
-    # 3. 完整翻译指令句泄漏: （请将译文控制在约N字，不要在译文中输出字数标注）
-    text = re.sub(r'[(\uff08]\s*请将译文控制在[^)\uff09]*[)\uff09]', '', text)
-    # 4. 批量提示元数据泄漏: 各句参考字数：[1]≈26字, [2]≈8字 ...
-    text = re.sub(r'各句参考字数[：:][^\n]*', '', text)
-    # 5. 零散指令片段泄漏
-    text = re.sub(r'[,，]?\s*不要在译文中输出字数标注[。.，,]?', '', text)
-    # 反引号包裹的行内代码 `xxx` → xxx
-    if '`' not in original:
-        text = re.sub(r'`([^`]+)`', r'\1', text)
-    # 加粗 **xxx** 或 __xxx__
-    if '**' not in original:
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    if '__' not in original:
-        text = re.sub(r'__(.+?)__', r'\1', text)
-    # 斜体 *xxx*（但不匹配单独的 * 或乘号前后有空格的情况）
-    if '*' not in original:
-        text = re.sub(r'(?<!\*)\*([^\s*][^*]*[^\s*])\*(?!\*)', r'\1', text)
-    # 斜体 _xxx_（仅匹配前后有空格或行首行尾的，避免破坏 snake_case 变量名）
-    if '_' not in original:
-        text = re.sub(r'(?<=\s)_([^_]+)_(?=\s|$)', r'\1', text)
-        text = re.sub(r'^_([^_]+)_(?=\s|$)', r'\1', text)
-    # 删除线 ~~xxx~~
-    if '~' not in original:
-        text = re.sub(r'~~(.+?)~~', r'\1', text)
-    # 行首 # 标题标记
-    if '#' not in original:
-        text = re.sub(r'^#{1,6}\s+', '', text)
-    return text.strip()
-
-
-def _strip_numbered_prefix(line: str) -> str:
-    """去除行首的 [N] 或 N. 编号前缀"""
-    cleaned = re.sub(r"^\[?\d+\]?\s*\.?\s*", "", line.strip())
-    return cleaned.strip()
 
 
 def _parse_numbered_translations(content: str, expected_count: int) -> List[str]:
@@ -2558,6 +2510,7 @@ async def _generate_tts_segments(
         # 最后防线：清除可能残留的格式标记
         text_zh = _strip_markdown(text_zh, seg.get("text_en", seg.get("text", "")))
         text_zh = _clean_refine_artifacts(text_zh)  # 清理 [轻]/[中]/[短] 等标签
+        text_zh = strip_parenthetical_annotations(text_zh)  # 去除 LLM 括号注音
         text_zh = _fix_polyphones(text_zh)  # 多音字同音替换，纠正 TTS 误读
         if len(text_zh.strip()) >= 2:
             # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
@@ -3345,69 +3298,6 @@ def _estimate_speed_ratios(
             "status": status,
         })
     return results
-
-
-def _estimate_duration_jieba(text_zh: str) -> float:
-    """用 jieba 分词后按词粒度估算朗读时长（毫秒）。
-
-    Ridge 回归校准值（6 视频 3009 样本, alpha=50, R²=0.92）：
-      单字词（如"的""是"）: ~138ms
-      双字词（如"今天""学习"）: ~361ms
-      三字词（如"计算机""互联网"）: ~506ms
-      四字及以上（如"人工智能"）: ~223ms/字
-      英文单词: ~31ms/字符
-      URL/域名（逐字母朗读）: ~16ms/字符
-      数字: ~311ms/字符
-      截距: +1210ms
-    """
-    import jieba
-    import unicodedata
-
-    # 先检测 URL/域名模式：TTS 会逐字母朗读这些内容
-    _URL_PATTERN = re.compile(
-        r'(?:https?://)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}'
-        r'(?:/[^\s]*)?'
-    )
-
-    # 预处理：找出 URL 并计算其独立时长，然后从文本中移除
-    url_ms = 0.0
-    clean_text = text_zh
-    for m in _URL_PATTERN.finditer(text_zh):
-        url_str = m.group()
-        # URL 逐字母朗读：每个字母/符号约 16ms
-        url_chars = sum(1 for c in url_str if c.isalnum() or c in './-_:')
-        url_ms += url_chars * 16
-        clean_text = clean_text.replace(url_str, '', 1)
-
-    words = jieba.lcut(clean_text)
-    total_ms = url_ms
-    for word in words:
-        # 跳过纯标点/空白
-        meaningful = [c for c in word if not unicodedata.category(c).startswith(('P', 'Z', 'C'))]
-        if not meaningful:
-            total_ms += 197  # 标点停顿
-            continue
-
-        zh_count = sum(1 for c in meaningful if '\u4e00' <= c <= '\u9fff')
-        other_count = len(meaningful) - zh_count
-
-        if zh_count > 0:
-            # 中文词：按词长分配
-            if zh_count == 1:
-                total_ms += 138
-            elif zh_count == 2:
-                total_ms += 361
-            elif zh_count == 3:
-                total_ms += 506
-            else:
-                total_ms += zh_count * 223
-        if other_count > 0:
-            # 英文/数字：比纯中文慢（TTS 需要切换语言）
-            digits = sum(1 for c in meaningful if c.isdigit())
-            letters = other_count - digits
-            total_ms += letters * 31 + digits * 311
-
-    return max(0, total_ms + 1210)  # 校准截距: +1210ms (Ridge v2 拟合, 6 视频 3009 样本)
 
 
 def _identify_high_cps_segments(
@@ -4614,27 +4504,6 @@ def _fix_polyphones(text: str) -> str:
             text_pos += len(py_entry[0])
     return ''.join(chars)
 
-
-def _clean_refine_artifacts(text: str) -> str:
-    """清理翻译文本中残留的 refine 格式标签。
-
-    处理 LLM 输出中可能泄漏的标签格式：
-      **[轻]** xxx → xxx
-      - [中] xxx   → xxx
-      [V3] xxx     → xxx
-    以及 LLM 回显的系统指令文本。
-    """
-    if not text:
-        return text
-    # 去除行首的 markdown/列表标记 + [轻]/[中]/[短]/[轻扩]/[中扩]/[重扩]/[V1]-[V10] 标签
-    text = re.sub(r"^[-*]*\s*\*{0,2}\[(轻|中|短|轻扩|中扩|重扩)\]\*{0,2}\s*", "", text.strip())
-    text = re.sub(r"^[-*]*\s*\*{0,2}\[V\d+\]\*{0,2}\s*", "", text.strip(), flags=re.IGNORECASE)
-    # 如果整行都是系统指令回显（如"以下为每段翻译的三个精简版本..."），返回空
-    if re.search(r"(轻扩?|中扩?|短|重扩).*[/／].*(轻扩?|中扩?|短|重扩)", text):
-        return ""
-    if re.search(r"\[V\d+\].*[/／].*\[V\d+\]", text, re.IGNORECASE):
-        return ""
-    return text.strip()
 
 
 def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]]:

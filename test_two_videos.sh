@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 # 集成测试脚本: 对 10 个视频执行全功能管线测试
-# 全功能开启: two_pass, nlp_segmentation, isometric, post_tts_calibration,
+# 全功能开启: two_pass, nlp_segmentation, post_tts_calibration,
 #   gap_borrowing, video_slowdown, atempo_disabled, feedback_loop
 # 用途: 收集 TTS 时长校准数据 + 回归测试
 # 覆盖领域: 微积分、计算机科学、微分方程、神经网络、分析、概率
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# ── 从 config.json 动态读取 LLM 凭据（禁止硬编码 API Key）──
+if [ ! -f config.json ]; then
+    echo "❌ config.json 不存在，请先复制 config.example.json 并填入 API Key"
+    exit 1
+fi
+LLM_API_KEY=$(./venv/bin/python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_key',''))")
+LLM_API_URL=$(./venv/bin/python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('api_url',''))")
+LLM_MODEL=$(./venv/bin/python3 -c "import json; c=json.load(open('config.json')); print(c.get('llm',{}).get('model',''))")
+if [ -z "$LLM_API_KEY" ]; then
+    echo "❌ config.json 中 llm.api_key 为空"
+    exit 1
+fi
 
 # ctrl+c / 异常退出时清理临时配置文件
 trap 'rm -f /tmp/test_*_*.json' EXIT
@@ -75,24 +88,29 @@ run_video() {
   "voice": "zh-CN-YunxiNeural",
   "translator": "llm",
   "llm": {
-    "api_url": "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
-    "api_key": "sk-sp-e0987ca0f8c04f969a5218dbdc6f1401",
-    "model": "qwen3-coder-next",
+    "api_url": "$LLM_API_URL",
+    "api_key": "$LLM_API_KEY",
+    "model": "$LLM_MODEL",
     "batch_size": 8,
     "temperature": 0.3,
-    "two_pass": true,
-    "isometric": 3,
-    "isometric_cps_threshold": 5.5
+    "two_pass": true
   },
   "nlp_segmentation": true,
-  "tts_chain": ["edge-tts", "piper", "gtts", "pyttsx3"],
+  "tts_chain": ["edge-tts", "sherpa-onnx", "piper", "gtts", "pyttsx3"],
   "piper": {
     "model_path": "models/piper/zh_CN-huayan-medium.onnx"
+  },
+  "sherpa_onnx": {
+    "model": "models/vits-zh-hf-fanchen-wnj/vits-zh-hf-fanchen-wnj.onnx",
+    "lexicon": "models/vits-zh-hf-fanchen-wnj/lexicon.txt",
+    "tokens": "models/vits-zh-hf-fanchen-wnj/tokens.txt",
+    "dict_dir": "models/vits-zh-hf-fanchen-wnj/dict",
+    "speaker_id": 0
   },
   "skip_steps": $SKIP_STEPS,
   "refine": {
     "enabled": true,
-    "max_iterations": 20,
+    "max_iterations": 5,
     "speed_threshold": 1.5,
     "post_tts_calibration": true,
     "calibration_threshold": 1.30
@@ -118,7 +136,7 @@ JSONEOF
 
     echo -e "${YELLOW}🚀 开始运行管线...${NC}"
     echo "   skip_steps: $SKIP_STEPS"
-    echo "   功能: two_pass, nlp_segmentation, isometric, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop"
+    echo "   功能: two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop"
     echo ""
 
     local START_TIME

@@ -3,7 +3,7 @@
 # 跳过: download, extract, separate (保留已有的 original.mp4, audio.wav, 分离音频)
 #
 # 用法:
-#   bash test_pipeline.sh              # 集成测试: 全功能开启，从 transcribe 到 merge
+#   bash test_pipeline.sh              # 快速测试: 跳过 transcribe+translate，复用缓存 (默认)
 #   bash test_pipeline.sh --integrated # 集成测试: 全功能开启，跳过 transcribe（用缓存）
 #   bash test_pipeline.sh --baseline   # 回归测试: 全功能关闭，验证不引入回归
 #   bash test_pipeline.sh --fast       # 快速测试 (跳过 transcribe+translate，复用缓存)
@@ -48,7 +48,7 @@ for f in original.mp4 audio.wav info.json; do
     fi
 done
 
-MODE="full"
+MODE="fast"
 case "${1:-}" in
     --full)        MODE="full" ;;
     --integrated)  MODE="integrated" ;;
@@ -141,7 +141,7 @@ else
     VID_SLOW=true
     ATEMPO_DISABLED=true
     FEEDBACK_LOOP=true
-    FEATURE_DESC="two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop"
+    FEATURE_DESC="two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop, isometric=3"
 fi
 
 cat > "$TMPCONFIG" <<JSONEOF
@@ -156,13 +156,19 @@ cat > "$TMPCONFIG" <<JSONEOF
     "batch_size": 8,
     "temperature": 0.3,
     "two_pass": $TWO_PASS,
-    "isometric": 3,
-    "isometric_cps_threshold": 5.5
+    "isometric": 3
   },
   "nlp_segmentation": $NLP_SEG,
-  "tts_chain": ["edge-tts", "piper", "gtts", "pyttsx3"],
+  "tts_chain": ["edge-tts", "sherpa-onnx", "piper", "gtts", "pyttsx3"],
   "piper": {
     "model_path": "models/piper/zh_CN-huayan-medium.onnx"
+  },
+  "sherpa_onnx": {
+    "model": "models/vits-zh-hf-fanchen-wnj/vits-zh-hf-fanchen-wnj.onnx",
+    "lexicon": "models/vits-zh-hf-fanchen-wnj/lexicon.txt",
+    "tokens": "models/vits-zh-hf-fanchen-wnj/tokens.txt",
+    "dict_dir": "models/vits-zh-hf-fanchen-wnj/dict",
+    "speaker_id": 0
   },
   "skip_steps": $SKIP_STEPS,
   "refine": {

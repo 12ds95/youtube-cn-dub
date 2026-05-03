@@ -1556,7 +1556,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     def _group_sentence_fragments(segs):
         """检测跨段句子碎片，合并为翻译组。
         
-        保守策略：只合并真正的短碎片（< 6 词 AND < 2 秒），避免过度合并。
+        两类合并条件：
+        1. 短碎片（< 6 词 AND < 2 秒）
+        2. 不完整句子（不以 .!? 结尾的段，无论长度）
         检测段内句子边界（句号后接大写字母），避免跨句合并。
         """
         groups = []  # [(merged_seg, [original_indices])]
@@ -1576,12 +1578,14 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 # 当前段内有句子边界（句号+空格+大写）→ 不继续合并
                 if re.search(r'[.!?]\s+[A-Z]', curr_text):
                     break
-                # 只有短碎片才合并（< 6 词 AND < 2 秒）
-                if curr_words >= 6 or curr_dur >= 2.0:
+                # 短碎片直接合并；长段若不以句末标点结尾也视为不完整句
+                is_short_fragment = curr_words < 6 and curr_dur < 2.0
+                is_incomplete_sentence = not (curr_text and curr_text[-1] in '.!?')
+                if not is_short_fragment and not is_incomplete_sentence:
                     break
-                # 合并限制：最多3段，总时长不超8秒
+                # 合并限制：最多4段，总时长不超12秒
                 total_dur = segs[i + 1].get("end", 0) - segs[group_indices[0]].get("start", 0)
-                if len(group_indices) >= 3 or total_dur > 8:
+                if len(group_indices) >= 4 or total_dur > 12:
                     break
                 i += 1
                 group_indices.append(i)
@@ -1623,9 +1627,10 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
         batch = segments[i:i + batch_size]
         # 构造批量翻译请求：每行一句，用编号标记
-        CHARS_PER_SEC = 4.0  # 仅用于参考范围计算
+        # 目标字数: 4.5 CPS 与 LLM 自然翻译长度匹配，作为参考而非硬约束
+        CHARS_PER_SEC = 4.5
         lines = []
-        length_hints = []
+        char_hints = []
         has_sentence_groups = False
         for j, seg in enumerate(batch):
             global_idx = i + j
@@ -1637,12 +1642,10 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             else:
                 lines.append(f"[{j+1}] {seg['text']}")
             dur_sec = seg.get("end", 0) - seg.get("start", 0)
-            center = max(2, int(dur_sec * CHARS_PER_SEC))
-            lo = max(2, int(center * 0.75))
-            hi = int(center * 1.3)
-            length_hints.append(f"[{j+1}]≈{center}字({lo}-{hi})")
+            target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+            char_hints.append(f"[{j+1}]≈{target_chars}字")
         user_msg = "\n".join(lines)
-        hint_line = f"各句目标字数：{', '.join(length_hints)}"
+        hint_line = f"各句参考字数：{', '.join(char_hints)}"
 
         # 构造上下文提示（滑动窗口：6句回看 + 3句前瞻）
         context_hint = ""
@@ -1678,8 +1681,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             f"重要：每个 [编号] 只翻译该编号对应的英文，严禁将相邻句内容合并到同一编号。\n"
             f"{fragment_hint}"
             f"{hint_line}\n"
-            f"请尽量将每句译文控制在目标字数范围内，同时确保信息完整不遗漏。"
-            f"计算机缩写保留英文原词，不加括号注音。\n\n{user_msg}"
+            f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
+            f"计算机缩写保留英文原词，不加括号注音。"
+            f"忠实原文语义，不要曲解也不要过度扩充。\n\n{user_msg}"
         )
 
         payload = {
@@ -1821,6 +1825,35 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 if zh and len(zh.strip()) >= 2:
                     batch_results[j]["text_zh"] = zh.strip()
                     print(f"       ✅ 错位修复: #{i+j} \"{batch[j]['text'][:30]}\"")
+
+        # ── 相邻段 text_zh 近似去重: 检测 LLM 跨段内容污染 ──
+        neighbor_dup_indices = []
+        for j in range(len(batch_results) - 1):
+            zh_a = batch_results[j]["text_zh"].strip()
+            zh_b = batch_results[j + 1]["text_zh"].strip()
+            if len(zh_a) < 6 or len(zh_b) < 6:
+                continue
+            # 子串包含 或 字符重叠率 > 0.6
+            is_dup = (zh_a in zh_b or zh_b in zh_a or
+                      _char_overlap_ratio(zh_a, zh_b) > 0.6)
+            if is_dup:
+                # 保留英文原文更长的段（更可能是正确归属），重试另一段
+                en_a = batch_results[j].get("text_en", "")
+                en_b = batch_results[j + 1].get("text_en", "")
+                dup_j = j if len(en_a) <= len(en_b) else j + 1
+                if dup_j not in neighbor_dup_indices:
+                    neighbor_dup_indices.append(dup_j)
+        if neighbor_dup_indices:
+            print(f"     ⚠️  检测到 {len(neighbor_dup_indices)} 段相邻译文近似重复，逐段重译...")
+            retry_segs = [batch[j] for j in neighbor_dup_indices]
+            retry_zhs = _translate_llm_single(
+                retry_segs, endpoint, headers, model, system_prompt, temperature
+            )
+            for k, j in enumerate(neighbor_dup_indices):
+                zh = retry_zhs[k]
+                if zh and len(zh.strip()) >= 2:
+                    batch_results[j]["text_zh"] = zh.strip()
+                    print(f"       ✅ 去重修复: #{i+j} \"{batch[j]['text'][:30]}\"")
 
         for br in batch_results:
             result.append(br)
@@ -2008,11 +2041,9 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
     for seg in batch:
         zh = None
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
-        center = max(2, int(dur_sec * 4.0))
-        lo = max(2, int(center * 0.75))
-        hi = int(center * 1.3)
+        target_chars = max(2, int(dur_sec * 4.5))
         user_content = (
-            f"（目标≈{center}字，范围{lo}-{hi}字，信息完整不遗漏。）\n{seg['text']}"
+            f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注。计算机缩写保留英文原词，不加括号注音。）\n{seg['text']}"
         )
         for attempt in range(max_retries):
             try:
@@ -2572,6 +2603,7 @@ async def _generate_tts_segments(
         api_url = llm_config["api_url"].rstrip("/")
         api_key = llm_config.get("api_key", "")
         model = llm_config.get("model", "")
+        pre_tts_log = []  # 记录每段调整
         if api_key and model:
             import httpx
             endpoint = f"{api_url}/chat/completions" if "/chat/completions" not in api_url else api_url
@@ -2581,27 +2613,31 @@ async def _generate_tts_segments(
             _url_pat = re.compile(
                 r'(?:https?://)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}'
             )
+            rejected_count = 0
             for item in outliers:
                 idx = item["idx"]
                 seg = segments[idx]
                 old_zh = item["text_zh"]
+                old_ratio = item["raw_ratio"]
+                text_en = seg.get("text_en", seg.get("text", ""))
                 # 含 URL 且超速的片段：LLM 无法有效缩短 URL 发音，跳过
                 if item["raw_ratio"] > 1.35 and _url_pat.search(old_zh):
                     continue
                 target_chars = max(2, int(item["target_dur_ms"] / MS_PER_CHAR))
-                current_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', old_zh))
-                # 判断调整方向
+                # 判断调整方向，prompt 附带英文原文供 LLM 参考
                 if item["raw_ratio"] > 1.35:
                     action = "精简"
-                    prompt = f"请将以下中文译文精简到约 {target_chars} 字，保持核心语义：\n{old_zh}"
+                    prompt = (f"英文原文: {text_en}\n当前中文译文: {old_zh}\n"
+                              f"请将中文译文精简到约 {target_chars} 字，必须忠实英文原文语义，不得删减关键信息。")
                 else:
                     action = "扩展"
-                    prompt = f"请将以下中文译文扩展到约 {target_chars} 字，使表达更完整自然：\n{old_zh}"
+                    prompt = (f"英文原文: {text_en}\n当前中文译文: {old_zh}\n"
+                              f"请将中文译文扩展到约 {target_chars} 字，忠实英文原文，使表达更完整自然。")
                 try:
                     payload = {
                         "model": model,
                         "messages": [
-                            {"role": "system", "content": "你是配音字幕调整助手。根据要求精简或扩展译文，输出纯文本，不要添加任何解释。"},
+                            {"role": "system", "content": "你是配音字幕调整助手。根据英文原文和要求精简或扩展译文，必须忠实原文语义。输出纯文本，不要添加任何解释。"},
                             {"role": "user", "content": prompt},
                         ],
                         "temperature": 0.3,
@@ -2611,22 +2647,50 @@ async def _generate_tts_segments(
                         resp = await client.post(endpoint, json=payload, headers=headers)
                         resp.raise_for_status()
                         new_zh = resp.json()["choices"][0]["message"]["content"].strip()
-                        new_zh = _strip_markdown(new_zh, seg.get("text_en", seg.get("text", "")))
-                        if new_zh and len(new_zh) >= 2:
-                            # 更新 segments 和 item
-                            segments[idx]["text_zh"] = new_zh
-                            item["text_zh"] = new_zh
-                            # 重新计算 rate（使用 jieba 估算，含 URL 检测）
-                            new_est_ms = _estimate_duration_jieba(new_zh)
-                            if new_est_ms > 0 and item["target_dur_ms"] > 0:
-                                new_ratio = new_est_ms / item["target_dur_ms"]
-                                item["raw_ratio"] = new_ratio
-                                item["rate"] = max(0.85, min(1.20, new_ratio))
-                            adjusted_count += 1
+                        new_zh = _strip_markdown(new_zh, text_en)
+                        # 统一质量守卫
+                        guard_mode = "shrink" if action == "精简" else "expand"
+                        is_valid, reason = _validate_text_adjustment(
+                            new_zh, old_zh, idx, segments, mode=guard_mode,
+                        )
+                        if not is_valid:
+                            rejected_count += 1
+                            continue
+                        # 通过所有守卫，更新 segments 和 item
+                        segments[idx]["text_zh"] = new_zh
+                        item["text_zh"] = new_zh
+                        # 重新计算 rate（使用 jieba 估算，含 URL 检测）
+                        new_est_ms = _estimate_duration_jieba(new_zh)
+                        new_ratio = item["raw_ratio"]
+                        if new_est_ms > 0 and item["target_dur_ms"] > 0:
+                            new_ratio = new_est_ms / item["target_dur_ms"]
+                            item["raw_ratio"] = new_ratio
+                            item["rate"] = max(0.85, min(1.20, new_ratio))
+                        pre_tts_log.append({
+                            "idx": idx, "action": action,
+                            "old_zh": old_zh, "new_zh": new_zh,
+                            "old_ratio": round(old_ratio, 3),
+                            "new_ratio": round(new_ratio, 3),
+                        })
+                        adjusted_count += 1
                 except Exception as e:
                     print(f"        ⚠️ 段落 {idx} {action}失败: {e}")
-            if adjusted_count:
-                print(f"        ✅ 成功调整 {adjusted_count}/{len(outliers)} 个片段")
+            if adjusted_count or rejected_count:
+                print(f"        ✅ 成功调整 {adjusted_count}/{len(outliers)} 个片段"
+                      + (f"，拒绝 {rejected_count} 个低质量结果" if rejected_count else ""))
+            # 写入日志
+            if pre_tts_log or rejected_count:
+                import json as _json_ptc
+                _ptc_audit = _audit_dir(tts_dir.parent)
+                log_path = _ptc_audit / "pre_tts_check_log.json"
+                log_data = {
+                    "total_outliers": len(outliers),
+                    "adjusted": adjusted_count,
+                    "rejected": rejected_count,
+                    "changes": pre_tts_log,
+                }
+                with open(log_path, "w", encoding="utf-8") as _f:
+                    _json_ptc.dump(log_data, _f, ensure_ascii=False, indent=2)
 
     # ── 断点恢复：先用上次失败引擎重试失败片段 ──
     start_idx = 0
@@ -3039,18 +3103,20 @@ async def _llm_duration_feedback(
         actual = out["actual_ms"]
         target = out["target_dur_ms"]
         target_chars = out["target_chars"]
+        text_en = seg.get("text_en", seg.get("text", ""))
 
         prompt = (
+            f"英文原文: {text_en}\n"
             f"当前中文译文合成语音时长为 {actual}ms，目标时长为 {target}ms。\n"
-            f"请将以下译文{action}到约 {target_chars} 字，保持核心语义准确：\n{old_zh}"
+            f"请将以下译文{action}到约 {target_chars} 字，必须忠实英文原文语义：\n{old_zh}"
         )
         try:
             payload = {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": (
-                        "你是配音字幕调整助手。根据实际语音时长反馈调整译文长度，"
-                        "输出纯文本，不要添加任何解释、引号或标点符号以外的内容。"
+                        "你是配音字幕调整助手。根据英文原文和实际语音时长反馈调整译文长度，"
+                        "必须忠实英文原文语义。只输出调整后的译文，不要输出解释、引号或其他多余内容。"
                     )},
                     {"role": "user", "content": prompt},
                 ],
@@ -3065,13 +3131,13 @@ async def _llm_duration_feedback(
                 new_zh = _strip_think_block(new_zh)
                 new_zh = _strip_markdown(new_zh, seg.get("text_en", seg.get("text", "")))
                 if new_zh and len(new_zh) >= 2 and new_zh != old_zh:
-                    # 忠实度校验: 防止 LLM 编造内容 (devlog/2026-03-29-expand-llm-garbage.md)
-                    if not _check_refine_fidelity(old_zh, new_zh, min_overlap=0.25):
-                        print(f"        ⚠️ 段落 {idx} 忠实度不足，跳过")
-                        continue
-                    # 邻段去重: 防止 LLM 偷懒复制相邻段
-                    if _is_duplicate_of_neighbors(new_zh, idx, segments):
-                        print(f"        ⚠️ 段落 {idx} 与相邻段重复，跳过")
+                    # 统一质量守卫（含过度压缩检查，之前此处缺失）
+                    guard_mode = "shrink" if action == "精简" else "expand"
+                    is_valid, reason = _validate_text_adjustment(
+                        new_zh, old_zh, idx, segments, mode=guard_mode,
+                    )
+                    if not is_valid:
+                        print(f"        ⚠️ 段落 {idx} {reason}，跳过")
                         continue
                     # 更新 segments 和对应 item
                     segments[idx]["text_zh"] = new_zh
@@ -3108,21 +3174,34 @@ async def _llm_duration_feedback(
 
     print(f"     ✅ LLM 闭环完成: {adjusted_count} 段译文调整并重新合成")
 
-    # 保存审计日志
+    # 保存审计日志（含实际文本变更）
     try:
         audit_dir = tts_dir.parent / "audit"
         audit_dir.mkdir(exist_ok=True)
-        llm_log = [{
-            "idx": out["idx"],
-            "action": out["action"],
-            "target_ms": out["target_dur_ms"],
-            "actual_ms": out["actual_ms"],
-            "deviation": out["deviation"],
-            "current_chars": out["current_chars"],
-            "target_chars": out["target_chars"],
-        } for out in outliers]
+        llm_log = []
+        for out in outliers:
+            entry = {
+                "idx": out["idx"],
+                "action": out["action"],
+                "target_ms": out["target_dur_ms"],
+                "actual_ms": out["actual_ms"],
+                "deviation": out["deviation"],
+                "current_chars": out["current_chars"],
+                "target_chars": out["target_chars"],
+            }
+            # 记录实际被调整的文本变更
+            current_zh = segments[out["idx"]].get("text_zh", "")
+            if current_zh != out["text_zh"]:
+                entry["old_zh"] = out["text_zh"]
+                entry["new_zh"] = current_zh
+            llm_log.append(entry)
+        log_data = {
+            "adjusted": adjusted_count,
+            "total_outliers": len(outliers),
+            "changes": llm_log,
+        }
         with open(audit_dir / "llm_duration_feedback_log.json", "w", encoding="utf-8") as f:
-            json.dump(llm_log, f, ensure_ascii=False, indent=2)
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -4331,6 +4410,35 @@ def _check_refine_fidelity(original_zh: str, candidate_zh: str,
     return overlap >= min_overlap
 
 
+def _validate_text_adjustment(
+    new_zh: str, old_zh: str, idx: int, segments: List[dict],
+    mode: str = "shrink",
+    fidelity_threshold: float = 0.25,
+    compression_floor: float = 0.6,
+    expansion_ceiling: float = 2.0,
+) -> tuple:
+    """统一质量守卫：校验 LLM 译文调整结果。
+
+    所有精简/扩展路径共用，避免守卫逻辑分散导致改漏。
+
+    Returns:
+        (is_valid, rejection_reason) — reason 为 None 表示通过
+    """
+    if not new_zh or len(new_zh.strip()) < 2:
+        return False, "too_short"
+    if not _check_refine_fidelity(old_zh, new_zh, min_overlap=fidelity_threshold):
+        return False, "low_fidelity"
+    if _is_duplicate_of_neighbors(new_zh, idx, segments):
+        return False, "duplicate"
+    if mode == "shrink" and len(old_zh) > 4:
+        if len(new_zh) < len(old_zh) * compression_floor:
+            return False, "over_compressed"
+    if mode == "expand":
+        if len(new_zh) > len(old_zh) * expansion_ceiling:
+            return False, "over_expanded"
+    return True, None
+
+
 def _refine_with_llm(
     segments: List[dict], overfast_items: List[dict], llm_config: dict,
 ) -> List[dict]:
@@ -4513,15 +4621,18 @@ def _clean_refine_artifacts(text: str) -> str:
     处理 LLM 输出中可能泄漏的标签格式：
       **[轻]** xxx → xxx
       - [中] xxx   → xxx
-      [短] xxx     → xxx
+      [V3] xxx     → xxx
     以及 LLM 回显的系统指令文本。
     """
     if not text:
         return text
-    # 去除行首的 markdown/列表标记 + [轻]/[中]/[短]/[轻扩]/[中扩]/[重扩] 标签
+    # 去除行首的 markdown/列表标记 + [轻]/[中]/[短]/[轻扩]/[中扩]/[重扩]/[V1]-[V10] 标签
     text = re.sub(r"^[-*]*\s*\*{0,2}\[(轻|中|短|轻扩|中扩|重扩)\]\*{0,2}\s*", "", text.strip())
+    text = re.sub(r"^[-*]*\s*\*{0,2}\[V\d+\]\*{0,2}\s*", "", text.strip(), flags=re.IGNORECASE)
     # 如果整行都是系统指令回显（如"以下为每段翻译的三个精简版本..."），返回空
     if re.search(r"(轻扩?|中扩?|短|重扩).*[/／].*(轻扩?|中扩?|短|重扩)", text):
+        return ""
+    if re.search(r"\[V\d+\].*[/／].*\[V\d+\]", text, re.IGNORECASE):
         return ""
     return text.strip()
 
@@ -4529,19 +4640,17 @@ def _clean_refine_artifacts(text: str) -> str:
 def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]]:
     """解析 LLM 多候选精简结果。
 
-    预期格式：
-      [1]
-      [轻] xxx
-      [中] xxx
-      [短] xxx
-      [2]
-      ...
+    预期格式（两种均兼容）：
+      格式 A（旧）:           格式 B（新, 10 候选）:
+        [1]                     [1]
+        [轻] xxx                [V1] xxx
+        [中] xxx                [V2] xxx
+        [短] xxx                ...
+        [2]                     [V10] xxx
+        ...                     [2]
 
-    也兼容 LLM 的非标准变体：
-      **[轻]** xxx  (markdown 加粗)
-      - [轻] xxx    (列表符号)
-
-    返回: [[候选1, 候选2, 候选3], [候选1, ...], ...]
+    也兼容 markdown 加粗、列表符号等变体。
+    返回: [[候选1, 候选2, ...], [候选1, ...], ...]
     """
     results = []
     current_candidates = []
@@ -4554,23 +4663,33 @@ def _parse_multi_candidates(content: str, expected_count: int) -> List[List[str]
         # 跳过 LLM 回显系统指令的行（如 "以下为每段翻译的三个精简版本..."）
         if re.search(r"[轻中短].*[/／].*[轻中短]", line):
             continue
+        if re.search(r"\[V\d+\].*[/／].*\[V\d+\]", line):
+            continue
 
-        # 新段落标记 [N] 或 **[N]**
+        # 新段落标记 [N] 或 **[N]**（纯数字编号，不跟内容）
         if re.match(r"^\*{0,2}\[(\d+)\]\*{0,2}$", line) or re.match(r"^(\d+)\.", line):
             if current_candidates:
                 results.append(current_candidates)
             current_candidates = []
             continue
 
+        # 匹配 [V1]-[V10] 编号标签
+        v_match = re.match(
+            r"^[-*]*\s*\*{0,2}\[V(\d+)\]\*{0,2}\s*(.+)$", line, re.IGNORECASE)
+        if v_match:
+            text = v_match.group(2).strip()
+            text = _strip_think_block(text) if '<think>' in text else text
+            text = _clean_refine_artifacts(text)
+            if text:
+                current_candidates.append(text)
+            continue
+
         # 匹配 [轻]/[中]/[短] 标签，兼容 markdown 和列表前缀
-        # 覆盖: [轻] xxx, **[轻]** xxx, - [轻] xxx, * [轻] xxx
         tag_match = re.match(
             r"^[-*]*\s*\*{0,2}\[([轻中短])\]\*{0,2}\s*(.+)$", line)
         if tag_match:
             text = tag_match.group(2).strip()
-            # 清理可能的 think block 残留
             text = _strip_think_block(text) if '<think>' in text else text
-            # 最终清理残留标签
             text = _clean_refine_artifacts(text)
             if text:
                 current_candidates.append(text)
@@ -4669,8 +4788,7 @@ def _select_best_candidate(
       2. 长度过滤（取决于 mode）
       3. 排除与原文语义忠实度过低的候选（防止跨段内容污染）
       4. 用 jieba 分词估算每个候选的朗读时长
-      5. shrink: 选时长最接近 target_ms 且不超出的；都超出则选最短的
-         fill:   选时长最接近 target_ms 且不超出的**最长**候选；都超出则选最短的
+      5. shrink: 选最接近 target_ms 的；fill: 选最长的
     """
     if not candidates:
         return ""
@@ -4689,12 +4807,9 @@ def _select_best_candidate(
         cand = _clean_refine_artifacts(cand)
         if not cand or len(cand) < 2:
             continue
-        # 长度过滤
+        # 方向性长度过滤（多候选评分专用，非质量守卫）
         if mode == "fill":
-            # 扩展模式：候选必须比原文长，且不超过 2 倍
             if len(cand) <= len(original_zh):
-                continue
-            if len(cand) > len(original_zh) * 2.0:
                 continue
         elif allow_same_length:
             if len(cand) > len(original_zh) * 1.15:
@@ -4702,15 +4817,15 @@ def _select_best_candidate(
         else:
             if len(cand) >= len(original_zh):
                 continue
-        # 质量守卫: 拒绝过度压缩（<60%原文长度说明删了信息而非精练表达）
-        if mode != "fill" and len(original_zh) > 4:
-            if len(cand) < len(original_zh) * 0.6:
-                continue
-        # 排除与邻段重复的
-        if _is_duplicate_of_neighbors(cand, idx, segments):
-            continue
-        # 排除与原文语义忠实度过低的候选（防止 LLM 跨段内容混淆）
-        if not _check_refine_fidelity(original_zh, cand, min_overlap=fidelity_threshold):
+        # 统一质量守卫
+        guard_mode = "expand" if mode == "fill" else "shrink"
+        is_valid, _reason = _validate_text_adjustment(
+            cand, original_zh, idx, segments,
+            mode=guard_mode,
+            fidelity_threshold=fidelity_threshold,
+            expansion_ceiling=2.0,
+        )
+        if not is_valid:
             continue
         valid.append(cand)
 
@@ -4727,6 +4842,7 @@ def _select_best_candidate(
             scored.append((cand, est_ms, diff, over))
 
         not_over = [s for s in scored if not s[3]]
+
         if mode == "fill":
             # 扩展方向：选不超出目标的最长候选（尽量填满时间窗）
             if not_over:
@@ -4756,11 +4872,11 @@ def _isometric_translate_batch(
 ) -> List[dict]:
     """等时翻译：为高 CPS 段生成多候选长度变体并选优
 
-    在翻译完成后运行，对估算 CPS 超标的段生成 [轻]/[中]/[短] 三个长度变体，
-    用 jieba 分词估算时长选最接近目标的候选。
+    在翻译完成后运行，对估算 CPS 超标的段生成 3 个不同长度的翻译变体，
+    用 jieba 分词估算时长选最优候选。
 
     复用现有基础设施:
-      - _parse_multi_candidates() 解析 [轻]/[中]/[短]
+      - _parse_multi_candidates() 解析 [轻]/[中]/[短] 编号候选
       - _select_best_candidate() 候选选择（allow_same_length=True）
       - _estimate_duration_jieba() 时长估算
     """
@@ -4768,13 +4884,12 @@ def _isometric_translate_batch(
     import copy
 
     result = copy.deepcopy(segments)
-    CHARS_PER_SEC = 4.0
 
     api_url = llm_config["api_url"].rstrip("/")
     api_key = llm_config["api_key"]
     model = llm_config["model"]
     temperature = llm_config.get("temperature", 0.3)
-    batch_size = min(llm_config.get("batch_size", 15), 5)
+    batch_size = llm_config.get("batch_size", 15)
 
     endpoint = (api_url if "/chat/completions" in api_url
                 else f"{api_url}/chat/completions")
@@ -4789,16 +4904,16 @@ def _isometric_translate_batch(
         "你是专业的英中视频配音翻译专家。以下英文已有初始中文翻译，"
         "但翻译朗读时长超出原始时间窗口，需要精简。\n"
         "请为每段生成 3 个不同长度的中文翻译版本：\n"
-        "  [轻] 微调版（去除冗余修饰词，保留全部信息）\n"
-        "  [中] 紧凑版（缩短约 15%，简化句式但保留全部信息点）\n"
-        "  [短] 精简版（缩短约 25%，用更简练的表达传达全部信息）\n\n"
-        "核心规则：三个版本都必须保留原文的全部信息点，区别只在于表达的精炼程度。\n"
+        "  [轻] 轻度精简（去除冗余修饰词，简化句式）\n"
+        "  [中] 中度精简（缩短 15-25%，保留全部信息点）\n"
+        "  [短] 大幅精简（缩短 25-40%，用最精练的表达传达核心信息）\n\n"
+        "核心规则：所有版本都必须忠实原文语义，区别只在于表达的精炼程度。\n"
         "1) 忠实翻译英文原文，不得偏离原文含义\n"
-        "2) 不要删除信息来省字数——要靠更精练的表达来缩短\n"
+        "2) 不要删除关键信息来省字数——要靠更精练的表达来缩短\n"
         "3) 计算机缩写保留英文原词，不加括号注音\n"
         "4) 严禁重复上下文内容\n"
         "5) 译文自然流畅，适合朗读\n"
-        "6) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
+        "6) 输出格式：每段先 [编号]，然后分行输出 [轻] [中] [短]"
     )
 
     # 构建待处理列表
@@ -4806,7 +4921,7 @@ def _isometric_translate_batch(
     for idx in high_cps_indices:
         seg = segments[idx]
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
-        target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+        target_chars = max(2, int(dur_sec * 4.5))
         zh_chars = sum(1 for c in seg.get("text_zh", "") if '\u4e00' <= c <= '\u9fff')
         items.append({
             "idx": idx,
@@ -4840,7 +4955,7 @@ def _isometric_translate_batch(
             )
 
         user_msg = (
-            f"请为以下 {len(batch)} 段翻译各生成 [轻]/[中]/[短] 三个长度版本：\n\n"
+            f"请为以下 {len(batch)} 段翻译各生成 [轻] [中] [短] 共 3 个长度版本：\n\n"
             + "\n\n".join(lines)
         )
 
@@ -4851,7 +4966,7 @@ def _isometric_translate_batch(
                 {"role": "user", "content": user_msg},
             ],
             "temperature": temperature,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         }
 
         try:
@@ -4899,7 +5014,6 @@ def _isometric_expand_batch(
     import copy
 
     result = copy.deepcopy(segments)
-    CHARS_PER_SEC = 4.0
 
     api_url = llm_config["api_url"].rstrip("/")
     api_key = llm_config["api_key"]
@@ -4939,7 +5053,7 @@ def _isometric_expand_batch(
     for idx in low_cps_indices:
         seg = segments[idx]
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
-        target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+        target_chars = max(2, int(dur_sec * 4.5))
         zh_chars = sum(1 for c in seg.get("text_zh", "") if '\u4e00' <= c <= '\u9fff')
         items.append({
             "idx": idx,
@@ -5100,18 +5214,17 @@ def _expand_with_llm(
                     # 只有确实变长了才采纳
                     if len(clean_zh) <= len(original_zh):
                         continue
-                    # 防止过度扩展：短原文允许更大倍率（≤10字→3x，≤20字→2.5x，>20字→2x）
+                    # 动态扩展上限：短原文允许更大倍率
                     max_ratio = 3.0 if len(original_zh) <= 10 else (2.5 if len(original_zh) <= 20 else 2.0)
-                    if len(clean_zh) > len(original_zh) * max_ratio:
-                        print(f"       ⚠️  #{item['idx']} 扩展过长 ({len(clean_zh)}/{len(original_zh)}字，上限{max_ratio:.1f}x)，跳过")
-                        continue
-                    # 检查是否与相邻段重复
-                    if _is_duplicate_of_neighbors(clean_zh, item["idx"], expanded):
-                        print(f"       ⚠️  #{item['idx']} 扩展结果与相邻段重复，跳过")
-                        continue
-                    # 关键：检查扩展结果与原译文的语义忠实度（防止 LLM 跨段混淆）
-                    if not _check_refine_fidelity(original_zh, clean_zh, min_overlap=0.3):
-                        print(f"       ⚠️  #{item['idx']} 扩展结果偏离原译文过大，跳过")
+                    # 统一质量守卫
+                    is_valid, reason = _validate_text_adjustment(
+                        clean_zh, original_zh, item["idx"], expanded,
+                        mode="expand",
+                        fidelity_threshold=0.3,
+                        expansion_ceiling=max_ratio,
+                    )
+                    if not is_valid:
+                        print(f"       ⚠️  #{item['idx']} 扩展{reason}，跳过")
                         continue
                     expanded[item["idx"]]["text_zh"] = clean_zh
         except Exception as e:

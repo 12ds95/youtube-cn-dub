@@ -1510,7 +1510,7 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         "3) 保持与原文相近的语气和情感（教学、惊叹、幽默等）\n"
         "4) 计算机/数学术语保留通用英文缩写（API、GPU、3x3等），不加括号注音\n"
         "5) 避免翻译腔：不生硬直译，也不过度意译丢失原意\n"
-        "6) 每句译文长度应与原文时长匹配，不要过度压缩也不要冗余扩充\n"
+        "6) 每句译文长度应与原文时长匹配（参考给定字数范围），不要为控制长度而遗漏信息\n"
         "7) 只输出翻译结果，不输出解释或注释"
     )
     batch_size = llm_config.get("batch_size", 15)
@@ -1552,21 +1552,97 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             system_prompt += f"\n{topic_guide}"
             print(f"     📋 自动识别翻译风格已注入")
 
+    # ── 句子分组：将 Whisper 切碎的句子碎片合并为完整句翻译单元 ──
+    def _group_sentence_fragments(segs):
+        """检测跨段句子碎片，合并为翻译组。
+        
+        保守策略：只合并真正的短碎片（< 6 词 AND < 2 秒），避免过度合并。
+        检测段内句子边界（句号后接大写字母），避免跨句合并。
+        """
+        groups = []  # [(merged_seg, [original_indices])]
+        i = 0
+        while i < len(segs):
+            group_indices = [i]
+            # 向后扫描：仅当当前段是短碎片时才尝试合并
+            while i + 1 < len(segs):
+                curr_text = segs[group_indices[-1]].get("text", "").strip()
+                next_text = segs[i + 1].get("text", "").strip()
+                curr_dur = segs[group_indices[-1]].get("end", 0) - segs[group_indices[-1]].get("start", 0)
+                curr_words = len(curr_text.split())
+                
+                # 当前段以句末标点结尾 → 句子结束，不合并
+                if curr_text and curr_text[-1] in '.!?':
+                    break
+                # 当前段内有句子边界（句号+空格+大写）→ 不继续合并
+                if re.search(r'[.!?]\s+[A-Z]', curr_text):
+                    break
+                # 只有短碎片才合并（< 6 词 AND < 2 秒）
+                if curr_words >= 6 or curr_dur >= 2.0:
+                    break
+                # 合并限制：最多3段，总时长不超8秒
+                total_dur = segs[i + 1].get("end", 0) - segs[group_indices[0]].get("start", 0)
+                if len(group_indices) >= 3 or total_dur > 8:
+                    break
+                i += 1
+                group_indices.append(i)
+            
+            if len(group_indices) == 1:
+                groups.append((segs[group_indices[0]], group_indices))
+            else:
+                merged_text = " ".join(segs[j].get("text", "") for j in group_indices)
+                merged_seg = {
+                    "text": merged_text,
+                    "start": segs[group_indices[0]]["start"],
+                    "end": segs[group_indices[-1]]["end"],
+                    "_sub_indices": group_indices,
+                    "_sub_durations": [
+                        segs[j].get("end", 0) - segs[j].get("start", 0)
+                        for j in group_indices
+                    ],
+                }
+                groups.append((merged_seg, group_indices))
+            i += 1
+        return groups
+
+    # 执行句子分组（用于 prompt 标注，不改变段数）
+    sent_groups = _group_sentence_fragments(segments)
+    merged_count = sum(1 for _, indices in sent_groups if len(indices) > 1)
+    # 构建 seg_index → group_id 映射（用于 prompt 中标注句子组）
+    seg_to_group = {}  # seg_index → (group_id, position_in_group, group_size)
+    group_id = 0
+    for _, indices in sent_groups:
+        if len(indices) > 1:
+            for pos, idx in enumerate(indices):
+                seg_to_group[idx] = (group_id, pos, len(indices))
+            group_id += 1
+    if merged_count > 0:
+        print(f"     📎 句子分组标注: {merged_count} 组短碎片句 (共 {sum(len(g) for _, g in sent_groups if len(g)>1)} 段)")
+
     result = []
     prev_context = None
     for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
         batch = segments[i:i + batch_size]
         # 构造批量翻译请求：每行一句，用编号标记
-        CHARS_PER_SEC = 4.0  # TTS 中文语速：约 4 字/秒（宽松值，减少小模型过度压缩）
+        CHARS_PER_SEC = 4.0  # 仅用于参考范围计算
         lines = []
-        char_hints = []
+        length_hints = []
+        has_sentence_groups = False
         for j, seg in enumerate(batch):
-            lines.append(f"[{j+1}] {seg['text']}")
+            global_idx = i + j
+            # 标注句子碎片组
+            group_info = seg_to_group.get(global_idx)
+            if group_info and group_info[1] > 0:  # 非组首段
+                lines.append(f"[{j+1}] {{续}} {seg['text']}")
+                has_sentence_groups = True
+            else:
+                lines.append(f"[{j+1}] {seg['text']}")
             dur_sec = seg.get("end", 0) - seg.get("start", 0)
-            target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
-            char_hints.append(f"[{j+1}]≈{target_chars}字")
+            center = max(2, int(dur_sec * CHARS_PER_SEC))
+            lo = max(2, int(center * 0.75))
+            hi = int(center * 1.3)
+            length_hints.append(f"[{j+1}]≈{center}字({lo}-{hi})")
         user_msg = "\n".join(lines)
-        hint_line = f"各句参考字数：{', '.join(char_hints)}"
+        hint_line = f"各句目标字数：{', '.join(length_hints)}"
 
         # 构造上下文提示（滑动窗口：6句回看 + 3句前瞻）
         context_hint = ""
@@ -1582,18 +1658,27 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 prev_context = None
         if prev_context:
             context_hint += f"前文：{'；'.join(prev_context)}\n"
-        # 前瞻：取当前批次之后 3 句英文原文供理解语境
+        # 前瞻：取当前批次之后 5 句英文原文供理解语境
         next_start = i + batch_size
         if next_start < len(segments):
-            next_preview = [segments[k]["text"][:60] for k in range(next_start, min(next_start + 3, len(segments)))]
+            next_preview = [segments[k]["text"][:60] for k in range(next_start, min(next_start + 5, len(segments)))]
             context_hint += f"下文预览：{'；'.join(next_preview)}\n"
+
+        # 句子碎片分布翻译提示
+        fragment_hint = ""
+        if has_sentence_groups:
+            fragment_hint = (
+                "标记{续}的句子是前一句的语音延续（同一句话被语音识别拆分），"
+                "请将完整句意均匀分配到各段，每段都要有实质内容，不要把所有信息堆到第一段。\n"
+            )
 
         batch_prompt = (
             (f"{context_hint}\n" if context_hint else "")
-            + f"请翻译以下 {len(batch)} 句英文，每句用 [编号] 格式输出，一行一句，不要合并或拆分。\n"
+            + f"请翻译以下 {len(batch)} 句英文，每句用 [编号] 格式输出，一行一句。\n"
+            f"重要：每个 [编号] 只翻译该编号对应的英文，严禁将相邻句内容合并到同一编号。\n"
+            f"{fragment_hint}"
             f"{hint_line}\n"
-            f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
-            f"宁可稍长也不要为凑字数而截断语义。"
+            f"请尽量将每句译文控制在目标字数范围内，同时确保信息完整不遗漏。"
             f"计算机缩写保留英文原词，不加括号注音。\n\n{user_msg}"
         )
 
@@ -1740,9 +1825,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         for br in batch_results:
             result.append(br)
 
-        # 保存最后几句作为下一批的上下文（6句滑动窗口提升跨批次连贯性）
+        # 保存最后几句作为下一批的上下文（10句滑动窗口提升跨批次连贯性）
         if batch_results:
-            prev_context = [r["text_zh"] for r in batch_results[-6:]]
+            prev_context = [r["text_zh"] for r in batch_results[-10:]]
 
         print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
 
@@ -1791,6 +1876,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     # 清除外部模板，Pass 1 使用固定 prompt
     pass1_config["prompt_template"] = ""
     pass1_config["style"] = ""
+    pass1_config["isometric"] = 0  # 等时翻译仅在 Pass 2 之后运行一次，Pass 1 不运行
 
     print(f"  📝 Pass 1: 忠实直译...")
     pass1_results = _translate_llm(segments, pass1_config, video_title, output_dir=output_dir)
@@ -1805,22 +1891,23 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     endpoint = api_url if "/chat/completions" in api_url else f"{api_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    CHARS_PER_SEC = 4.0
     adapt_system = (
-        "你是视频配音翻译润色专家。在忠实直译的基础上做轻度润色，使之更适合口语朗读。\n"
-        "核心原则——保留全部信息，只调表达：\n"
-        "1) 直译版的每一个信息点都必须保留，绝不能为省字数而删减内容\n"
-        "2) 只做表达润色：调整语序使之更口语化、拆分长从句、替换书面词为口语词\n"
-        "3) 保持原文的语气和情感基调（教学讲解风格，不要变成网络口水话）\n"
-        "4) 计算机/数学缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
-        "5) 译文长度尽量匹配参考字数，但宁可稍长也不要截断语义\n"
-        "6) 每句保持 [编号] 格式，一行一句\n"
-        "7) 只输出润色结果，不要解释\n\n"
+        "你是英中翻译质量审校专家。请对照英文原文审校直译版，修正错误并提升表达自然度。\n"
+        "审校原则——修正错误，保留全部信息，不要重写：\n"
+        "1) 逐句核对英文原文，修正直译中的漏译、误译、术语错误\n"
+        "2) 直译版的每一个信息点都必须完整保留，绝不能为省字数而删减内容\n"
+        "3) 只做必要的表达调整：修复不通顺的语句、消除翻译腔、调整不自然的语序\n"
+        "4) 不要追求口语化——目标是准确、通顺、自然的标准中文\n"
+        "5) 保持原文的语气和情感基调（教学讲解风格）\n"
+        "6) 专有名词、人名、作品名要翻译完整（如 Home Alone→《小鬼当家》）\n"
+        "7) 计算机/数学缩写保留英文原词（如 API、GPU 等），不加括号注音\n"
+        "8) 每句保持 [编号] 格式，一行一句\n"
+        "9) 如果直译版已经准确通顺，直接输出原文即可，不要为改而改\n"
+        "10) 只输出审校结果，不要解释\n\n"
         "错误示范（不要这样做）：\n"
-        "  原文: 'viewers of this channel would certainly enjoy his content, so do check it out'\n"
-        "  直译: '本频道的观众一定会喜欢他的内容，所以一定去看看'\n"
-        "  ✗ 错误润色: '他频道超赞，别错过' ← 删掉了'本频道观众'和'一定会喜欢'的信息\n"
-        "  ✓ 正确润色: '咱频道的观众肯定也会喜欢他的内容，大家一定去看看'"
+        "  ✗ 删减信息: '本频道的观众一定会喜欢他的内容' → '他频道超赞' ← 丢失了信息\n"
+        "  ✗ 过度口语: '这个概念在数学中非常重要' → '这玩意儿贼重要' ← 不自然\n"
+        "  ✓ 正确审校: '本频道的观众一定会喜欢他的内容，所以一定去看看' → (已通顺，保持原样)"
     )
 
     print(f"  🎙️  Pass 2: 配音改编...")
@@ -1832,17 +1919,14 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         batch = pass1_results[i:i + batch_size]
         lines = []
         for j, seg in enumerate(batch):
-            dur_sec = seg.get("end", 0) - seg.get("start", 0)
-            target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
             lines.append(
                 f"[{j+1}] EN: {seg['text_en']}\n"
-                f"     直译: {seg['text_zh']}\n"
-                f"     目标≈{target_chars}字"
+                f"     直译: {seg['text_zh']}"
             )
 
         user_msg = (
-            f"请对以下 {len(batch)} 段直译做轻度口语化润色，保留全部信息，"
-            f"每句用 [编号] 格式输出：\n\n" + "\n\n".join(lines)
+            f"请审校以下 {len(batch)} 段直译，对照英文原文修正错误并提升表达自然度，"
+            f"保留全部信息，每句用 [编号] 格式输出：\n\n" + "\n\n".join(lines)
         )
 
         payload = {
@@ -1920,16 +2004,15 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
                           max_retries: int = 3):
     """逐条 LLM 翻译（降级方案），带重试"""
     import httpx
-    CHARS_PER_SEC = 4.0
     results = []
     for seg in batch:
         zh = None
-        # 计算目标字数，作为前缀指令（不混入源文本）
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
-        target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
+        center = max(2, int(dur_sec * 4.0))
+        lo = max(2, int(center * 0.75))
+        hi = int(center * 1.3)
         user_content = (
-            f"（译文约{target_chars}字，宁可稍长也不要截断语义。"
-            f"不要在译文中输出字数标注。）\n{seg['text']}"
+            f"（目标≈{center}字，范围{lo}-{hi}字，信息完整不遗漏。）\n{seg['text']}"
         )
         for attempt in range(max_retries):
             try:

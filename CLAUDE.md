@@ -1,5 +1,17 @@
 # Project Guidelines
 
+## 运行环境
+
+**必须使用项目 venv 运行所有 Python 脚本**，系统 Python 缺少 jieba 等依赖且 SSL 不可用。
+
+```bash
+# 正确
+/Users/caixin/Desktop/youtube-cn-dub/venv/bin/python3 test_translate_only.py --compare-only --all
+
+# 错误 — 不要用系统 python3
+python3 test_translate_only.py
+```
+
 ## API Key 安全规则
 
 **绝对禁止**在脚本、代码、文档中硬编码真实 API Key。

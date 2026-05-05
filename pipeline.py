@@ -1795,6 +1795,33 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
 
     print(f"  ✅ LLM 翻译完成")
 
+    # ── 全局窗口去重: 检测 3 段内近重复（跨段内容污染） ──
+    window_dup_indices = []
+    for j in range(1, len(result)):
+        curr_zh = result[j].get("text_zh", "")
+        if len(curr_zh) < 8:
+            continue
+        for k in range(max(0, j - 3), j):
+            prev_zh = result[k].get("text_zh", "")
+            if len(prev_zh) < 8:
+                continue
+            if (curr_zh in prev_zh or prev_zh in curr_zh or
+                    _char_overlap_ratio(curr_zh, prev_zh) > 0.6):
+                if j not in window_dup_indices:
+                    window_dup_indices.append(j)
+                break
+    if window_dup_indices:
+        print(f"  ⚠️  全局窗口去重: {len(window_dup_indices)} 段近重复，逐段重译...")
+        retry_segs = [segments[j] for j in window_dup_indices]
+        retry_zhs = _translate_llm_single(
+            retry_segs, endpoint, headers, model, system_prompt, temperature
+        )
+        for k, j in enumerate(window_dup_indices):
+            zh = retry_zhs[k]
+            if zh and len(zh.strip()) >= 2:
+                result[j]["text_zh"] = zh.strip()
+                print(f"     ✅ 窗口去重修复: #{j} \"{segments[j]['text'][:30]}\"")
+
     # ── 等时翻译：多候选长度优化 ──
     isometric_n = llm_config.get("isometric", 0)
     if isometric_n > 0 and llm_config.get("api_key"):
@@ -1927,6 +1954,17 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
                         if shrink_ratio < 0.6:
                             pass2_fallback += 1
                             continue  # 保持 Pass 1 结果，拒绝过度压缩
+                    # 扩展守卫: 改编后比直译长 50% 以上，说明合并了相邻段内容
+                    if len(pass1_zh) > 4 and len(clean) / len(pass1_zh) > 1.5:
+                        pass2_fallback += 1
+                        continue
+                    # 跨段重复检测: 与已采纳的上一段高度相似则回退
+                    if i + j > 0:
+                        prev_zh = final_results[i + j - 1]["text_zh"]
+                        if len(clean) > 6 and len(prev_zh) > 6:
+                            if clean in prev_zh or prev_zh in clean or _char_overlap_ratio(clean, prev_zh) > 0.6:
+                                pass2_fallback += 1
+                                continue
                     # 段内重复检测: 幻觉式循环输出回退 Pass 1
                     if _compute_repetition_score(clean) > 0.3:
                         pass2_fallback += 1
@@ -1943,6 +1981,36 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
             pass2_fallback += len(batch)
 
     print(f"     Pass 2 采纳: {pass2_adapted} 段, 回退 Pass 1: {pass2_fallback} 段")
+
+    # ── Pass 2 全局后校验: CPS 异常 + 跨段重复 → 回退 Pass 1 ──
+    reverted = 0
+    for j in range(len(final_results)):
+        seg = final_results[j]
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        if dur_sec <= 0:
+            continue
+        zh_chars = sum(1 for c in seg.get("text_zh", "") if '\u4e00' <= c <= '\u9fff')
+        cps = zh_chars / dur_sec
+        # CPS > 10 说明翻译严重超长（合并了相邻段内容）
+        if cps > 10 and seg["text_zh"] != pass1_results[j]["text_zh"]:
+            final_results[j]["text_zh"] = pass1_results[j]["text_zh"]
+            reverted += 1
+            continue
+        # 跨段近重复: 与前 3 段任一高度相似
+        curr_zh = seg["text_zh"]
+        if len(curr_zh) > 6:
+            for k in range(max(0, j - 3), j):
+                prev_zh = final_results[k]["text_zh"]
+                if (len(prev_zh) > 6 and
+                        (curr_zh in prev_zh or prev_zh in curr_zh or
+                         _char_overlap_ratio(curr_zh, prev_zh) > 0.6)):
+                    if seg["text_zh"] != pass1_results[j]["text_zh"]:
+                        final_results[j]["text_zh"] = pass1_results[j]["text_zh"]
+                        reverted += 1
+                    break
+    if reverted:
+        print(f"     ⚠️  全局后校验: {reverted} 段异常已回退 Pass 1")
+
     print(f"  ✅ 两步翻译完成 ({len(final_results)} 段)")
 
     # ── 等时翻译：多候选长度优化（Pass 2 之后）──

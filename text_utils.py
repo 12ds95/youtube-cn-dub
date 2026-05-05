@@ -4,6 +4,7 @@
 从 pipeline.py 抽取，供 pipeline.py 和 phase2_translate.py 共用。
 """
 import re
+from functools import lru_cache
 
 
 def _strip_think_block(content: str) -> str:
@@ -102,22 +103,151 @@ def normalize_llm_output(text: str, original: str = "", strip_refine: bool = Fal
     return text.strip()
 
 
-def strip_parenthetical_annotations(text_zh: str) -> str:
-    """去除 LLM 自发添加的英文括号注音，如（Euler angles）、（Andy Matuszczak）。
+# ─── 括号注解语义去重 ────────────────────────────────────────────────
 
-    启发式：全角括号（）内容包含拉丁字母 AND 非CJK字符占比 >50% → 判定为注音，删除。
-    保留：数学记号（4, 1）、中文解释（或更现实地，借助计算机完成运算）。
+# 全角+半角括号匹配
+_PAREN_PATTERN = re.compile(r'[（(]([^）)]*)[）)]')
+
+# 数学/代码排除：含运算符或数学符号
+_MATH_CHARS = set('+-*/=°×÷∑∫∂√≈≠≤≥<>^')
+
+# 延迟加载的 embedding 模型
+_annotation_model = None
+_annotation_model_loaded = False
+
+
+def _load_annotation_model():
+    """延迟加载 sentence-transformers 模型用于括号注解语义判断"""
+    global _annotation_model, _annotation_model_loaded
+    if _annotation_model_loaded:
+        return _annotation_model
+    _annotation_model_loaded = True
+    try:
+        from sentence_transformers import SentenceTransformer
+        _annotation_model = SentenceTransformer(
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        )
+    except Exception:
+        _annotation_model = None
+    return _annotation_model
+
+
+@lru_cache(maxsize=512)
+def _semantic_similarity(text_a: str, text_b: str) -> float:
+    """计算两段文本的 cosine similarity（缓存结果）"""
+    import numpy as np
+    model = _load_annotation_model()
+    if model is None:
+        return -1.0  # 模型不可用，返回特殊值
+    embs = model.encode([text_a, text_b], normalize_embeddings=True)
+    return float(np.dot(embs[0], embs[1]))
+
+
+def _is_math_content(inner: str) -> bool:
+    """判断括号内容是否为数学/代码表达式"""
+    if not inner:
+        return False
+    # 含数学运算符
+    if any(c in _MATH_CHARS for c in inner):
+        return True
+    # 纯数字+逗号+空格 (坐标/元组): (4, 1), (0, 0, 1)
+    if re.fullmatch(r'[\d,.\s\-]+', inner):
+        return True
+    # 单字母变量列表 (数学符号): (i,j,k), (x, y, z), (a,b)
+    if re.fullmatch(r'[a-zA-Z](?:\s*[,，]\s*[a-zA-Z])+', inner.strip()):
+        return True
+    return False
+
+
+def _is_pure_cjk_explanation(inner: str) -> bool:
+    """判断括号内容是否为纯中文解释（非注音）"""
+    if not inner:
+        return False
+    cjk = sum(1 for c in inner if '\u4e00' <= c <= '\u9fff')
+    # >90% 是 CJK 字符 → 中文解释，保留
+    return len(inner) > 0 and cjk / len(inner) > 0.9
+
+
+def strip_parenthetical_annotations(text_zh: str) -> str:
+    """去除 LLM 自发添加的冗余括号注音。
+
+    使用 sentence-transformers 模型判断括号内容是否与前文语义重复：
+      - 数学/坐标表达式 → 保留
+      - 纯中文解释 → 保留
+      - 内容 <2 字符 → 保留
+      - 其余用 embedding cosine similarity 判断：>0.5 为冗余，去除
+
+    支持全角（）和半角() 括号。模型延迟加载，加载失败时回退启发式规则。
     """
-    if not text_zh or '（' not in text_zh:
+    if not text_zh:
+        return text_zh
+    if '（' not in text_zh and '(' not in text_zh:
+        return text_zh
+    # 排除不含拉丁字母的文本（纯中文括号内容无需检查）
+    if not re.search(r'[（(][^）)]*[a-zA-Z][^）)]*[）)]', text_zh):
         return text_zh
 
     def _should_strip(match):
         inner = match.group(1)
-        if not inner or not re.search(r'[a-zA-Z]', inner):
+        if not inner or len(inner) < 2:
             return match.group(0)
-        cjk = sum(1 for c in inner if '\u4e00' <= c <= '\u9fff')
-        if (len(inner) - cjk) / len(inner) > 0.5:
-            return ''
-        return match.group(0)
 
-    return re.sub(r'（([^）]*)）', _should_strip, text_zh)
+        # 快速排除：无拉丁字母
+        if not re.search(r'[a-zA-Z]', inner):
+            return match.group(0)
+
+        # 快速排除：数学/代码内容
+        if _is_math_content(inner):
+            return match.group(0)
+
+        # 快速排除：纯中文解释
+        if _is_pure_cjk_explanation(inner):
+            return match.group(0)
+
+        # 提取括号前的 context（前面最近的有意义文本，最多 15 字符）
+        start = match.start()
+        context_before = text_zh[max(0, start - 15):start].strip()
+        # 去掉 context 中的标点
+        context_before = re.sub(r'[，。！？、；：""''…—\s]+', '', context_before)
+
+        if len(context_before) < 2:
+            # context 太短，回退启发式
+            cjk = sum(1 for c in inner if '\u4e00' <= c <= '\u9fff')
+            if len(inner) > 0 and (len(inner) - cjk) / len(inner) > 0.5:
+                return ''
+            return match.group(0)
+
+        # 使用 embedding 判断语义相似度
+        sim = _semantic_similarity(context_before, inner)
+        if sim < 0:
+            # 模型不可用，回退启发式
+            cjk = sum(1 for c in inner if '\u4e00' <= c <= '\u9fff')
+            if len(inner) > 0 and (len(inner) - cjk) / len(inner) > 0.5:
+                return ''
+            return match.group(0)
+
+        if sim > 0.5:
+            return ''  # 冗余，去除
+        return match.group(0)  # 不冗余，保留
+
+    return _PAREN_PATTERN.sub(_should_strip, text_zh)
+
+
+# ─── 统一消费接口 ────────────────────────────────────────────────────
+
+def text_for_duration(text_zh: str) -> str:
+    """为时长/budget 估算准备文本：去除冗余括号注解。
+
+    所有 _estimate_duration_jieba / count_hanzi / budget 计算前应调用此函数，
+    确保括号注音不膨胀时长估算。
+    """
+    return strip_parenthetical_annotations(text_zh)
+
+
+def text_for_tts(text_zh: str) -> str:
+    """为 TTS 合成准备文本：去除冗余括号注解。
+
+    TTS 引擎不应朗读冗余的英文注音。
+    注：多音字修复 (_fix_polyphones) 由 pipeline.py 在此之后单独处理。
+    """
+    return strip_parenthetical_annotations(text_zh)

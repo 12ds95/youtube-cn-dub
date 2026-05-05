@@ -21,7 +21,7 @@ import jieba
 
 # ── 共享工具函数 ──
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from text_utils import normalize_llm_output, strip_parenthetical_annotations
+from text_utils import normalize_llm_output, text_for_duration
 from duration_estimator import estimate_duration as _estimate_duration_jieba
 
 
@@ -36,7 +36,7 @@ def count_hanzi(text: str) -> int:
 
 def extract_budgets(segments: list) -> list[int]:
     """从 Phase 1 的 text_zh 提取每段汉字数作为 budget"""
-    return [count_hanzi(seg["text_zh"]) for seg in segments]
+    return [count_hanzi(text_for_duration(seg["text_zh"])) for seg in segments]
 
 
 def extract_budgets_jieba(segments: list) -> list[int]:
@@ -46,8 +46,8 @@ def extract_budgets_jieba(segments: list) -> list[int]:
     将时长按全局汉字/ms 比率换算回汉字数，作为 DP 的 budget。
     相同字数但含英文/数字/URL 的段会获得更大 budget（因为 TTS 读得慢）。
     """
-    durations = [_estimate_duration_jieba(seg["text_zh"]) for seg in segments]
-    hanzi_counts = [count_hanzi(seg["text_zh"]) for seg in segments]
+    durations = [_estimate_duration_jieba(text_for_duration(seg["text_zh"])) for seg in segments]
+    hanzi_counts = [count_hanzi(text_for_duration(seg["text_zh"])) for seg in segments]
     total_hanzi = sum(hanzi_counts)
     total_dur = sum(durations)
     if total_dur <= 0 or total_hanzi <= 0:
@@ -105,7 +105,7 @@ BASE_SYSTEM_PROMPT = (
 def generate_candidates(
     full_english: str, endpoint: str, headers: dict, model: str,
     n_candidates: int = 5, max_tokens: int = 8192,
-    total_budget: int = 0,
+    total_budget: int = 0, style_guide: str = "",
 ) -> list[str]:
     """生成多个全文翻译候选"""
     candidates = []
@@ -115,6 +115,8 @@ def generate_candidates(
 
     for i, cfg in enumerate(configs):
         sys_prompt = BASE_SYSTEM_PROMPT
+        if style_guide:
+            sys_prompt += f"\n{style_guide}"
         if cfg["style"]:
             sys_prompt += f"\n\n附加风格要求：{cfg['style']}"
 
@@ -458,6 +460,212 @@ def score_candidate(segments_zh: list[str], budgets: list[int]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────
+# Sentence Embedding (lazy)
+# ─────────────────────────────────────────────────────────
+
+_embedding_model = None
+_embedding_available = None
+
+
+def _load_embedding_model():
+    """懒加载 sentence embedding 模型 (paraphrase-multilingual-MiniLM-L12-v2)"""
+    global _embedding_model, _embedding_available
+    if _embedding_available is not None:
+        return _embedding_available
+    try:
+        import os
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer(
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        )
+        _embedding_available = True
+        print("  ✅ sentence embedding 模型已加载")
+    except Exception as e:
+        print(f"  ⚠️  sentence embedding 不可用 ({e})")
+        _embedding_available = False
+    return _embedding_available
+
+
+def compute_alignment_score(
+    en_segments: list[str], zh_segments: list[str],
+) -> tuple[float, list[float]]:
+    """计算英中逐段 cosine similarity。
+
+    返回 (平均 sim, 每段 sim)。embedding 不可用时返回 (0.5, [])。
+    """
+    if not _load_embedding_model():
+        return 0.5, []
+    import numpy as np
+    en_embs = _embedding_model.encode(en_segments, normalize_embeddings=True)
+    zh_embs = _embedding_model.encode(zh_segments, normalize_embeddings=True)
+    sims = [float(np.dot(e, z)) for e, z in zip(en_embs, zh_embs)]
+    avg = sum(sims) / len(sims) if sims else 0.0
+    return avg, sims
+
+
+# ─────────────────────────────────────────────────────────
+# 量化质量指标
+# ─────────────────────────────────────────────────────────
+
+def compute_repetition_score(zh_text: str) -> float:
+    """字符级 n-gram 重复率 + 句子级近重复检测 (0.0 = 无重复, 1.0 = 全重复)。
+
+    层级 1: 3-gram 和 4-gram 检测, 出现 >=3 次视为重复 (捕捉幻觉式循环)。
+    层级 2: 句子级近重复 — 按中文句末标点分句, 检测 Jaccard > 0.7 的近重复对 (捕捉整句重复)。
+    返回两者中更高的重复率。
+    """
+    from collections import Counter
+    chars = [c for c in zh_text if '\u4e00' <= c <= '\u9fff' or c.isalnum()]
+    if len(chars) < 10:
+        return 0.0
+    worst = 0.0
+
+    # 层级 1: character n-gram
+    for n in (3, 4):
+        if len(chars) < n:
+            continue
+        ngrams = [tuple(chars[i:i+n]) for i in range(len(chars) - n + 1)]
+        total = len(ngrams)
+        counts = Counter(ngrams)
+        repeated = sum(cnt for cnt in counts.values() if cnt >= 3)
+        ratio = repeated / total if total > 0 else 0.0
+        worst = max(worst, ratio)
+
+    # 层级 2: sentence-level near-duplicate
+    sentences = re.split(r'[。！？；\n]+', zh_text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if len(sentences) >= 2:
+        dup_chars = 0
+        total_chars = sum(len(s) for s in sentences)
+        seen = []
+        for s in sentences:
+            s_set = set(s)
+            for prev, prev_set in seen:
+                if len(s) < 10:
+                    continue
+                intersection = len(s_set & prev_set)
+                union = len(s_set | prev_set)
+                if union > 0 and intersection / union > 0.6:
+                    dup_chars += len(s)
+                    break
+            seen.append((s, s_set))
+        if total_chars > 0:
+            sent_ratio = dup_chars / total_chars
+            worst = max(worst, sent_ratio)
+
+    return worst
+
+
+def compute_source_coverage(
+    en_text: str, zh_text: str,
+    term_dict: dict[str, str] | None = None,
+) -> tuple[float, int]:
+    """检查英文中的关键标识符是否保留在中文译文中。
+
+    提取: 数字 (>=2字符) + 大写缩写 + 含数字的术语 (3D/3x3) + URL片段。
+    若提供 term_dict (英→中), 额外检查双语术语覆盖:
+      匹配英文原词 OR 中文翻译均视为覆盖。
+    返回 (覆盖率 0.0-1.0, token数)。无 token 时返回 (1.0, 0)。
+    """
+    tokens = set()
+    # 数字 (>=2 字符)
+    for m in re.findall(r'\d+(?:\.\d+)?%?', en_text):
+        if len(m) >= 2:
+            tokens.add(m)
+    # 大写缩写 (>=2 字母)
+    for m in re.findall(r'\b[A-Z]{2,}\b', en_text):
+        tokens.add(m)
+    # 含数字的术语: 3D, 3x3
+    for m in re.findall(r'\b\d+[A-Za-z]+\b', en_text):
+        tokens.add(m)
+    for m in re.findall(r'\b\d+x\d+\b', en_text):
+        tokens.add(m)
+    # URL 片段: xxx.yyy/zzz
+    for m in re.findall(r'[a-z]+\.[a-z]+(?:/[a-z]+)*', en_text, re.IGNORECASE):
+        tokens.add(m.lower())
+
+    # 双语术语覆盖 (从 LLM guide 的 term_rules 构建)
+    bilingual_pairs = []  # [(en_term, zh_term)]
+    if term_dict:
+        en_lower = en_text.lower()
+        for en_term, zh_term in term_dict.items():
+            # 只检查在原文中实际出现的术语
+            if en_term.lower() in en_lower:
+                bilingual_pairs.append((en_term, zh_term))
+
+    # 去重: 如果基础 token 已被双语术语覆盖 (如 "3D" 在 "3D orientation → 三维朝向" 中)
+    bilingual_en_lower = {en.lower() for en, _ in bilingual_pairs}
+    tokens = {t for t in tokens if t.lower() not in bilingual_en_lower}
+
+    if not tokens and not bilingual_pairs:
+        return 1.0, 0
+
+    zh_lower = zh_text.lower()
+    found = 0
+
+    # 基础 token 匹配 (增强: NxN→N×N, 序数词→数字部分, 数字+字母→数字部分)
+    for t in tokens:
+        if t in zh_text or t.lower() in zh_lower:
+            found += 1
+        elif re.fullmatch(r'\d+x\d+', t):
+            # 3x3 → 3×3 (全角乘号)
+            alt = t.replace('x', '×')
+            if alt in zh_text:
+                found += 1
+        elif re.fullmatch(r'\d+(?:st|nd|rd|th)', t):
+            # 19th → 查找数字部分 "19"
+            num_part = re.match(r'\d+', t).group()
+            if num_part in zh_text:
+                found += 1
+        elif re.fullmatch(r'\d+[A-Za-z]+', t):
+            # 3D/2D → 数字部分 "3"/"2" 出现在 zh 中即可
+            num_part = re.match(r'\d+', t).group()
+            if len(num_part) >= 1 and num_part in zh_text:
+                found += 1
+
+    # 双语术语匹配: EN 原词 OR ZH 翻译出现即算覆盖
+    for en_term, zh_term in bilingual_pairs:
+        if (en_term.lower() in zh_lower) or (zh_term in zh_text):
+            found += 1
+
+    total = len(tokens) + len(bilingual_pairs)
+    return found / total, total
+
+
+def compute_combined_score(
+    alignment_sim: float,
+    budget_score: dict,
+    repetition_ratio: float,
+    coverage: float | tuple[float, int],
+) -> float:
+    """综合质量评分 (0-100)。
+
+    权重: Alignment 50% + Budget 25% + Repetition 15% + Coverage 10%
+    当 coverage 无 anchor token 时，将 10% 权重转给 alignment (60/25/15/0)。
+    """
+    if isinstance(coverage, tuple):
+        cov_ratio, n_tokens = coverage
+    else:
+        cov_ratio, n_tokens = coverage, 1  # 兼容旧调用
+
+    mae = budget_score.get("mae", 5)
+    budget_pts = max(0, 1.0 - mae / 10) * 25
+    rep_pts = (1.0 - min(repetition_ratio, 1.0)) * 15
+
+    if n_tokens > 0:
+        align_pts = alignment_sim * 50
+        cov_pts = cov_ratio * 10
+    else:
+        # 无 anchor token: coverage 无信号, 权重全归 alignment
+        align_pts = alignment_sim * 60
+        cov_pts = 0
+
+    return align_pts + budget_pts + rep_pts + cov_pts
+
+
+# ─────────────────────────────────────────────────────────
 # 对比报告
 # ─────────────────────────────────────────────────────────
 
@@ -554,6 +762,21 @@ def main():
     total_hanzi = sum(budgets_hanzi)
     total_jieba = sum(budgets_jieba)
     full_english = " ".join(seg["text_en"] for seg in segments)
+    en_segments = [seg["text_en"] for seg in segments]
+
+    _load_embedding_model()
+
+    # ── 翻译风格识别 (LLM guide) ──
+    from translation_style import (
+        detect_translation_style, load_cached_style, parse_term_rules,
+    )
+    style_guide, term_rules = load_cached_style(output_dir)
+    if not style_guide:
+        style_guide, term_rules = detect_translation_style(
+            segments, "", endpoint, headers, model,
+            output_dir=output_dir, text_key="text_en",
+        )
+    term_dict = parse_term_rules(term_rules) if term_rules else {}
 
     print(f"Phase 2 全文翻译质量优化")
     print(f"  目录: {output_dir}")
@@ -561,6 +784,8 @@ def main():
     print(f"  英文: {len(full_english)} 字符 (~{len(full_english)//4} tokens)")
     print(f"  Budget (hanzi): 总{total_hanzi}, 范围 {min(budgets_hanzi)}-{max(budgets_hanzi)} (avg={total_hanzi/len(budgets_hanzi):.1f})")
     print(f"  Budget (jieba): 总{total_jieba}, 范围 {min(budgets_jieba)}-{max(budgets_jieba)} (avg={total_jieba/len(budgets_jieba):.1f})")
+    if term_dict:
+        print(f"  术语字典: {len(term_dict)} 条")
 
     # 打印两种 budget 差异较大的段
     diffs = [(i, budgets_hanzi[i], budgets_jieba[i]) for i in range(len(segments))
@@ -578,13 +803,14 @@ def main():
     if est_total > 28000:
         print(f"  ⚠️  预估 token 数 {est_total} 较大，可能需要分批（当前仍一次性发送）")
 
-    # 生成候选
+    # 生成候选 (注入 style guide)
     print(f"🔄 生成 {args.candidates} 个全文翻译候选...")
     candidates = generate_candidates(
         full_english, endpoint, headers, model,
         n_candidates=args.candidates,
         max_tokens=max(8192, total_hanzi * 3),
         total_budget=total_hanzi,
+        style_guide=style_guide,
     )
     if not candidates:
         print("❌ 所有候选生成失败")
@@ -616,24 +842,33 @@ def main():
 
     for mode_name, mode_budgets in budget_modes:
         print(f"\n🔪 DP 切分 + 评分 [{mode_name} budget]...")
+        best_combined = -1
         best_score = None
         best_segments = None
         best_idx = -1
 
         for orig_idx, cand in valid_candidates:
             cand_clean = normalize_llm_output(cand)
-            cand_clean = strip_parenthetical_annotations(cand_clean)
+            cand_clean = text_for_duration(cand_clean)
             split_result = split_text_by_budgets(cand_clean, mode_budgets)
             sc = score_candidate(split_result, mode_budgets)
-            print(f"  候选 {orig_idx+1}: MSE={sc['mse']:.1f}, MAE={sc['mae']:.1f}, "
-                  f"max_dev={sc['max_dev']}, empty={sc['empty']}, total={sc['total']:.1f}")
 
-            if best_score is None or sc["total"] < best_score["total"]:
+            align_sim, _ = compute_alignment_score(en_segments, split_result)
+            repetition = compute_repetition_score(cand_clean)
+            cov_ratio, cov_n = compute_source_coverage(full_english, cand_clean, term_dict)
+            combined = compute_combined_score(align_sim, sc, repetition, (cov_ratio, cov_n))
+
+            print(f"  候选 {orig_idx+1}: combined={combined:.1f} "
+                  f"(align={align_sim:.3f}, MAE={sc['mae']:.1f}, "
+                  f"rep={repetition:.3f}, cov={cov_ratio:.2f}/{cov_n})")
+
+            if combined > best_combined:
+                best_combined = combined
                 best_score = sc
                 best_segments = split_result
                 best_idx = orig_idx
 
-        print(f"  ✅ [{mode_name}] 选中候选 {best_idx+1} (total_score={best_score['total']:.1f})")
+        print(f"  ✅ [{mode_name}] 选中候选 {best_idx+1} (combined={best_combined:.1f})")
         best_results[mode_name] = (best_score, best_segments, best_idx)
 
     # 构建两种 Phase 2 输出

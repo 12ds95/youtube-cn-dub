@@ -67,6 +67,8 @@ from text_utils import (
     _clean_refine_artifacts,
     normalize_llm_output,
     strip_parenthetical_annotations,
+    text_for_duration,
+    text_for_tts,
 )
 from duration_estimator import estimate_duration as _estimate_duration_jieba
 
@@ -1204,170 +1206,20 @@ def _translate_nllb_fallback(texts: List[str]) -> List[str]:
 def _detect_translation_style(segments: List[dict], video_title: str,
                                endpoint: str, headers: dict, model: str,
                                temperature: float, output_dir: Path = None) -> str:
-    """扫描完整视频内容后，识别主题和翻译风格，返回追加到 system_prompt 的指导规则。
-
-    策略：把全部英文原文拼接后送给 LLM 做一次完整扫描（专用轮次），而非只看开头。
-    - 如果总文本 < 8000 字符，直接全量发送
-    - 如果过长，均匀采样（头部 30% + 中部 40% + 尾部 30%），保证覆盖视频各阶段
-    这样即使开头是广告/赞助商口播/无关寒暄，也不会误判整体主题。
-    """
-    import httpx
-
-    if not segments:
-        return ""
-
-    # ── 构建完整文本，必要时均匀采样 ──
-    all_texts = [s["text"] for s in segments if s.get("text", "").strip()]
-    full_text = "\n".join(all_texts)
-
-    MAX_CHARS = 8000  # LLM 上下文窗口预算（留足空间给 prompt + response）
-    if len(full_text) > MAX_CHARS:
-        # 均匀采样：头部 30% + 中部 40% + 尾部 30%
-        n = len(all_texts)
-        head_end = int(n * 0.3)
-        mid_start = int(n * 0.3)
-        mid_end = int(n * 0.7)
-        tail_start = int(n * 0.7)
-
-        head = all_texts[:head_end]
-        mid = all_texts[mid_start:mid_end]
-        tail = all_texts[tail_start:]
-
-        # 在各段之间加标记，让 LLM 知道这是采样
-        sample_parts = []
-        sample_parts.append(f"=== 视频前段 (第1~{head_end}段，共{n}段) ===")
-        sample_parts.append("\n".join(head))
-        sample_parts.append(f"\n=== 视频中段 (第{mid_start+1}~{mid_end}段) ===")
-        sample_parts.append("\n".join(mid))
-        sample_parts.append(f"\n=== 视频后段 (第{tail_start+1}~{n}段) ===")
-        sample_parts.append("\n".join(tail))
-        sample_text = "\n".join(sample_parts)
-
-        # 如果还是太长，按比例截断每部分
-        if len(sample_text) > MAX_CHARS:
-            budget_per_part = MAX_CHARS // 3
-            head_text = "\n".join(head)[:budget_per_part]
-            mid_text = "\n".join(mid)[:budget_per_part]
-            tail_text = "\n".join(tail)[:budget_per_part]
-            sample_text = (
-                f"=== 视频前段 ===\n{head_text}\n"
-                f"=== 视频中段 ===\n{mid_text}\n"
-                f"=== 视频后段 ===\n{tail_text}"
-            )
-        content_desc = f"均匀采样 {n} 段（头/中/尾各约 30%/40%/30%）"
-    else:
-        sample_text = full_text
-        content_desc = f"完整内容 {len(all_texts)} 段"
-
-    print(f"     🔍 主题识别中（{content_desc}）...")
-
-    detect_prompt = f"""你是翻译领域专家。请仔细阅读以下视频的完整英文内容，分析其核心主题、专业领域和翻译注意事项。
-
-注意：
-- 视频开头可能有广告、赞助商口播、寒暄等与主题无关的内容，请忽略这些，聚焦于视频的核心主题
-- 请综合头、中、尾部内容做整体判断，不要只看开头
-
-视频标题: {video_title or '(无标题)'}
-
-英文原文:
-{sample_text}
-
-请用以下JSON格式返回（只返回JSON，不要其他内容）:
-{{
-  "topic": "视频核心主题（如: 线性代数/量子力学/React前端开发/宏观经济学/日常Vlog 等，尽量具体）",
-  "style": "建议的翻译风格（如: 学术严谨/口语化教学/新闻播报/技术文档/轻松聊天）",
-  "term_rules": [
-    "列出本视频中出现的专业术语翻译规则，每条格式: 英文 → 中文",
-    "只列出真正在原文中出现过的术语，不要凭空臆造"
-  ],
-  "warnings": [
-    "列出本视频翻译中需要特别注意的陷阱",
-    "如: 某个常见词在本视频的专业语境中有特殊含义",
-    "如: 容易被误译的符号、缩写、双关语等"
-  ]
-}}"""
-
-    try:
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "你是翻译领域专家。请基于视频完整内容做全局分析，不要仅凭开头几段下结论。"},
-                {"role": "user", "content": detect_prompt},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 1500,
-        }
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(endpoint, json=payload, headers=headers)
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
-
-        # 提取 JSON（LLM 可能在外面包了 ```json ... ```）
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if not json_match:
-            print(f"     ⚠️  主题识别返回格式异常，使用通用规则")
-            return _default_translation_rules()
-        detected = json.loads(json_match.group())
-
-        # 构建追加到 system_prompt 的风格指导
-        guide_parts = []
-        topic = detected.get("topic", "")
-        style = detected.get("style", "")
-        if topic:
-            guide_parts.append(f"\n本视频主题: {topic}")
-        if style:
-            guide_parts.append(f"翻译风格: {style}")
-
-        # 术语规则
-        term_rules = detected.get("term_rules", [])
-        if term_rules:
-            guide_parts.append("专业术语翻译规则（必须遵守）:")
-            for rule in term_rules[:15]:  # 限制不超过15条
-                guide_parts.append(f"  - {rule}")
-
-        # 翻译陷阱警告
-        warnings = detected.get("warnings", [])
-        if warnings:
-            guide_parts.append("翻译注意事项:")
-            for w in warnings[:8]:
-                guide_parts.append(f"  - {w}")
-
-        # 始终注入的通用保护规则
-        guide_parts.append(_default_translation_rules())
-
-        result = "\n".join(guide_parts)
-        print(f"     ✅ 主题: {topic} | 风格: {style} | 术语规则: {len(term_rules)} 条")
-        if term_rules:
-            for rule in term_rules[:5]:
-                print(f"        · {rule}")
-            if len(term_rules) > 5:
-                print(f"        ... 共 {len(term_rules)} 条")
-
-        # 保存风格检测结果 JSON (便于 review/debug)
-        if output_dir:
-            style_path = _audit_dir(output_dir) / "style_detection.json"
-            style_data = {"topic": topic, "style": style,
-                          "term_rules": term_rules, "warnings": warnings}
-            with open(style_path, "w", encoding="utf-8") as _f:
-                json.dump(style_data, _f, ensure_ascii=False, indent=2)
-
-        return result
-
-    except Exception as e:
-        print(f"     ⚠️  主题识别失败 ({e})，使用通用翻译规则")
-        return _default_translation_rules()
+    """扫描完整视频内容后，识别主题和翻译风格（委托 translation_style 模块）。"""
+    from translation_style import detect_translation_style
+    guide, _term_rules = detect_translation_style(
+        segments, video_title, endpoint, headers, model,
+        temperature=temperature, output_dir=output_dir,
+        text_key="text",
+    )
+    return guide
 
 
 def _default_translation_rules() -> str:
-    """通用翻译保护规则，无论主题识别是否成功都会注入"""
-    return (
-        "\n通用翻译规则（始终遵守）:"
-        "\n  - 禁止使用 Markdown 格式（不用 **加粗**、`反引号`、# 标题等标记）"
-        "\n  - 数学符号（i, e, π, θ 等）在数学/科学语境中保持专业含义，不译为日常用语"
-        "\n  - 负号'-'在数学语境中翻译为'负'，如'-3'读作'负三'"
-        "\n  - 译文用于语音朗读，必须通顺自然，适合听觉理解"
-        "\n  - 宁可译文稍长，也不要为省字数而删减原文信息"
-    )
+    """通用翻译保护规则（委托 translation_style 模块）。"""
+    from translation_style import default_translation_rules
+    return default_translation_rules()
 
 
 def _load_prompt_template(template_path: str) -> str:
@@ -1381,6 +1233,55 @@ def _load_prompt_template(template_path: str) -> str:
     if p.exists():
         return p.read_text(encoding="utf-8").strip()
     return ""
+
+
+def _compute_repetition_score(zh_text: str) -> float:
+    """字符级 n-gram 重复率 + 句子级近重复检测 (0.0 = 无重复, 1.0 = 全重复)。
+
+    层级 1: 3-gram 和 4-gram 检测, 出现 >=3 次视为重复 (捕捉幻觉式循环)。
+    层级 2: 句子级近重复 — 按中文句末标点分句, 检测 Jaccard > 0.6 的近重复对 (捕捉整句重复)。
+    返回两者中更高的重复率。
+    """
+    from collections import Counter
+    chars = [c for c in zh_text if '\u4e00' <= c <= '\u9fff' or c.isalnum()]
+    if len(chars) < 10:
+        return 0.0
+    worst = 0.0
+
+    # 层级 1: character n-gram
+    for n in (3, 4):
+        if len(chars) < n:
+            continue
+        ngrams = [tuple(chars[i:i+n]) for i in range(len(chars) - n + 1)]
+        total = len(ngrams)
+        counts = Counter(ngrams)
+        repeated = sum(cnt for cnt in counts.values() if cnt >= 3)
+        ratio = repeated / total if total > 0 else 0.0
+        worst = max(worst, ratio)
+
+    # 层级 2: sentence-level near-duplicate
+    sentences = re.split(r'[。！？；\n]+', zh_text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if len(sentences) >= 2:
+        dup_chars = 0
+        total_chars = sum(len(s) for s in sentences)
+        seen = []
+        for s in sentences:
+            s_set = set(s)
+            for prev, prev_set in seen:
+                if len(s) < 10:
+                    continue
+                intersection = len(s_set & prev_set)
+                union = len(s_set | prev_set)
+                if union > 0 and intersection / union > 0.6:
+                    dup_chars += len(s)
+                    break
+            seen.append((s, s_set))
+        if total_chars > 0:
+            sent_ratio = dup_chars / total_chars
+            worst = max(worst, sent_ratio)
+
+    return worst
 
 
 def _detect_batch_hallucination(translations: List[str], prev_context: List[str] = None) -> set:
@@ -1865,6 +1766,24 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                     batch_results[j]["text_zh"] = zh.strip()
                     print(f"       ✅ 去重修复: #{i+j} \"{batch[j]['text'][:30]}\"")
 
+        # ── 段内重复检测: 捕捉 LLM 幻觉式循环输出 ──
+        rep_indices = []
+        for j, br in enumerate(batch_results):
+            score = _compute_repetition_score(br.get("text_zh", ""))
+            if score > 0.3:
+                rep_indices.append(j)
+        if rep_indices:
+            print(f"     ⚠️  检测到 {len(rep_indices)} 段段内重复 (repetition_score > 0.3)，逐段重译...")
+            retry_segs = [batch[j] for j in rep_indices]
+            retry_zhs = _translate_llm_single(
+                retry_segs, endpoint, headers, model, system_prompt, temperature
+            )
+            for k, j in enumerate(rep_indices):
+                zh = retry_zhs[k]
+                if zh and len(zh.strip()) >= 2 and _compute_repetition_score(zh) <= 0.3:
+                    batch_results[j]["text_zh"] = zh.strip()
+                    print(f"       ✅ 重复修复: #{i+j} \"{batch[j]['text'][:30]}\"")
+
         for br in batch_results:
             result.append(br)
 
@@ -2008,6 +1927,10 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
                         if shrink_ratio < 0.6:
                             pass2_fallback += 1
                             continue  # 保持 Pass 1 结果，拒绝过度压缩
+                    # 段内重复检测: 幻觉式循环输出回退 Pass 1
+                    if _compute_repetition_score(clean) > 0.3:
+                        pass2_fallback += 1
+                        continue
                     if len(clean) >= 2:
                         final_results[i + j]["text_zh"] = clean
                         pass2_adapted += 1
@@ -2510,7 +2433,7 @@ async def _generate_tts_segments(
         # 最后防线：清除可能残留的格式标记
         text_zh = _strip_markdown(text_zh, seg.get("text_en", seg.get("text", "")))
         text_zh = _clean_refine_artifacts(text_zh)  # 清理 [轻]/[中]/[短] 等标签
-        text_zh = strip_parenthetical_annotations(text_zh)  # 去除 LLM 括号注音
+        text_zh = text_for_tts(text_zh)  # 去除冗余括号注音（embedding 语义判断）
         text_zh = _fix_polyphones(text_zh)  # 多音字同音替换，纠正 TTS 误读
         if len(text_zh.strip()) >= 2:
             # 防御：跳过纯标点/占位符文本（如 "---"、"..."），TTS 引擎无法合成
@@ -2613,7 +2536,7 @@ async def _generate_tts_segments(
                         segments[idx]["text_zh"] = new_zh
                         item["text_zh"] = new_zh
                         # 重新计算 rate（使用 jieba 估算，含 URL 检测）
-                        new_est_ms = _estimate_duration_jieba(new_zh)
+                        new_est_ms = _estimate_duration_jieba(text_for_duration(new_zh))
                         new_ratio = item["raw_ratio"]
                         if new_est_ms > 0 and item["target_dur_ms"] > 0:
                             new_ratio = new_est_ms / item["target_dur_ms"]
@@ -3100,7 +3023,7 @@ async def _llm_duration_feedback(
                             break
                     adjusted_count += 1
                     # 准备重新生成 TTS
-                    new_est_ms = _estimate_duration_jieba(new_zh)
+                    new_est_ms = _estimate_duration_jieba(text_for_duration(new_zh))
                     rate = new_est_ms / target if target > 0 and new_est_ms > 0 else 1.0
                     rate = max(rate_range[0], min(rate_range[1], rate))
                     regen_items.append({
@@ -3261,7 +3184,7 @@ def _estimate_speed_ratios(
     results = []
     underslow_threshold = 0.7
     for idx, seg in enumerate(segments):
-        text_zh = seg.get("text_zh", "")
+        text_zh = text_for_duration(seg.get("text_zh", ""))
         target_ms = int((seg["end"] - seg["start"]) * 1000)
         if target_ms <= 0 or not text_zh.strip():
             results.append({
@@ -3310,7 +3233,7 @@ def _identify_high_cps_segments(
     """
     high_cps = []
     for i, seg in enumerate(segments):
-        text_zh = seg.get("text_zh", "")
+        text_zh = text_for_duration(seg.get("text_zh", ""))
         zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
         if zh_chars < 3:
             continue
@@ -3337,7 +3260,7 @@ def _identify_low_cps_segments(
     """
     low_cps = []
     for i, seg in enumerate(segments):
-        text_zh = seg.get("text_zh", "")
+        text_zh = text_for_duration(seg.get("text_zh", ""))
         zh_chars = sum(1 for c in text_zh if '\u4e00' <= c <= '\u9fff')
         if zh_chars < 3:
             continue
@@ -3476,7 +3399,7 @@ async def _post_tts_calibrate(
     tts_items = []
     for idx in changed_indices:
         seg = refined_segments[idx]
-        text_zh = seg.get("text_zh", "")
+        text_zh = text_for_tts(seg.get("text_zh", ""))
         target_dur_ms = int((seg["end"] - seg["start"]) * 1000)
         # 计算新的 rate
         rate = 1.0
@@ -4705,7 +4628,7 @@ def _select_best_candidate(
         # 分词估算时长，选最接近目标的
         scored = []
         for cand in valid:
-            est_ms = _estimate_duration_jieba(cand)  # 校准后参数已含停顿
+            est_ms = _estimate_duration_jieba(text_for_duration(cand))  # 校准后参数已含停顿
             diff = abs(est_ms - target_ms)
             over = est_ms > target_ms  # 是否超出目标
             scored.append((cand, est_ms, diff, over))

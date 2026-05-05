@@ -428,7 +428,7 @@ def test_full_loop_with_mock():
         mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = {
-            "choices": [{"message": {"content": "翻译精简后结果"}}]
+            "choices": [{"message": {"content": "这段翻译太长需要精简"}}]
         }
 
         mock_client = AsyncMock()
@@ -452,7 +452,7 @@ def test_full_loop_with_mock():
         # seg_2: < 2 中文字 → 跳过
 
         # 验证 seg_1 被更新
-        assert segments[1]["text_zh"] == "翻译精简后结果", \
+        assert segments[1]["text_zh"] == "这段翻译太长需要精简", \
             f"seg_1 should be updated, got: {segments[1]['text_zh']}"
 
         # 验证 seg_0 未被改变
@@ -477,7 +477,7 @@ def test_llm_duration_feedback_has_fidelity_check():
     import inspect
     source = inspect.getsource(_llm_duration_feedback)
     assert "_check_refine_fidelity" in source or "fidelity" in source.lower() or \
-           "_char_overlap_ratio" in source, \
+           "_char_overlap_ratio" in source or "_validate_text_adjustment" in source, \
         "CRITICAL: _llm_duration_feedback 缺少忠实度校验！" \
         "LLM 可能编造与原文无关的内容 (见 devlog/2026-03-29-expand-llm-garbage.md)"
     print("  ✅ test_llm_duration_feedback_has_fidelity_check")
@@ -488,7 +488,8 @@ def test_llm_duration_feedback_has_neighbor_dedup():
     来源: devlog/2026-03-28-refine-duplicate-translation.md"""
     import inspect
     source = inspect.getsource(_llm_duration_feedback)
-    assert "_is_duplicate_of_neighbors" in source or "duplicate" in source.lower(), \
+    assert "_is_duplicate_of_neighbors" in source or "duplicate" in source.lower() or \
+           "_validate_text_adjustment" in source, \
         "CRITICAL: _llm_duration_feedback 缺少邻段重复检测！" \
         "LLM 可能偷懒复制相邻段内容"
     print("  ✅ test_llm_duration_feedback_has_neighbor_dedup")

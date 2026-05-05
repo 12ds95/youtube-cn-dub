@@ -833,7 +833,15 @@ def merge_short_segments(segments: List[dict], min_chars: int = 3) -> List[dict]
             # 尝试合并到前一段
             if merged:
                 prev = merged[-1]
-                prev["text_zh"] = prev.get("text_zh", "") + text_zh
+                candidate_zh = prev.get("text_zh", "") + text_zh
+                candidate_dur = max(prev["end"], seg["end"]) - prev["start"]
+                # CPS 守卫：合并后语速过高则拒绝
+                if candidate_dur > 0:
+                    zh_chars = sum(1 for c in candidate_zh if '\u4e00' <= c <= '\u9fff')
+                    if zh_chars / candidate_dur > 12:
+                        merged.append(seg)
+                        continue
+                prev["text_zh"] = candidate_zh
                 prev["text_en"] = prev.get("text_en", "") + " " + seg.get("text_en", seg.get("text", ""))
                 prev["end"] = max(prev["end"], seg["end"])
                 print(f"  🔗 合并短段 #{i}（\"{text_zh}\"）→ 前段")
@@ -841,7 +849,15 @@ def merge_short_segments(segments: List[dict], min_chars: int = 3) -> List[dict]
             # 没有前段，合并到后一段
             elif i + 1 < len(segments):
                 nxt = segments[i + 1].copy()
-                nxt["text_zh"] = text_zh + nxt.get("text_zh", "")
+                candidate_zh = text_zh + nxt.get("text_zh", "")
+                candidate_dur = max(nxt.get("end", 0), seg["end"]) - min(seg["start"], nxt["start"])
+                # CPS 守卫
+                if candidate_dur > 0:
+                    zh_chars = sum(1 for c in candidate_zh if '\u4e00' <= c <= '\u9fff')
+                    if zh_chars / candidate_dur > 12:
+                        merged.append(seg)
+                        continue
+                nxt["text_zh"] = candidate_zh
                 nxt["text_en"] = seg.get("text_en", seg.get("text", "")) + " " + nxt.get("text_en", nxt.get("text", ""))
                 nxt["start"] = min(seg["start"], nxt["start"])
                 merged.append(nxt)
@@ -1235,6 +1251,43 @@ def _load_prompt_template(template_path: str) -> str:
     return ""
 
 
+def _log_zh_change(log_list: list, idx: int, old_zh: str, new_zh: str,
+                   reason: str, extra: dict = None):
+    """记录一次 text_zh 变更到内存 list，用于后续写 audit JSON。"""
+    entry = {"idx": idx, "reason": reason, "old_zh": old_zh, "new_zh": new_zh}
+    if extra:
+        entry.update(extra)
+    log_list.append(entry)
+
+
+def _validate_translation_retry(
+    new_zh: str, text_en: str, idx: int, segments: List[dict],
+) -> tuple:
+    """翻译重试结果的轻量验证（用于错位/去重/重复/污染修复路径）。
+
+    比 _validate_text_adjustment 更轻：不检查 fidelity/compression（旧译文已被判有问题）。
+    检查: too_short / untranslated_english / repetition / duplicate。
+
+    Returns:
+        (is_valid, rejection_reason) — reason 为 None 表示通过
+    """
+    if not new_zh or len(new_zh.strip()) < 2:
+        return False, "too_short"
+    # 未翻译英文检测：重试结果包含原文没有的英文单词
+    _new_eng = set(re.findall(r'[a-zA-Z]{3,}', new_zh))
+    _src_eng = set(re.findall(r'[a-zA-Z]{3,}', text_en))
+    _novel_eng = {w for w in (_new_eng - _src_eng) if not w.isupper()}
+    if _novel_eng:
+        return False, "untranslated_english"
+    # 段内重复检测
+    if _compute_repetition_score(new_zh) > 0.3:
+        return False, "repetition"
+    # 邻段重复检测
+    if _is_duplicate_of_neighbors(new_zh, idx, segments):
+        return False, "duplicate"
+    return True, None
+
+
 def _compute_repetition_score(zh_text: str) -> float:
     """字符级 n-gram 重复率 + 句子级近重复检测 (0.0 = 无重复, 1.0 = 全重复)。
 
@@ -1403,6 +1456,51 @@ def _check_batch_alignment(batch: List[dict], translations: List[str]) -> List[i
                 if ratios[i] > median * 3.0 or ratios[i] < median * 0.2:
                     scores[i] += 1.0
 
+    # ── 信号 4: 系统性前移检测 (length-shift correlation) ──
+    # 当 ZH 长度序列与 EN 长度序列偏移 1~3 位后相关性显著高于原位，
+    # 说明 LLM 把后面几段内容合并翻译到前面的编号中。
+    if len(batch) >= 5:
+        en_lens = [len(en) for en in en_texts]
+        zh_lens = [_zh_chars(zh) for zh in zh_texts]
+        # 简化相关性: 用 rank 相关(无需 scipy) — 按排序位置比较
+        def _rank_correlation(xs, ys):
+            """Spearman rank correlation without scipy."""
+            n = len(xs)
+            if n < 4:
+                return 0.0
+            def _ranks(vals):
+                sorted_idx = sorted(range(n), key=lambda k: vals[k])
+                ranks = [0.0] * n
+                for rank, idx in enumerate(sorted_idx):
+                    ranks[idx] = rank
+                return ranks
+            rx, ry = _ranks(xs), _ranks(ys)
+            mean_x = sum(rx) / n
+            mean_y = sum(ry) / n
+            num = sum((rx[k] - mean_x) * (ry[k] - mean_y) for k in range(n))
+            den_x = sum((rx[k] - mean_x) ** 2 for k in range(n)) ** 0.5
+            den_y = sum((ry[k] - mean_y) ** 2 for k in range(n)) ** 0.5
+            if den_x < 1e-9 or den_y < 1e-9:
+                return 0.0
+            return num / (den_x * den_y)
+
+        corr_0 = _rank_correlation(en_lens, zh_lens)
+        best_shift = 0
+        best_corr = corr_0
+        for shift in range(1, min(4, len(batch) - 3)):
+            # zh[i] 与 en[i+shift] 对齐 → 截断两端
+            shifted_en = en_lens[shift:]
+            shifted_zh = zh_lens[:len(shifted_en)]
+            if len(shifted_en) >= 4:
+                corr_s = _rank_correlation(shifted_en, shifted_zh)
+                if corr_s > best_corr:
+                    best_corr = corr_s
+                    best_shift = shift
+        # 如果偏移相关性明显优于原位(差值>0.3且偏移相关>0.5)，判定整批前移
+        if best_shift > 0 and best_corr > 0.5 and (best_corr - corr_0) > 0.3:
+            for i in range(len(batch)):
+                scores[i] += 2.0
+
     return [i for i, s in enumerate(scores) if s >= 1.5]
 
 
@@ -1533,10 +1631,38 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     if merged_count > 0:
         print(f"     📎 句子分组标注: {merged_count} 组短碎片句 (共 {sum(len(g) for _, g in sent_groups if len(g)>1)} 段)")
 
+    # ── 自适应批大小: 低锚点密度内容缩小批次防止前移 ──
+    def _estimate_anchor_density(segs):
+        """估算锚点密度(每段平均锚点数)。低密度 → 降级小批次。"""
+        total_anchors = 0
+        for seg in segs:
+            text = seg.get("text", "")
+            # 数字
+            total_anchors += len(re.findall(r'\d{2,}', text))
+            # 全大写缩写
+            total_anchors += len(re.findall(r'\b[A-Z]{2,}\b', text))
+            # 非句首专有名词
+            words = text.split()
+            for k, w in enumerate(words):
+                clean = re.sub(r'[^a-zA-Z]', '', w)
+                if clean and clean[0].isupper() and k > 0 and len(clean) > 2:
+                    total_anchors += 1
+        return total_anchors / max(len(segs), 1)
+
+    anchor_density = _estimate_anchor_density(segments)
+    effective_batch_size = batch_size
+    if anchor_density < 0.5 and batch_size > 4:
+        effective_batch_size = 4
+        print(f"     ⚠️  低锚点密度 ({anchor_density:.2f}/段)，缩小批次 {batch_size}→{effective_batch_size} 防止跨段错位")
+    elif anchor_density < 1.0 and batch_size > 6:
+        effective_batch_size = 6
+        print(f"     ⚠️  中等锚点密度 ({anchor_density:.2f}/段)，缩小批次 {batch_size}→{effective_batch_size}")
+
     result = []
+    fix_log = []  # 记录所有翻译修复变更（用于 audit JSON）
     prev_context = None
-    for batch_idx, i in enumerate(range(0, len(segments), batch_size)):
-        batch = segments[i:i + batch_size]
+    for batch_idx, i in enumerate(range(0, len(segments), effective_batch_size)):
+        batch = segments[i:i + effective_batch_size]
         # 构造批量翻译请求：每行一句，用编号标记
         # 目标字数: 4.5 CPS 与 LLM 自然翻译长度匹配，作为参考而非硬约束
         CHARS_PER_SEC = 4.5
@@ -1572,10 +1698,10 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 prev_context = None
         if prev_context:
             context_hint += f"前文：{'；'.join(prev_context)}\n"
-        # 前瞻：取当前批次之后 5 句英文原文供理解语境
-        next_start = i + batch_size
+        # 前瞻：取当前批次之后 2 句英文摘要供理解语境（限制暴露量防止跨段污染）
+        next_start = i + effective_batch_size
         if next_start < len(segments):
-            next_preview = [segments[k]["text"][:60] for k in range(next_start, min(next_start + 5, len(segments)))]
+            next_preview = [segments[k]["text"][:30] for k in range(next_start, min(next_start + 2, len(segments)))]
             context_hint += f"下文预览：{'；'.join(next_preview)}\n"
 
         # 句子碎片分布翻译提示
@@ -1589,7 +1715,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         batch_prompt = (
             (f"{context_hint}\n" if context_hint else "")
             + f"请翻译以下 {len(batch)} 句英文，每句用 [编号] 格式输出，一行一句。\n"
-            f"重要：每个 [编号] 只翻译该编号对应的英文，严禁将相邻句内容合并到同一编号。\n"
+            f"严格规则：[1]只翻译第1句英文，[2]只翻译第2句英文，以此类推——"
+            f"绝对不能把后面句子的内容提前翻译到前面的编号中，也不能把多句合并。\n"
+            f"前文和下文预览仅供理解语境，不要翻译预览中的内容。\n"
             f"{fragment_hint}"
             f"{hint_line}\n"
             f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
@@ -1733,9 +1861,13 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             )
             for k, j in enumerate(misaligned):
                 zh = retry_zhs[k]
-                if zh and len(zh.strip()) >= 2:
-                    batch_results[j]["text_zh"] = zh.strip()
-                    print(f"       ✅ 错位修复: #{i+j} \"{batch[j]['text'][:30]}\"")
+                if zh:
+                    old_zh = batch_results[j]["text_zh"]
+                    is_valid, _reason = _validate_translation_retry(zh.strip(), batch[j]["text"], i+j, result + batch_results)
+                    if is_valid:
+                        batch_results[j]["text_zh"] = zh.strip()
+                        _log_zh_change(fix_log, i+j, old_zh, zh.strip(), "misalign_fix")
+                        print(f"       ✅ 错位修复: #{i+j} \"{old_zh[:18]}\" → \"{zh.strip()[:18]}\"")
 
         # ── 相邻段 text_zh 近似去重: 检测 LLM 跨段内容污染 ──
         neighbor_dup_indices = []
@@ -1762,9 +1894,13 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             )
             for k, j in enumerate(neighbor_dup_indices):
                 zh = retry_zhs[k]
-                if zh and len(zh.strip()) >= 2:
-                    batch_results[j]["text_zh"] = zh.strip()
-                    print(f"       ✅ 去重修复: #{i+j} \"{batch[j]['text'][:30]}\"")
+                if zh:
+                    old_zh = batch_results[j]["text_zh"]
+                    is_valid, _reason = _validate_translation_retry(zh.strip(), batch[j]["text"], i+j, result + batch_results)
+                    if is_valid:
+                        batch_results[j]["text_zh"] = zh.strip()
+                        _log_zh_change(fix_log, i+j, old_zh, zh.strip(), "dedup_fix")
+                        print(f"       ✅ 去重修复: #{i+j} \"{old_zh[:18]}\" → \"{zh.strip()[:18]}\"")
 
         # ── 段内重复检测: 捕捉 LLM 幻觉式循环输出 ──
         rep_indices = []
@@ -1780,9 +1916,13 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             )
             for k, j in enumerate(rep_indices):
                 zh = retry_zhs[k]
-                if zh and len(zh.strip()) >= 2 and _compute_repetition_score(zh) <= 0.3:
-                    batch_results[j]["text_zh"] = zh.strip()
-                    print(f"       ✅ 重复修复: #{i+j} \"{batch[j]['text'][:30]}\"")
+                if zh:
+                    old_zh = batch_results[j]["text_zh"]
+                    is_valid, _reason = _validate_translation_retry(zh.strip(), batch[j]["text"], i+j, result + batch_results)
+                    if is_valid:
+                        batch_results[j]["text_zh"] = zh.strip()
+                        _log_zh_change(fix_log, i+j, old_zh, zh.strip(), "repetition_fix")
+                        print(f"       ✅ 重复修复: #{i+j} \"{old_zh[:18]}\" → \"{zh.strip()[:18]}\"")
 
         for br in batch_results:
             result.append(br)
@@ -1791,36 +1931,27 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         if batch_results:
             prev_context = [r["text_zh"] for r in batch_results[-10:]]
 
-        print(f"     进度: {min(i+batch_size, len(segments))}/{len(segments)}")
+        print(f"     进度: {min(i+effective_batch_size, len(segments))}/{len(segments)}")
 
     print(f"  ✅ LLM 翻译完成")
 
-    # ── 全局窗口去重: 检测 3 段内近重复（跨段内容污染） ──
-    window_dup_indices = []
-    for j in range(1, len(result)):
-        curr_zh = result[j].get("text_zh", "")
-        if len(curr_zh) < 8:
-            continue
-        for k in range(max(0, j - 3), j):
-            prev_zh = result[k].get("text_zh", "")
-            if len(prev_zh) < 8:
-                continue
-            if (curr_zh in prev_zh or prev_zh in curr_zh or
-                    _char_overlap_ratio(curr_zh, prev_zh) > 0.6):
-                if j not in window_dup_indices:
-                    window_dup_indices.append(j)
-                break
+    # ── 全局窗口去重: 检测跨段内容污染（近重复对两段都重译） ──
+    window_dup_indices = _detect_cross_contamination(result, window=3, threshold=0.6)
     if window_dup_indices:
-        print(f"  ⚠️  全局窗口去重: {len(window_dup_indices)} 段近重复，逐段重译...")
+        print(f"  ⚠️  跨段污染检测: {len(window_dup_indices)} 段近重复，逐段重译...")
         retry_segs = [segments[j] for j in window_dup_indices]
         retry_zhs = _translate_llm_single(
             retry_segs, endpoint, headers, model, system_prompt, temperature
         )
         for k, j in enumerate(window_dup_indices):
             zh = retry_zhs[k]
-            if zh and len(zh.strip()) >= 2:
-                result[j]["text_zh"] = zh.strip()
-                print(f"     ✅ 窗口去重修复: #{j} \"{segments[j]['text'][:30]}\"")
+            if zh:
+                old_zh = result[j]["text_zh"]
+                is_valid, _reason = _validate_translation_retry(zh.strip(), segments[j]["text"], j, result)
+                if is_valid:
+                    result[j]["text_zh"] = zh.strip()
+                    _log_zh_change(fix_log, j, old_zh, zh.strip(), "contamination_fix")
+                    print(f"     ✅ 污染修复: #{j} \"{old_zh[:18]}\" → \"{zh.strip()[:18]}\"")
 
     # ── 等时翻译：多候选长度优化 ──
     isometric_n = llm_config.get("isometric", 0)
@@ -1839,6 +1970,16 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         if low_cps:
             print(f"  📐 等时扩展: {len(low_cps)}/{len(result)} 段估算 CPS < {expand_threshold}，生成多候选...")
             result = _isometric_expand_batch(result, low_cps, llm_config)
+
+    # ── 写入翻译修复审计日志 ──
+    if fix_log and output_dir:
+        audit_dir = Path(output_dir) / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(audit_dir / "translation_fix_log.json", "w", encoding="utf-8") as f:
+                json.dump({"fixes": len(fix_log), "changes": fix_log}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     return result
 
@@ -1903,6 +2044,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
     final_results = list(pass1_results)  # 复制 Pass 1 结果作为 fallback
     pass2_adapted = 0
     pass2_fallback = 0
+    two_pass_log = []  # 记录 Pass-2 采纳变更（用于 audit JSON）
 
     for i in range(0, len(pass1_results), batch_size):
         batch = pass1_results[i:i + batch_size]
@@ -1947,30 +2089,19 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
                 if adapted and len(adapted.strip()) >= 2:
                     clean = _strip_numbered_prefix(adapted) if re.match(r"^\[\d+\]", adapted) else adapted
                     clean = _strip_markdown(clean, seg["text_en"])
-                    # 质量守卫: 润色后不应比直译短太多（短 40% 以上说明删了内容）
                     pass1_zh = seg["text_zh"]
-                    if len(clean) >= 2 and len(pass1_zh) > 4:
-                        shrink_ratio = len(clean) / len(pass1_zh)
-                        if shrink_ratio < 0.6:
-                            pass2_fallback += 1
-                            continue  # 保持 Pass 1 结果，拒绝过度压缩
-                    # 扩展守卫: 改编后比直译长 50% 以上，说明合并了相邻段内容
-                    if len(pass1_zh) > 4 and len(clean) / len(pass1_zh) > 1.5:
-                        pass2_fallback += 1
-                        continue
-                    # 跨段重复检测: 与已采纳的上一段高度相似则回退
-                    if i + j > 0:
-                        prev_zh = final_results[i + j - 1]["text_zh"]
-                        if len(clean) > 6 and len(prev_zh) > 6:
-                            if clean in prev_zh or prev_zh in clean or _char_overlap_ratio(clean, prev_zh) > 0.6:
-                                pass2_fallback += 1
-                                continue
-                    # 段内重复检测: 幻觉式循环输出回退 Pass 1
-                    if _compute_repetition_score(clean) > 0.3:
-                        pass2_fallback += 1
-                        continue
-                    if len(clean) >= 2:
+                    # 统一质量守卫（覆盖: 压缩/扩展/忠实度/未翻译英文/邻段重复/段内重复）
+                    is_valid, _reason = _validate_text_adjustment(
+                        clean, pass1_zh, i + j, final_results,
+                        mode="refine",
+                        fidelity_threshold=0.20,
+                        compression_floor=0.60,
+                        expansion_ceiling=1.50,
+                        check_repetition=True,
+                    )
+                    if is_valid:
                         final_results[i + j]["text_zh"] = clean
+                        _log_zh_change(two_pass_log, i + j, pass1_zh, clean, "pass2_adopt")
                         pass2_adapted += 1
                     else:
                         pass2_fallback += 1
@@ -1981,6 +2112,8 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
             pass2_fallback += len(batch)
 
     print(f"     Pass 2 采纳: {pass2_adapted} 段, 回退 Pass 1: {pass2_fallback} 段")
+    for entry in two_pass_log[:3]:
+        print(f"       #{entry['idx']} \"{entry['old_zh'][:18]}\" → \"{entry['new_zh'][:18]}\"")
 
     # ── Pass 2 全局后校验: CPS 异常 + 跨段重复 → 回退 Pass 1 ──
     reverted = 0
@@ -2030,6 +2163,16 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         if low_cps:
             print(f"  📐 等时扩展: {len(low_cps)}/{len(final_results)} 段估算 CPS < {expand_threshold}，生成多候选...")
             final_results = _isometric_expand_batch(final_results, low_cps, llm_config)
+
+    # ── 写入两步翻译审计日志 ──
+    if two_pass_log and output_dir:
+        audit_dir = Path(output_dir) / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(audit_dir / "two_pass_log.json", "w", encoding="utf-8") as f:
+                json.dump({"adopted": len(two_pass_log), "changes": two_pass_log}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     return final_results
 
@@ -4414,6 +4557,41 @@ def _char_overlap_ratio(s1: str, s2: str) -> float:
     return overlap
 
 
+def _detect_cross_contamination(
+    segments: List[dict], window: int = 3, threshold: float = 0.6
+) -> List[int]:
+    """检测跨段内容污染：滑动窗口内中文译文近重复的段对。
+
+    与简单去重不同，当发现近重复对(j, k)时，将**两段都**加入重译列表。
+    原因：被污染的往往是前者（LLM 从 next_preview 吸收了后段内容），
+    但仅从 zh↔zh 相似度无法可靠判断哪个是"原件"哪个是"污染副本"。
+    逐条重译两段可消除因 batch 上下文引起的污染。
+
+    Args:
+        segments: 带 text_zh 的段列表
+        window: 回看窗口大小（默认3，检测距离<=3的近重复）
+        threshold: _char_overlap_ratio 阈值
+
+    Returns:
+        需要重译的段索引列表（去重、排序）
+    """
+    retry_set = set()
+    for j in range(1, len(segments)):
+        curr_zh = segments[j].get("text_zh", "").strip()
+        if len(curr_zh) < 8:
+            continue
+        for k in range(max(0, j - window), j):
+            prev_zh = segments[k].get("text_zh", "").strip()
+            if len(prev_zh) < 8:
+                continue
+            if (curr_zh in prev_zh or prev_zh in curr_zh or
+                    _char_overlap_ratio(curr_zh, prev_zh) > threshold):
+                retry_set.add(j)
+                retry_set.add(k)
+                break
+    return sorted(retry_set)
+
+
 def _check_refine_fidelity(original_zh: str, candidate_zh: str,
                             min_overlap: float = 0.25) -> bool:
     """检查精简候选是否保持了与原文的语义忠实度。
@@ -4441,10 +4619,14 @@ def _validate_text_adjustment(
     fidelity_threshold: float = 0.25,
     compression_floor: float = 0.6,
     expansion_ceiling: float = 2.0,
+    check_repetition: bool = False,
 ) -> tuple:
     """统一质量守卫：校验 LLM 译文调整结果。
 
     所有精简/扩展路径共用，避免守卫逻辑分散导致改漏。
+    mode: "shrink" 仅检查 compression_floor
+          "expand" 仅检查 expansion_ceiling
+          "refine" 同时检查两者（用于 Pass-2 两步翻译）
 
     Returns:
         (is_valid, rejection_reason) — reason 为 None 表示通过
@@ -4461,12 +4643,14 @@ def _validate_text_adjustment(
         return False, "untranslated_english"
     if _is_duplicate_of_neighbors(new_zh, idx, segments):
         return False, "duplicate"
-    if mode == "shrink" and len(old_zh) > 4:
+    if mode in ("shrink", "refine") and len(old_zh) > 4:
         if len(new_zh) < len(old_zh) * compression_floor:
             return False, "over_compressed"
-    if mode == "expand":
+    if mode in ("expand", "refine"):
         if len(new_zh) > len(old_zh) * expansion_ceiling:
             return False, "over_expanded"
+    if check_repetition and _compute_repetition_score(new_zh) > 0.3:
+        return False, "repetition"
     return True, None
 
 
@@ -4521,6 +4705,7 @@ def _refine_with_llm(
         "8) 输出格式：每段先 [编号]，然后分行输出 [轻]/[中]/[短] 三个版本"
     )
 
+    refine_changes = []
     for i in range(0, len(overfast_items), batch_size):
         batch = overfast_items[i:i + batch_size]
         lines = []
@@ -4578,15 +4763,18 @@ def _refine_with_llm(
                     candidates, target_ms, item["text_zh"], idx, refined)
 
                 if best_zh and len(best_zh) < len(item["text_zh"]):
+                    old_zh = refined[idx]["text_zh"]
                     refined[idx]["text_zh"] = best_zh
+                    refine_changes.append({"idx": idx, "old_zh": old_zh, "new_zh": best_zh})
         except Exception as e:
             print(f"     ⚠️  LLM 精简批次 {i//batch_size+1} 失败: {e}")
 
         print(f"     精简进度: {min(i + batch_size, len(overfast_items))}/{len(overfast_items)}")
 
-    total_refined = sum(1 for item in overfast_items
-                        if refined[item["idx"]]["text_zh"] != segments[item["idx"]]["text_zh"])
+    total_refined = len(refine_changes)
     print(f"     精简完成: {total_refined}/{len(overfast_items)} 段已更新")
+    for entry in refine_changes[:3]:
+        print(f"       #{entry['idx']} \"{entry['old_zh'][:18]}\" → \"{entry['new_zh'][:18]}\"")
     return refined
 
 
@@ -4948,6 +5136,7 @@ def _isometric_translate_batch(
         })
 
     adopted = 0
+    iso_changes = []
     for i in range(0, len(items), batch_size):
         batch = items[i:i + batch_size]
         lines = []
@@ -5001,7 +5190,9 @@ def _isometric_translate_batch(
                     allow_same_length=True)
 
                 if best_zh:
+                    old_zh = result[idx]["text_zh"]
                     result[idx]["text_zh"] = best_zh
+                    iso_changes.append({"idx": idx, "old_zh": old_zh, "new_zh": best_zh})
                     adopted += 1
         except Exception as e:
             print(f"     ⚠️  等时翻译批次 {i//batch_size+1} 失败: {e}")
@@ -5009,6 +5200,8 @@ def _isometric_translate_batch(
         print(f"     等时进度: {min(i + batch_size, len(items))}/{len(items)}")
 
     print(f"     等时翻译完成: {adopted}/{len(items)} 段已优化")
+    for entry in iso_changes[:3]:
+        print(f"       #{entry['idx']} \"{entry['old_zh'][:18]}\" → \"{entry['new_zh'][:18]}\"")
     return result
 
 
@@ -5080,6 +5273,7 @@ def _isometric_expand_batch(
         })
 
     adopted = 0
+    expand_changes = []
     for i in range(0, len(items), batch_size):
         batch = items[i:i + batch_size]
         lines = []
@@ -5133,7 +5327,9 @@ def _isometric_expand_batch(
                     mode="fill", fidelity_threshold=0.15)
 
                 if best_zh:
+                    old_zh = result[idx]["text_zh"]
                     result[idx]["text_zh"] = best_zh
+                    expand_changes.append({"idx": idx, "old_zh": old_zh, "new_zh": best_zh})
                     adopted += 1
         except Exception as e:
             print(f"     ⚠️  等时扩展批次 {i//batch_size+1} 失败: {e}")
@@ -5141,6 +5337,8 @@ def _isometric_expand_batch(
         print(f"     扩展进度: {min(i + batch_size, len(items))}/{len(items)}")
 
     print(f"     等时扩展完成: {adopted}/{len(items)} 段已优化")
+    for entry in expand_changes[:3]:
+        print(f"       #{entry['idx']} \"{entry['old_zh'][:18]}\" → \"{entry['new_zh'][:18]}\"")
     return result
 
 

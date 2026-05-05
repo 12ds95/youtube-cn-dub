@@ -69,6 +69,27 @@ def _strip_numbered_prefix(line: str) -> str:
     return cleaned.strip()
 
 
+def strip_char_count_prefix(text: str) -> str:
+    """去除 LLM 输出译文前的字数自报: '(35) 文本' / '(35字) 文本' / '(32-46字) 文本' → '文本'"""
+    if not text:
+        return text
+    return re.sub(r"^\s*\(\s*\d+(?:\s*-\s*\d+)?\s*字?\s*\)\s*", "", text).strip()
+
+
+def compute_target_char_range(duration_sec: float, cps_lo: float = 3.5,
+                              cps_hi: float = 5.5) -> tuple:
+    """根据 segment 时长计算中文字数目标区间。
+
+    cps_lo / cps_hi: 自然中文朗读字符/秒, 默认 [3.5, 5.5] (与项目 CPS 合规区间一致)。
+    返回 (lo_chars, hi_chars), 都是 int 且 lo < hi。
+    """
+    if duration_sec <= 0:
+        return (1, 4)
+    lo = max(1, int(round(duration_sec * cps_lo)))
+    hi = max(lo + 1, int(round(duration_sec * cps_hi)))
+    return (lo, hi)
+
+
 def _clean_refine_artifacts(text: str) -> str:
     """清理翻译文本中残留的 refine 格式标签。
 

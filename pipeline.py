@@ -64,6 +64,8 @@ from text_utils import (
     _strip_think_block,
     _strip_markdown,
     _strip_numbered_prefix,
+    strip_char_count_prefix,
+    compute_target_char_range,
     _clean_refine_artifacts,
     normalize_llm_output,
     strip_parenthetical_annotations,
@@ -241,7 +243,7 @@ DEFAULT_CONFIG = {
         "system_prompt": (           # 翻译 system prompt（一般无需修改）
             "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。"
             "要求：1)翻译准确流畅，符合中文表达习惯；"
-            "2)计算机领域缩写保留英文原词（如 API、SDK、HTTP、GPU 等），但不要加括号注音（禁止写成'四元数（Quaternions）'这种形式）；"
+            "2)专有名词与缩写优先保留原文; 若有约定俗成中文译法则用译法;"
             "3)忠实原文语义，不要为缩短字数而曲解原意，也不要过度扩充；"
             "4)翻译要适合做视频配音朗读，语句通顺自然，短句为主；"
             "5)只输出翻译结果，不要解释。"
@@ -870,6 +872,256 @@ def merge_short_segments(segments: List[dict], min_chars: int = 3) -> List[dict]
     if len(merged) < len(segments):
         print(f"  🔗 短段合并: {len(segments)} → {len(merged)} 段")
     return merged
+
+
+# ─── Step 3.7: Sentence Unit 合并 ─────────────────────────────────
+_SENT_END_CHARS = ".!?。！？"
+_SUB_CLAUSE_CHARS = ",;:，；："
+
+
+def group_segments_to_units(
+    segments: List[dict],
+    config: dict = None,
+    *,
+    min_unit_duration: float = 1.5,
+    max_unit_duration: float = 12.0,
+    min_unit_gap_for_split_ms: int = 800,
+) -> List[dict]:
+    """把 Whisper 碎片合并到 sentence unit。
+
+    规则:
+    - 当前段以句末标点结尾 → 关闭 unit
+    - 段间静音 ≥ min_unit_gap_for_split_ms → 关闭 unit (即使前段无标点)
+    - unit 累计时长 ≥ max_unit_duration → 在子句标点处强制切
+    - unit 时长 < min_unit_duration → 与时长更短的相邻 unit 合并
+    """
+    if not segments:
+        return []
+
+    if config:
+        cfg = config.get("unit_grouping", {}) if isinstance(config, dict) else {}
+        min_unit_duration = cfg.get("min_duration", min_unit_duration)
+        max_unit_duration = cfg.get("max_duration", max_unit_duration)
+        min_unit_gap_for_split_ms = cfg.get("min_gap_for_split_ms", min_unit_gap_for_split_ms)
+
+    # ── Pre-split: 把 seg 内部句末标点处切成多个 piece (preserve _orig_idx) ──
+    pieces: List[dict] = []
+    for orig_idx, seg in enumerate(segments):
+        sub = _split_segment_at_internal_sentence_breaks(seg)
+        for p in sub:
+            p["_orig_idx"] = orig_idx
+            pieces.append(p)
+
+    # ── Pass 1: 按标点 + 静音聚合 ──
+    units: List[dict] = []
+    current = None
+    current_members: List[int] = []
+    current_members_set: set = set()
+
+    def _flush():
+        nonlocal current, current_members, current_members_set
+        if current is not None:
+            current["_unit_member_indices"] = list(current_members)
+            units.append(current)
+        current = None
+        current_members = []
+        current_members_set = set()
+
+    def _add_member(idx):
+        if idx not in current_members_set:
+            current_members_set.add(idx)
+            current_members.append(idx)
+
+    for p in pieces:
+        text = (p.get("text") or "").strip()
+        if not text:
+            continue
+        if current is None:
+            current = {"start": p["start"], "end": p["end"], "text": text}
+            if p.get("words"):
+                current["words"] = list(p["words"])
+            _add_member(p["_orig_idx"])
+        else:
+            gap_ms = (p["start"] - current["end"]) * 1000
+            if gap_ms >= min_unit_gap_for_split_ms:
+                _flush()
+                current = {"start": p["start"], "end": p["end"], "text": text}
+                if p.get("words"):
+                    current["words"] = list(p["words"])
+                _add_member(p["_orig_idx"])
+            else:
+                current["text"] = (current["text"] + " " + text).strip()
+                current["end"] = p["end"]
+                if p.get("words"):
+                    current.setdefault("words", []).extend(p["words"])
+                _add_member(p["_orig_idx"])
+
+        # 段尾有句末标点 → 关闭 unit
+        if current and current["text"].rstrip()[-1:] in _SENT_END_CHARS:
+            _flush()
+
+    _flush()
+
+    # ── Pass 2: 超长 unit 按子句切 ──
+    refined: List[dict] = []
+    for u in units:
+        dur = u["end"] - u["start"]
+        if dur <= max_unit_duration:
+            refined.append(u)
+            continue
+        parts = _split_long_unit_by_clause(u, max_unit_duration)
+        refined.extend(parts)
+
+    # ── Pass 3: 短 unit 合并到时长更短的邻居 ──
+    if len(refined) <= 1:
+        return refined
+
+    def _merge_into(target: dict, src: dict):
+        text_join = (target["text"] + " " + src["text"]) if target["start"] < src["start"] \
+            else (src["text"] + " " + target["text"])
+        target["start"] = min(target["start"], src["start"])
+        target["end"] = max(target["end"], src["end"])
+        target["text"] = text_join.strip()
+        if src.get("words"):
+            target_words = target.get("words", [])
+            target["words"] = sorted(target_words + src["words"], key=lambda w: w.get("start", 0))
+        members = target.get("_unit_member_indices", []) + src.get("_unit_member_indices", [])
+        target["_unit_member_indices"] = sorted(members)
+
+    merged: List[dict] = [refined[0]]
+    for u in refined[1:]:
+        prev = merged[-1]
+        prev_dur = prev["end"] - prev["start"]
+        curr_dur = u["end"] - u["start"]
+        if curr_dur < min_unit_duration or prev_dur < min_unit_duration:
+            # 选时长更短的合并方向（贪心）
+            _merge_into(prev, u)
+        else:
+            merged.append(u)
+    return merged
+
+
+def _split_segment_at_internal_sentence_breaks(seg: dict) -> List[dict]:
+    """如果 seg.text 内部含句末标点+空格 (如 "context. So...")，
+    按字符比例时间切成多个 piece。无内部断点则原样返回。
+    """
+    text = (seg.get("text") or "").strip()
+    if not text:
+        return [seg]
+    breaks: List[int] = []
+    for i, c in enumerate(text):
+        if c in _SENT_END_CHARS:
+            # 内部断点: 不在末尾，且后面跟空格 (避免误切如 "U.S." / 数字小数)
+            if i < len(text) - 1 and text[i + 1] == " " and i > 0:
+                # 排除常见缩写: 前一个字符是单字母大写 (U.S., e.g., i.e.)
+                prev = text[i - 1]
+                if prev.isupper() and (i < 2 or not text[i - 2].isalpha()):
+                    continue
+                breaks.append(i + 1)
+    if not breaks:
+        return [seg]
+
+    seg_dur = seg["end"] - seg["start"]
+    text_len = len(text)
+    if seg_dur <= 0 or text_len <= 0:
+        return [seg]
+    words = seg.get("words") or []
+
+    pieces: List[dict] = []
+    cuts = breaks + [text_len]
+    last = 0
+    for cut in cuts:
+        chunk = text[last:cut].strip()
+        if not chunk:
+            last = cut
+            continue
+        piece_start = seg["start"] + (last / text_len) * seg_dur
+        piece_end = seg["start"] + (cut / text_len) * seg_dur
+        piece = {"start": piece_start, "end": piece_end, "text": chunk}
+        # 按时间分配 words
+        if words:
+            piece["words"] = [
+                w for w in words
+                if w.get("start", 0) >= piece_start - 1e-3 and w.get("end", 0) <= piece_end + 1e-3
+            ]
+        pieces.append(piece)
+        last = cut
+    if len(pieces) < 2:
+        return [seg]
+    # 第一段 start 与最后一段 end 对齐原段
+    pieces[0]["start"] = seg["start"]
+    pieces[-1]["end"] = seg["end"]
+    return pieces
+
+
+def _split_long_unit_by_clause(unit: dict, max_dur: float) -> List[dict]:
+    """单 unit 时长 > max_dur 时按子句标点切分。
+    选择最靠近时长目标位置的标点 (允许略前或略后)。
+    """
+    import math
+    text = unit["text"]
+    dur = unit["end"] - unit["start"]
+    if dur <= max_dur or not text:
+        return [unit]
+
+    clause_positions = sorted({i + 1 for i, c in enumerate(text) if c in _SUB_CLAUSE_CHARS})
+    if not clause_positions:
+        return [unit]
+
+    # 目标段数: ceil(dur / max_dur); 允许少 1 段以避免过度切分
+    n_parts = max(2, math.ceil(dur / max_dur))
+    char_per_sec = len(text) / dur if dur > 0 else 0
+    if char_per_sec <= 0:
+        return [unit]
+
+    parts: List[dict] = []
+    start_char = 0
+    start_time = unit["start"]
+    remaining_clauses = list(clause_positions)
+
+    for k in range(n_parts - 1):
+        # 剩余段所占目标时长
+        remaining_parts = n_parts - k
+        remaining_chars = len(text) - start_char
+        target_chars_for_segment = remaining_chars / remaining_parts
+        target_char = start_char + int(target_chars_for_segment)
+
+        # 找最靠近 target_char 的子句标点 (≥ start_char + 8 以避免空段)
+        candidate_clauses = [c for c in remaining_clauses if c >= start_char + 8 and c < len(text) - 4]
+        if not candidate_clauses:
+            break
+        cut = min(candidate_clauses, key=lambda c: abs(c - target_char))
+        end_time = start_time + (cut - start_char) / char_per_sec
+        parts.append({
+            "start": start_time,
+            "end": end_time,
+            "text": text[start_char:cut].strip(),
+            "_unit_member_indices": list(unit.get("_unit_member_indices", [])),
+        })
+        start_char = cut
+        start_time = end_time
+        remaining_clauses = [c for c in remaining_clauses if c > cut]
+
+    if start_char < len(text):
+        rest = text[start_char:].strip()
+        if rest:
+            parts.append({
+                "start": start_time,
+                "end": unit["end"],
+                "text": rest,
+                "_unit_member_indices": list(unit.get("_unit_member_indices", [])),
+            })
+
+    if len(parts) < 2:
+        return [unit]
+    if unit.get("words"):
+        # 按时间分配 words 到对应 part
+        for p in parts:
+            p["words"] = [
+                w for w in unit["words"]
+                if w.get("start", 0) >= p["start"] - 1e-3 and w.get("end", 0) <= p["end"] + 1e-3
+            ]
+    return parts
 
 
 def deduplicate_segments(segments: List[dict]) -> List[dict]:
@@ -1517,7 +1769,7 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         "1) 忠实传达原文全部信息，不遗漏、不添加、不曲解\n"
         "2) 译文用于语音朗读，必须通顺自然，符合中文口语表达习惯\n"
         "3) 保持与原文相近的语气和情感（教学、惊叹、幽默等）\n"
-        "4) 计算机/数学术语保留通用英文缩写（API、GPU、3x3等），不加括号注音\n"
+        "4) 专有名词与缩写优先保留原文; 若有约定俗成的中文译法则用译法\n"
         "5) 避免翻译腔：不生硬直译，也不过度意译丢失原意\n"
         "6) 每句译文长度应与原文时长匹配（参考给定字数范围），不要为控制长度而遗漏信息\n"
         "7) 只输出翻译结果，不输出解释或注释"
@@ -1663,26 +1915,17 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
     prev_context = None
     for batch_idx, i in enumerate(range(0, len(segments), effective_batch_size)):
         batch = segments[i:i + effective_batch_size]
-        # 构造批量翻译请求：每行一句，用编号标记
-        # 目标字数: 4.5 CPS 与 LLM 自然翻译长度匹配，作为参考而非硬约束
-        CHARS_PER_SEC = 4.5
-        lines = []
-        char_hints = []
+        # 构造批量翻译请求: 每行 '[N] (X-Y字) <英文>', 字数区间内联到每条 (Step 3)
+        # 转换 seg_to_group 全局索引 → 批内索引
+        batch_seg_to_group = {}
         has_sentence_groups = False
-        for j, seg in enumerate(batch):
-            global_idx = i + j
-            # 标注句子碎片组
-            group_info = seg_to_group.get(global_idx)
-            if group_info and group_info[1] > 0:  # 非组首段
-                lines.append(f"[{j+1}] {{续}} {seg['text']}")
+        for j in range(len(batch)):
+            info = seg_to_group.get(i + j)
+            if info and info[1] > 0:
+                batch_seg_to_group[j] = info
                 has_sentence_groups = True
-            else:
-                lines.append(f"[{j+1}] {seg['text']}")
-            dur_sec = seg.get("end", 0) - seg.get("start", 0)
-            target_chars = max(2, int(dur_sec * CHARS_PER_SEC))
-            char_hints.append(f"[{j+1}]≈{target_chars}字")
+        lines = build_unit_translation_lines(batch, seg_to_group=batch_seg_to_group)
         user_msg = "\n".join(lines)
-        hint_line = f"各句参考字数：{', '.join(char_hints)}"
 
         # 构造上下文提示（滑动窗口：6句回看 + 3句前瞻）
         context_hint = ""
@@ -1714,15 +1957,16 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
 
         batch_prompt = (
             (f"{context_hint}\n" if context_hint else "")
-            + f"请翻译以下 {len(batch)} 句英文，每句用 [编号] 格式输出，一行一句。\n"
-            f"严格规则：[1]只翻译第1句英文，[2]只翻译第2句英文，以此类推——"
-            f"绝对不能把后面句子的内容提前翻译到前面的编号中，也不能把多句合并。\n"
-            f"前文和下文预览仅供理解语境，不要翻译预览中的内容。\n"
-            f"{fragment_hint}"
-            f"{hint_line}\n"
-            f"注意：参考字数仅供控制译文长度，不要在译文中输出字数标注。"
-            f"计算机缩写保留英文原词，不加括号注音。"
-            f"忠实原文语义，不要曲解也不要过度扩充。\n\n{user_msg}"
+            + f"请翻译以下 {len(batch)} 句英文。每行已标注目标字数区间（来自 TTS 朗读时长，超出会音画不同步）。\n\n"
+            f"【输出格式 - 必须严格遵守】\n"
+            f"每行: [N] (实际字数) 译文\n"
+            f"  - N 与输入编号严格对应; 不要合并、跳号或乱序\n"
+            f"  - 实际字数指译文中的汉字个数, 必须落入给定区间\n"
+            f"  - 译文需自然中文, 不照搬英文语序; 专有名词与缩写优先保留原文 (若有约定中文译法则用译法)\n"
+            f"  - 前文/下文预览仅供理解上下文, 不要翻译预览内容\n"
+            f"{fragment_hint}\n"
+            f"【翻译任务】\n{user_msg}\n\n"
+            f"请逐行输出 {len(batch)} 行, 格式: [N] (实际字数) 译文"
         )
 
         payload = {
@@ -2000,7 +2244,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "1) 完整保留原文所有信息点，一个都不能遗漏\n"
         "2) 忠实直译为主，保持与原文的一一对应关系\n"
         "3) 译文必须是通顺的中文，不要逐词硬译\n"
-        "4) 计算机/数学缩写保留英文原词（如 API、SDK、HTTP、GPU、3x3 等），不加括号注音\n"
+        "4) 专有名词与缩写优先保留原文; 若有约定俗成的中文译法则用译法\n"
         "5) 只输出翻译结果，不要解释"
     )
     # 清除外部模板，Pass 1 使用固定 prompt
@@ -2030,7 +2274,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "4) 不要追求口语化——目标是准确、通顺、自然的标准中文\n"
         "5) 保持原文的语气和情感基调（教学讲解风格）\n"
         "6) 专有名词、人名、作品名要翻译完整（如 Home Alone→《小鬼当家》）\n"
-        "7) 计算机/数学缩写保留英文原词（如 API、GPU 等），不加括号注音\n"
+        "7) 专有名词与缩写优先保留原文\n"
         "8) 每句保持 [编号] 格式，一行一句\n"
         "9) 如果直译版已经准确通顺，直接输出原文即可，不要为改而改\n"
         "10) 只输出审校结果，不要解释\n\n"
@@ -2187,7 +2431,7 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
         dur_sec = seg.get("end", 0) - seg.get("start", 0)
         target_chars = max(2, int(dur_sec * 4.5))
         user_content = (
-            f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注。计算机缩写保留英文原词，不加括号注音。）\n{seg['text']}"
+            f"（请将译文控制在约{target_chars}字，不要在译文中输出字数标注。专有名词与缩写优先保留原文。）\n{seg['text']}"
         )
         for attempt in range(max_retries):
             try:
@@ -2219,6 +2463,28 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
 
 
 
+
+
+def build_unit_translation_lines(batch: List[dict], seg_to_group: dict = None,
+                                 cps_lo: float = 3.5, cps_hi: float = 5.5) -> List[str]:
+    """构造 Pass 1 翻译输入行: '[N] (X-Y字) <英文>'。
+
+    每个 unit 内联标注其字数目标区间，让 LLM 在生成时即可参照（强于事后软约束）。
+    碎片续段保留 {续} 标记。
+    """
+    if seg_to_group is None:
+        seg_to_group = {}
+    lines: List[str] = []
+    for j, seg in enumerate(batch):
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        lo, hi = compute_target_char_range(dur_sec, cps_lo=cps_lo, cps_hi=cps_hi)
+        marker = ""
+        # j 是批内索引；查 seg_to_group 时用全局索引或批内索引视上层而定
+        info = seg_to_group.get(j)
+        if info and info[1] > 0:
+            marker = "{续} "
+        lines.append(f"[{j+1}] ({lo}-{hi}字) {marker}{seg.get('text', '').strip()}")
+    return lines
 
 
 def _parse_numbered_translations(content: str, expected_count: int) -> List[str]:
@@ -2276,18 +2542,23 @@ def _parse_numbered_translations(content: str, expected_count: int) -> List[str]
         # 检查：如果编号验证填充率足够（≥50%），使用槽位结果
         filled = sum(1 for s in slots if s.strip())
         if filled >= expected_count * 0.5:
-            # 最终安全检查：去除残留 [N] 前缀
-            slots = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
-                     for t in slots]
-            return slots
+            # 最终安全检查：去除残留 [N] 前缀 + 字数自报前缀 (如 "(35) " / "(32-46字) ")
+            cleaned = []
+            for t in slots:
+                if re.match(r"^\[\d+\]", t):
+                    t = _strip_numbered_prefix(t)
+                cleaned.append(strip_char_count_prefix(t))
+            return cleaned
 
     # ── 降级: 编号解析失败，按行序分割（兼容无编号输出） ──
     raw_lines = [l.strip() for l in content.strip().split("\n") if l.strip()]
     translations = [_strip_numbered_prefix(l) for l in raw_lines]
 
-    # 最终安全检查：确保没有 [N] 前缀泄漏
-    translations = [_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t
-                    for t in translations]
+    # 最终安全检查：确保没有 [N] 前缀和字数前缀泄漏
+    translations = [
+        strip_char_count_prefix(_strip_numbered_prefix(t) if re.match(r"^\[\d+\]", t) else t)
+        for t in translations
+    ]
 
     # 补足或截断
     while len(translations) < expected_count:
@@ -2304,8 +2575,99 @@ def format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def generate_srt_files(segments: List[dict], output_dir: Path):
-    """生成三份 SRT 字幕"""
+_SUBTITLE_SENT_END = "。！？.!?"
+_SUBTITLE_CLAUSE = "，；：、,;:"
+
+
+def split_unit_into_subtitle_lines(seg: dict, max_chars: int = 14) -> List[dict]:
+    """把 sentence-unit 切成多条 SRT 子条目。
+
+    汉字数 ≤ max_chars 时单行返回; 否则按"句末标点 > 子句标点 > 词边界"贪心切分,
+    时间戳按字符占比等分到 unit 时间窗口。所有子行共享 unit 的 text_en。
+    """
+    text_zh = (seg.get("text_zh") or "").strip()
+    text_en = seg.get("text_en", "")
+    start = seg["start"]
+    end = seg["end"]
+
+    if not text_zh:
+        return [{"start": start, "end": end, "text_zh": text_zh, "text_en": text_en}]
+
+    zh_chars = sum(1 for c in text_zh if "一" <= c <= "鿿")
+    if zh_chars <= max_chars or zh_chars == 0:
+        return [{"start": start, "end": end, "text_zh": text_zh, "text_en": text_en}]
+
+    # 候选切点: (位置, 优先级) — 位置是切点之后的字符索引
+    candidates: List[tuple] = []
+    for i, c in enumerate(text_zh):
+        if c in _SUBTITLE_SENT_END:
+            candidates.append((i + 1, 1))  # 句末
+        elif c in _SUBTITLE_CLAUSE:
+            candidates.append((i + 1, 2))  # 子句
+
+    import math
+    n_lines = max(2, math.ceil(zh_chars / max_chars))
+    target_chars_per_line = zh_chars / n_lines
+
+    parts: List[str] = []
+    last_pos = 0
+    text_len = len(text_zh)
+    for k in range(n_lines - 1):
+        # 累计 target_chars 字数后找最近候选切点
+        target_pos = last_pos
+        seen = 0
+        while target_pos < text_len and seen < target_chars_per_line:
+            if "一" <= text_zh[target_pos] <= "鿿":
+                seen += 1
+            target_pos += 1
+        # 在 [last_pos+2, text_len-2] 范围内找最近候选
+        best = None
+        for pos, prio in candidates:
+            if pos <= last_pos + 2 or pos >= text_len - 2:
+                continue
+            dist = abs(pos - target_pos)
+            score = dist + (prio - 1) * 6  # 子句标点惩罚 6 字距
+            if best is None or score < best[0]:
+                best = (score, pos)
+        if best is None:
+            break
+        cut = best[1]
+        parts.append(text_zh[last_pos:cut].strip())
+        last_pos = cut
+
+    if last_pos < text_len:
+        parts.append(text_zh[last_pos:].strip())
+
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return [{"start": start, "end": end, "text_zh": text_zh, "text_en": text_en}]
+
+    # 时间戳按汉字数等比分配
+    dur = end - start
+    sub_entries: List[dict] = []
+    cum_chars = 0
+    cum_start = start
+    for i, p in enumerate(parts):
+        p_chars = sum(1 for c in p if "一" <= c <= "鿿")
+        cum_chars += p_chars
+        if i == len(parts) - 1:
+            p_end = end
+        else:
+            p_end = start + (cum_chars / zh_chars) * dur if zh_chars > 0 else end
+        sub_entries.append({
+            "start": cum_start,
+            "end": p_end,
+            "text_zh": p,
+            "text_en": text_en,
+        })
+        cum_start = p_end
+    return sub_entries
+
+
+def generate_srt_files(segments: List[dict], output_dir: Path,
+                       max_chars_per_line: int = 14):
+    """生成三份 SRT 字幕。每个 unit 内按 max_chars_per_line 切成多条子行,
+    时间戳按字符占比等比分配。"""
     paths = {
         "en": output_dir / "subtitle_en.srt",
         "zh": output_dir / "subtitle_zh.srt",
@@ -2314,13 +2676,27 @@ def generate_srt_files(segments: List[dict], output_dir: Path):
     with open(paths["en"], "w", encoding="utf-8") as fen, \
          open(paths["zh"], "w", encoding="utf-8") as fzh, \
          open(paths["bi"], "w", encoding="utf-8") as fbi:
-        for idx, seg in enumerate(segments, 1):
-            ts = f"{format_srt_time(seg['start'])} --> {format_srt_time(seg['end'])}"
-            text_zh = _strip_markdown(seg['text_zh'], seg.get('text_en', ''))
-            text_zh = _clean_refine_artifacts(text_zh)  # 清理 [轻]/[中]/[短] 等标签
-            fen.write(f"{idx}\n{ts}\n{seg['text_en']}\n\n")
-            fzh.write(f"{idx}\n{ts}\n{text_zh}\n\n")
-            fbi.write(f"{idx}\n{ts}\n{text_zh}\n{seg['text_en']}\n\n")
+        sub_idx = 1
+        for seg in segments:
+            text_zh_full = _strip_markdown(seg.get('text_zh', ''), seg.get('text_en', ''))
+            text_zh_full = _clean_refine_artifacts(text_zh_full)
+            sub_seg = {
+                "start": seg["start"], "end": seg["end"],
+                "text_zh": text_zh_full,
+                "text_en": seg.get("text_en", ""),
+            }
+            sublines = split_unit_into_subtitle_lines(sub_seg, max_chars=max_chars_per_line)
+            # 英文不分行 (整段 text_en 显示在第一条子行, 其余子行只有中文)
+            for sub_i, line in enumerate(sublines):
+                ts = f"{format_srt_time(line['start'])} --> {format_srt_time(line['end'])}"
+                en_show = line['text_en'] if sub_i == 0 else ""
+                fen.write(f"{sub_idx}\n{ts}\n{en_show}\n\n")
+                fzh.write(f"{sub_idx}\n{ts}\n{line['text_zh']}\n\n")
+                if en_show:
+                    fbi.write(f"{sub_idx}\n{ts}\n{line['text_zh']}\n{en_show}\n\n")
+                else:
+                    fbi.write(f"{sub_idx}\n{ts}\n{line['text_zh']}\n\n")
+                sub_idx += 1
     print(f"  ✅ SRT 字幕已生成 (英文/中文/双语)")
     return paths["en"], paths["zh"], paths["bi"]
 
@@ -2688,7 +3064,8 @@ async def _generate_tts_segments(
     outliers = [item for item in all_items
                 if item["raw_ratio"] < PRE_TTS_EXPAND_THRESHOLD
                 or item["raw_ratio"] > PRE_TTS_SHRINK_THRESHOLD]
-    if outliers and config.get("llm"):
+    pre_tts_adjust_enabled = config.get("alignment", {}).get("pre_tts_text_adjust", False)
+    if outliers and config.get("llm") and pre_tts_adjust_enabled:
         print(f"     🔄 预检：{len(outliers)} 个片段 ratio 超标，调整译文中...")
         llm_config = config["llm"]
         api_url = llm_config["api_url"].rstrip("/")
@@ -3240,6 +3617,9 @@ async def _llm_duration_feedback(
 
     align_cfg = (config or {}).get("alignment", {})
     if not align_cfg.get("feedback_loop", True):
+        return
+    # 文本改写型闭环单独开关，默认关闭（避免 TTS 时长目标侵蚀翻译质量）
+    if not align_cfg.get("llm_text_loop", False):
         return
 
     llm_config = (config or {}).get("llm")
@@ -4698,7 +5078,7 @@ def _refine_with_llm(
         "1) 必须忠实翻译英文原文，不得偏离原文含义\n"
         "2) 每个 [编号] 的精简版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
         "3) 精简是缩短同一句话，不是替换成其他句子——精简结果必须与当前翻译含义一致\n"
-        "4) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "4) 专有名词与缩写优先保留原文\n"
         "5) 忠实原文语义，不要为凑字数而曲解原意\n"
         "6) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
         "7) 适合配音朗读，语句自然\n"
@@ -5113,7 +5493,7 @@ def _isometric_translate_batch(
         "核心规则：所有版本都必须忠实原文语义，区别只在于表达的精炼程度。\n"
         "1) 忠实翻译英文原文，不得偏离原文含义\n"
         "2) 不要删除关键信息来省字数——要靠更精练的表达来缩短\n"
-        "3) 计算机缩写保留英文原词，不加括号注音\n"
+        "3) 专有名词与缩写优先保留原文\n"
         "4) 严禁重复上下文内容\n"
         "5) 译文自然流畅，适合朗读\n"
         "6) 输出格式：每段先 [编号]，然后分行输出 [轻] [中] [短]"
@@ -5249,7 +5629,7 @@ def _isometric_expand_batch(
         "1) 扩展必须严格基于对应编号的英文原文含义，严禁引入英文中没有的信息\n"
         "2) 每个 [编号] 的扩展版本必须严格对应该编号的英文原文，严禁混用其他编号的内容\n"
         "3) 必须保留原译文的核心词汇，只在原译文基础上补充修饰语或使表达更完整\n"
-        "4) 计算机缩写保留英文原词（如 API、SDK、HTTP、GPU 等），不加括号注音\n"
+        "4) 专有名词与缩写优先保留原文\n"
         "5) 不要为凑字数而加入原文没有的信息\n"
         "6) 严禁重复上下文内容——上下文摘要仅供避免重复参考，不要从中取内容\n"
         "7) 适合配音朗读，语句自然，短句为主\n"
@@ -5803,6 +6183,11 @@ async def process_video(config: dict):
                 return
             _log(f"[{step_translate}/{total_steps}] 翻译")
             try:
+                # ── Sentence Unit 合并: 把 Whisper 碎片聚合到句子单元 ──
+                if config.get("unit_grouping", {}).get("enabled", True):
+                    pre_n = len(raw_segments)
+                    raw_segments = group_segments_to_units(raw_segments, config)
+                    _log(f"  📎 Sentence Unit 合并: {pre_n} → {len(raw_segments)} 段")
                 segments = translate_segments(raw_segments, config)
                 segments = deduplicate_segments(segments)
                 segments = merge_short_segments(segments)

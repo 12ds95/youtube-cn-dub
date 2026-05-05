@@ -408,7 +408,7 @@ def test_full_loop_with_mock():
 
         config = {
             "llm": {"api_url": "http://test.api/v1", "api_key": "test-key", "model": "test-model"},
-            "alignment": {"feedback_loop": True, "tts_rate_range": [0.80, 1.35]},
+            "alignment": {"feedback_loop": True, "llm_text_loop": True, "tts_rate_range": [0.80, 1.35]},
         }
 
         # Mock pydub: seg_0 正常(3100ms, 偏差3.3%), seg_1 超长(4500ms, 偏差125%)

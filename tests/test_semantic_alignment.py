@@ -204,8 +204,9 @@ def test_segment_count_preserved():
         trans = json.load(f)
     print(f"  转录段数: {len(trans)}, 翻译段数: {len(segs)}")
     ratio = len(segs) / len(trans) if len(trans) > 0 else 0
-    assert 0.8 <= ratio <= 1.05, f"段数比 {ratio:.2f} 异常 (期望 0.80~1.05)"
-    print("  ✅ 段数保持一致")
+    # Sentence-Unit 流水线: 多个 Whisper 碎片合并到 1 unit, 比率允许 0.30-1.05
+    assert 0.30 <= ratio <= 1.05, f"段数比 {ratio:.2f} 异常 (期望 0.30~1.05)"
+    print("  ✅ 段数比合理")
 
 
 def test_no_hallucination():

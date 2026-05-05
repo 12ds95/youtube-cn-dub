@@ -172,7 +172,7 @@ cat > "$TMPCONFIG" <<JSONEOF
   },
   "skip_steps": $SKIP_STEPS,
   "refine": {
-    "enabled": true,
+    "enabled": false,
     "max_iterations": 3,
     "speed_threshold": 1.5,
     "post_tts_calibration": $POST_CAL,

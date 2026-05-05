@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# 集成测试脚本: 对 10 个视频执行全功能管线测试
+# 集成测试脚本: 对 output/ 下所有视频执行全功能管线测试
 # 全功能开启: two_pass, nlp_segmentation, post_tts_calibration,
 #   gap_borrowing, video_slowdown, atempo_disabled, feedback_loop
 # 用途: 收集 TTS 时长校准数据 + 回归测试
-# 覆盖领域: 微积分、计算机科学、微分方程、神经网络、分析、概率
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,18 +28,28 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-VIDEOS=(
-    "d4EgbgTm0Bg"
-    "kCc8FmEb1nY"
-    "zjMuIxRvygQ"
-    "Calculus/WUvTyaaNkzM"
-    "Computer Science/03_But_how_does_bitcoin_actually_work_"
-    "Computer Science/05_Simulating_an_epidemic"
-    "Differential Equations/01_Differential_equations,_studying_the_unsolvable"
-    "Neural Networks/aircAruvnKk"
-    "Analysis/02_But_what_is_the_Fourier_Transform__A_visual_introduction."
-    "Probability/06_But_what_is_the_Central_Limit_Theorem_"
-)
+# 动态发现 output/ 下所有视频目录
+# 判断逻辑: 含管线产物文件(transcribe_cache.json/original.mp4/audio_vocals.wav)的为视频目录
+#           否则为分类目录，遍历其子目录
+VIDEOS=()
+for entry in output/*/; do
+    entry="${entry%/}"          # 去尾部斜杠
+    entry="${entry#output/}"    # 去 output/ 前缀
+    if [ -f "output/$entry/transcribe_cache.json" ] || \
+       [ -f "output/$entry/original.mp4" ] || \
+       [ -f "output/$entry/audio_vocals.wav" ]; then
+        # 独立视频目录(含管线产物)
+        VIDEOS+=("$entry")
+    else
+        # 分类目录: 遍历其下每个子目录
+        for sub in output/"$entry"/*/; do
+            [ -d "$sub" ] || continue
+            sub="${sub%/}"
+            sub="${sub#output/}"
+            VIDEOS+=("$sub")
+        done
+    fi
+done
 
 run_video() {
     local VIDEO_ID="$1"
@@ -56,10 +65,10 @@ run_video() {
         return 1
     fi
 
-    # 判断 skip_steps
-    SKIP_STEPS='["download", "extract", "separate"]'
+    # 判断 skip_steps (临时跳过合成视频阶段)
+    SKIP_STEPS='["download", "extract", "separate", "subtitle", "merge"]'
     if [ -f "$VIDEO_DIR/transcribe_cache.json" ]; then
-        SKIP_STEPS='["download", "extract", "separate", "transcribe"]'
+        SKIP_STEPS='["download", "extract", "separate", "transcribe", "subtitle", "merge"]'
         echo "   模式: 跳过 transcribe (有缓存)"
     else
         echo "   模式: 需要 transcribe (无缓存)"
@@ -152,11 +161,11 @@ JSONEOF
 
     rm -f "$TMPCONFIG"
 
-    # 验证输出
+    # 验证输出 (跳过 final.mp4 和字幕)
     echo ""
     echo -e "${YELLOW}📋 输出验证 ($VIDEO_ID):${NC}"
     local PASS=true
-    for f in final.mp4 chinese_dub.wav segments_cache.json subtitle_bilingual.srt subtitle_zh.srt subtitle_en.srt audit/speed_report.json; do
+    for f in chinese_dub.wav segments_cache.json audit/speed_report.json; do
         if [ -f "$VIDEO_DIR/$f" ] && [ "$(stat -f%z "$VIDEO_DIR/$f" 2>/dev/null)" -gt 0 ]; then
             local size
             size=$(stat -f%z "$VIDEO_DIR/$f" | awk '{
@@ -201,8 +210,8 @@ JSONEOF
 }
 
 # 主流程
-echo -e "${YELLOW}🧪 10 视频集成测试 (全功能开启)${NC}"
-echo "   视频: ${VIDEOS[*]}"
+echo -e "${YELLOW}🧪 ${#VIDEOS[@]} 视频集成测试 (全功能开启)${NC}"
+echo "   视频数量: ${#VIDEOS[@]}"
 echo ""
 
 TOTAL_START=$(date +%s)

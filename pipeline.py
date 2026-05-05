@@ -2538,9 +2538,13 @@ async def _generate_tts_segments(
         return
 
     # ── Phase 3: 预检自适应 —— ratio 超标时先调整译文 ──
-    # 只处理 ratio 超出 (0.75, 1.30) 的片段，这些片段即使用 TTS rate 也无法完全补偿
+    # 降低阈值到 1.20: 原 1.35 只捕获极端段，大量 1.15-1.35 段逃逸
+    # 导致 TTS 后依赖 atempo 强制加速、自然度下降
+    PRE_TTS_SHRINK_THRESHOLD = 1.20
+    PRE_TTS_EXPAND_THRESHOLD = 0.70
     outliers = [item for item in all_items
-                if item["raw_ratio"] < 0.70 or item["raw_ratio"] > 1.35]
+                if item["raw_ratio"] < PRE_TTS_EXPAND_THRESHOLD
+                or item["raw_ratio"] > PRE_TTS_SHRINK_THRESHOLD]
     if outliers and config.get("llm"):
         print(f"     🔄 预检：{len(outliers)} 个片段 ratio 超标，调整译文中...")
         llm_config = config["llm"]
@@ -2558,6 +2562,9 @@ async def _generate_tts_segments(
                 r'(?:https?://)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}'
             )
             rejected_count = 0
+            rejection_details = []  # 记录拒绝原因
+            # 数学/公式检测：含运算符或纯公式的段无法有效精简
+            _math_pat = re.compile(r'[²³⁴∑∫∏×÷±√∞≈≠≤≥°]|[\d]+[×x\*][\d]+|cos|sin|tan')
             for item in outliers:
                 idx = item["idx"]
                 seg = segments[idx]
@@ -2565,65 +2572,184 @@ async def _generate_tts_segments(
                 old_ratio = item["raw_ratio"]
                 text_en = seg.get("text_en", seg.get("text", ""))
                 # 含 URL 且超速的片段：LLM 无法有效缩短 URL 发音，跳过
-                if item["raw_ratio"] > 1.35 and _url_pat.search(old_zh):
+                if item["raw_ratio"] > PRE_TTS_SHRINK_THRESHOLD and _url_pat.search(old_zh):
+                    continue
+                # 纯数学/公式短段（<15字且含数学符号）：无法精简或扩展
+                if len(old_zh) < 15 and _math_pat.search(old_zh):
                     continue
                 target_chars = max(2, int(item["target_dur_ms"] / MS_PER_CHAR))
-                # 判断调整方向，prompt 附带英文原文供 LLM 参考
-                if item["raw_ratio"] > 1.35:
+                target_dur_ms = item["target_dur_ms"]
+                # 目标感知 compression_floor：基于 target_chars/old_zh 长度比
+                # 允许 LLM 产出略低于目标（-5%缓冲），下限 0.40 防止极端丢失
+                if len(old_zh) > 0:
+                    adaptive_floor = max(0.40, target_chars / len(old_zh) - 0.05)
+                else:
+                    adaptive_floor = 0.60
+                # 判断调整方向
+                if item["raw_ratio"] > PRE_TTS_SHRINK_THRESHOLD:
                     action = "精简"
+                    # 所有精简段用多候选策略（n=3, 不同温度）
+                    n_candidates = 3
+                    temperatures = [0.3, 0.5, 0.7]
+                    # 计算允许的最小字数（基于 adaptive_floor）
+                    min_chars = max(2, int(len(old_zh) * adaptive_floor))
+                    # 给 LLM 一个范围而非精确目标，减少过度压缩
                     prompt = (f"英文原文: {text_en}\n当前中文译文: {old_zh}\n"
-                              f"请将中文译文精简到约 {target_chars} 字，必须忠实英文原文语义，不得删减关键信息。")
+                              f"请将中文译文精简到 {min_chars}~{target_chars} 字之间，"
+                              f"保留核心语义，确保适合配音朗读。只输出精简后的译文。")
                 else:
                     action = "扩展"
+                    n_candidates = 1
+                    temperatures = [0.3]
                     prompt = (f"英文原文: {text_en}\n当前中文译文: {old_zh}\n"
                               f"请将中文译文扩展到约 {target_chars} 字，忠实英文原文，使表达更完整自然。")
                 try:
-                    payload = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": "你是配音字幕调整助手。根据英文原文和要求精简或扩展译文，必须忠实原文语义。输出纯文本，不要添加任何解释。"},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": 0.3,
-                        "max_tokens": 256,
-                    }
+                    # 生成候选并选最优
+                    candidates = []
                     async with httpx.AsyncClient(timeout=15.0) as client:
-                        resp = await client.post(endpoint, json=payload, headers=headers)
-                        resp.raise_for_status()
-                        new_zh = resp.json()["choices"][0]["message"]["content"].strip()
-                        new_zh = _strip_markdown(new_zh, text_en)
-                        # 统一质量守卫
-                        guard_mode = "shrink" if action == "精简" else "expand"
+                        for temp in temperatures:
+                            payload = {
+                                "model": model,
+                                "messages": [
+                                    {"role": "system", "content": "你是配音字幕调整助手。根据英文原文和目标字数调整译文长度，保留核心语义。只输出调整后的译文，不要解释。"},
+                                    {"role": "user", "content": prompt},
+                                ],
+                                "temperature": temp,
+                                "max_tokens": 256,
+                            }
+                            resp = await client.post(endpoint, json=payload, headers=headers)
+                            resp.raise_for_status()
+                            cand = resp.json()["choices"][0]["message"]["content"].strip()
+                            cand = _strip_markdown(cand, text_en)
+                            cand = normalize_llm_output(cand, text_en)
+                            if cand and cand != old_zh and len(cand) >= 2:
+                                candidates.append(cand)
+                    if not candidates:
+                        rejected_count += 1
+                        rejection_details.append({"idx": idx, "reason": "no_valid_candidate", "action": action})
+                        continue
+                    # 从候选中选最优：通过守卫 + 时长最接近目标
+                    guard_mode = "shrink" if action == "精简" else "expand"
+                    best = None
+                    best_deviation = float('inf')
+                    reject_reason = None
+                    fallback_cand = None  # 备选: 仅 over_compressed 但语义忠实
+                    fallback_deviation = float('inf')
+                    for cand in candidates:
                         is_valid, reason = _validate_text_adjustment(
-                            new_zh, old_zh, idx, segments, mode=guard_mode,
+                            cand, old_zh, idx, segments, mode=guard_mode,
+                            fidelity_threshold=0.30,
+                            compression_floor=adaptive_floor,
                         )
                         if not is_valid:
-                            rejected_count += 1
+                            reject_reason = reason
+                            # over_compressed 但通过忠实度+非重复: 记录为 fallback
+                            if reason == "over_compressed" and guard_mode == "shrink":
+                                if (_check_refine_fidelity(old_zh, cand, min_overlap=0.30)
+                                        and not _is_duplicate_of_neighbors(cand, idx, segments)):
+                                    cand_est = _estimate_duration_jieba(text_for_duration(cand))
+                                    dev = abs(cand_est - target_dur_ms)
+                                    if dev < fallback_deviation:
+                                        fallback_cand = cand
+                                        fallback_deviation = dev
                             continue
-                        # 通过所有守卫，更新 segments 和 item
-                        segments[idx]["text_zh"] = new_zh
-                        item["text_zh"] = new_zh
-                        # 重新计算 rate（使用 jieba 估算，含 URL 检测）
-                        new_est_ms = _estimate_duration_jieba(text_for_duration(new_zh))
-                        new_ratio = item["raw_ratio"]
-                        if new_est_ms > 0 and item["target_dur_ms"] > 0:
-                            new_ratio = new_est_ms / item["target_dur_ms"]
-                            item["raw_ratio"] = new_ratio
-                            item["rate"] = max(0.85, min(1.20, new_ratio))
-                        pre_tts_log.append({
-                            "idx": idx, "action": action,
-                            "old_zh": old_zh, "new_zh": new_zh,
-                            "old_ratio": round(old_ratio, 3),
-                            "new_ratio": round(new_ratio, 3),
+                        # 评估时长接近度
+                        cand_est = _estimate_duration_jieba(text_for_duration(cand))
+                        deviation = abs(cand_est - target_dur_ms)
+                        if deviation < best_deviation:
+                            best = cand
+                            best_deviation = deviation
+                    # 主守卫全部拒绝时，尝试 fallback（over_compressed 但语义忠实）
+                    if best is None and fallback_cand is not None:
+                        best = fallback_cand
+                        best_deviation = fallback_deviation
+                    if best is None:
+                        rejected_count += 1
+                        rejection_details.append({
+                            "idx": idx, "reason": reject_reason or "all_failed",
+                            "action": action, "n_candidates": len(candidates),
                         })
-                        adjusted_count += 1
+                        continue
+                    # 通过守卫，更新 segments 和 item
+                    segments[idx]["text_zh"] = best
+                    item["text_zh"] = best
+                    new_est_ms = _estimate_duration_jieba(text_for_duration(best))
+                    new_ratio = item["raw_ratio"]
+                    if new_est_ms > 0 and target_dur_ms > 0:
+                        new_ratio = new_est_ms / target_dur_ms
+                        item["raw_ratio"] = new_ratio
+                        item["rate"] = max(0.85, min(1.20, new_ratio))
+                    pre_tts_log.append({
+                        "idx": idx, "action": action,
+                        "old_zh": old_zh, "new_zh": best,
+                        "old_ratio": round(old_ratio, 3),
+                        "new_ratio": round(new_ratio, 3),
+                        "n_candidates": len(candidates),
+                    })
+                    adjusted_count += 1
                 except Exception as e:
                     print(f"        ⚠️ 段落 {idx} {action}失败: {e}")
             if adjusted_count or rejected_count:
                 print(f"        ✅ 成功调整 {adjusted_count}/{len(outliers)} 个片段"
                       + (f"，拒绝 {rejected_count} 个低质量结果" if rejected_count else ""))
+
+            # ── 第二轮: 对仍 >1.50 的极端段再次尝试（更激进压缩）──
+            extreme_outliers = [item for item in all_items
+                                if item["raw_ratio"] > 1.50 and item["idx"] not in
+                                {r["idx"] for r in rejection_details if r.get("reason") == "low_fidelity"}]
+            if extreme_outliers:
+                pass2_count = 0
+                for item in extreme_outliers:
+                    idx = item["idx"]
+                    seg = segments[idx]
+                    old_zh = item["text_zh"]
+                    text_en = seg.get("text_en", seg.get("text", ""))
+                    target_dur_ms = item["target_dur_ms"]
+                    target_chars = max(2, int(target_dur_ms / MS_PER_CHAR))
+                    try:
+                        async with httpx.AsyncClient(timeout=15.0) as client:
+                            payload = {
+                                "model": model,
+                                "messages": [
+                                    {"role": "system", "content": "你是配音字幕精简专家。当前译文严重超时，必须大幅缩短。保留核心含义即可，删除所有修饰语和非必要信息。只输出精简后的译文。"},
+                                    {"role": "user", "content": f"英文原文: {text_en}\n当前中文: {old_zh}\n必须缩短到 {target_chars} 字以内。"},
+                                ],
+                                "temperature": 0.5,
+                                "max_tokens": 256,
+                            }
+                            resp = await client.post(endpoint, json=payload, headers=headers)
+                            resp.raise_for_status()
+                            cand = resp.json()["choices"][0]["message"]["content"].strip()
+                            cand = _strip_markdown(cand, text_en)
+                            cand = normalize_llm_output(cand, text_en)
+                        if cand and cand != old_zh and len(cand) >= 2:
+                            # 极端段放宽守卫: floor=0.30, fidelity=0.25
+                            is_valid, reason = _validate_text_adjustment(
+                                cand, old_zh, idx, segments, mode="shrink",
+                                fidelity_threshold=0.25, compression_floor=0.30)
+                            if is_valid:
+                                segments[idx]["text_zh"] = cand
+                                item["text_zh"] = cand
+                                new_est = _estimate_duration_jieba(text_for_duration(cand))
+                                if new_est > 0 and target_dur_ms > 0:
+                                    item["raw_ratio"] = new_est / target_dur_ms
+                                    item["rate"] = max(0.85, min(1.20, item["raw_ratio"]))
+                                pre_tts_log.append({
+                                    "idx": idx, "action": "极端精简(pass2)",
+                                    "old_zh": old_zh, "new_zh": cand,
+                                    "old_ratio": round(item["raw_ratio"], 3),
+                                    "new_ratio": round(new_est / target_dur_ms, 3) if target_dur_ms > 0 else 0,
+                                    "n_candidates": 1,
+                                })
+                                pass2_count += 1
+                                adjusted_count += 1
+                    except Exception:
+                        pass
+                if pass2_count:
+                    print(f"        🔧 第二轮极端精简: {pass2_count}/{len(extreme_outliers)} 段")
+
             # 写入日志
-            if pre_tts_log or rejected_count:
+            if pre_tts_log or rejected_count or rejection_details:
                 import json as _json_ptc
                 _ptc_audit = _audit_dir(tts_dir.parent)
                 log_path = _ptc_audit / "pre_tts_check_log.json"
@@ -2632,6 +2758,7 @@ async def _generate_tts_segments(
                     "adjusted": adjusted_count,
                     "rejected": rejected_count,
                     "changes": pre_tts_log,
+                    "rejections": rejection_details,
                 }
                 with open(log_path, "w", encoding="utf-8") as _f:
                     _json_ptc.dump(log_data, _f, ensure_ascii=False, indent=2)
@@ -4326,6 +4453,12 @@ def _validate_text_adjustment(
         return False, "too_short"
     if not _check_refine_fidelity(old_zh, new_zh, min_overlap=fidelity_threshold):
         return False, "low_fidelity"
+    # 未翻译英文检测：候选中出现原文没有的英文单词（≥3字母、非全大写缩写）
+    _new_eng = set(re.findall(r'[a-zA-Z]{3,}', new_zh))
+    _old_eng = set(re.findall(r'[a-zA-Z]{3,}', old_zh))
+    _novel_eng = {w for w in (_new_eng - _old_eng) if not w.isupper()}
+    if _novel_eng:
+        return False, "untranslated_english"
     if _is_duplicate_of_neighbors(new_zh, idx, segments):
         return False, "duplicate"
     if mode == "shrink" and len(old_zh) > 4:
@@ -4694,12 +4827,17 @@ def _select_best_candidate(
         else:
             if len(cand) >= len(original_zh):
                 continue
-        # 统一质量守卫
+        # 统一质量守卫 (compression_floor 自适应: 基于 target 与原文比例)
         guard_mode = "expand" if mode == "fill" else "shrink"
+        _comp_floor = 0.60
+        if guard_mode == "shrink" and target_ms > 0 and len(original_zh) > 0:
+            _target_chars = max(2, int(target_ms / 222))  # ~222ms/char
+            _comp_floor = max(0.40, _target_chars / len(original_zh) - 0.05)
         is_valid, _reason = _validate_text_adjustment(
             cand, original_zh, idx, segments,
             mode=guard_mode,
             fidelity_threshold=fidelity_threshold,
+            compression_floor=_comp_floor,
             expansion_ceiling=2.0,
         )
         if not is_valid:

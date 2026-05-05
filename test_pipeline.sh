@@ -54,6 +54,7 @@ case "${1:-}" in
     --integrated)  MODE="integrated" ;;
     --baseline)    MODE="baseline" ;;
     --fast)        MODE="fast" ;;
+    --tts-only)    MODE="tts-only" ;;
     --refine)      MODE="refine" ;;
     --retranslate) MODE="retranslate" ;;
 esac
@@ -87,6 +88,9 @@ case "$MODE" in
     fast)
         echo "   --fast 模式: 保留 segments_cache.json (跳过 transcribe + translate)"
         ;;
+    tts-only)
+        echo "   --tts-only 模式: 保留 segments_cache.json，跑 TTS+预检，跳过字幕+合成"
+        ;;
     refine)
         echo "   --refine 模式: 保留 segments_cache.json，仅运行迭代优化 (跳过 TTS 后步骤)"
         ;;
@@ -111,6 +115,9 @@ case "$MODE" in
         ;;
     fast)
         SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate"]'
+        ;;
+    tts-only)
+        SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate", "subtitle", "merge"]'
         ;;
     refine)
         SKIP_STEPS='["download", "extract", "separate", "transcribe", "translate", "tts", "subtitle", "merge"]'
@@ -237,7 +244,7 @@ check_file() {
 
 echo -e "${YELLOW}📋 输出验证:${NC}"
 
-if [ "$MODE" = "refine" ] || [ "$MODE" = "retranslate" ]; then
+if [ "$MODE" = "refine" ] || [ "$MODE" = "retranslate" ] || [ "$MODE" = "tts-only" ]; then
     # 仅验证翻译相关文件
     check_file "$VIDEO_DIR/segments_cache.json" "segments_cache.json (翻译缓存)"
 

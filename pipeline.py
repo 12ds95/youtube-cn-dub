@@ -4247,10 +4247,12 @@ def _is_duplicate_of_neighbors(
 
 def _char_overlap_ratio(s1: str, s2: str) -> float:
     """
-    计算两个字符串的字符重叠率 (公共字符数 / 较短串长度)。
+    计算两个字符串的相似度: max(多重集重叠率, 词级Jaccard)。
     忽略标点和空白，适合中文近义句子的相似度判断。
+
+    多重集重叠率: Counter 交集 / 较短串长度 — 对完全复制和包含关系敏感
+    词级 Jaccard: jieba 分词后 |词集交集| / |词集并集| — 对改写式重复敏感（同词不同序）
     """
-    # 过滤掉标点和空白
     import unicodedata
     def _meaningful_chars(s):
         return [c for c in s if not unicodedata.category(c).startswith(('P', 'Z'))]
@@ -4261,13 +4263,28 @@ def _char_overlap_ratio(s1: str, s2: str) -> float:
     if not chars1 or not chars2:
         return 0.0
 
-    # 使用多重集合（Counter）计算共有字符数
+    # 多重集重叠率 (Counter)
     from collections import Counter
     c1 = Counter(chars1)
     c2 = Counter(chars2)
     common = sum((c1 & c2).values())
     shorter = min(sum(c1.values()), sum(c2.values()))
-    return common / shorter if shorter > 0 else 0.0
+    overlap = common / shorter if shorter > 0 else 0.0
+
+    # 词级 Jaccard — 仅当双方长度接近且足够长时才有意义
+    # (短串或长度悬殊时 Counter overlap 已足够)
+    len1, len2 = len(chars1), len(chars2)
+    if min(len1, len2) >= 8 and max(len1, len2) / min(len1, len2) < 2.0:
+        import jieba
+        words1 = set(w for w in jieba.lcut(s1) if len(w.strip()) > 0
+                     and not unicodedata.category(w[0]).startswith(('P', 'Z')))
+        words2 = set(w for w in jieba.lcut(s2) if len(w.strip()) > 0
+                     and not unicodedata.category(w[0]).startswith(('P', 'Z')))
+        if words1 and words2:
+            word_jaccard = len(words1 & words2) / len(words1 | words2)
+            return max(overlap, word_jaccard)
+
+    return overlap
 
 
 def _check_refine_fidelity(original_zh: str, candidate_zh: str,
@@ -5548,6 +5565,9 @@ async def process_video(config: dict):
                 segments, tts_dir, config["voice"],
                 config.get("tts_concurrency", 5),
                 config=config)
+            # TTS 阶段可能调整了译文（预检/LLM闭环），持久化到 cache
+            with open(output_dir / "segments_cache.json", "w", encoding="utf-8") as f:
+                json.dump(segments, f, ensure_ascii=False, indent=2)
             _log("")
         else:
             _log(f"[{step_n}/{total_steps}] 生成 TTS - 跳过")
@@ -5628,6 +5648,9 @@ async def process_video(config: dict):
                 segments, output_dir, config["voice"],
                 config.get("tts_concurrency", 5),
                 config=config)
+            # TTS 阶段可能调整了译文（预检/LLM闭环），持久化到 cache
+            with open(output_dir / "segments_cache.json", "w", encoding="utf-8") as f:
+                json.dump(segments, f, ensure_ascii=False, indent=2)
             _log("")
         elif "tts" in skip:
             _log(f"[{step_n}/{total_steps}] 生成配音 - 跳过")

@@ -14,10 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ── compute_target_char_range ──
 
 def test_target_range_5s_normal():
-    """5 秒英语 → 中文目标字数 ~ [3.5*5, 5.5*5] = [17, 28]"""
+    """5 秒英语用 use_jieba=False 走 CPS 区间 [3.5*5, 5.5*5] = [18, 28]"""
     from text_utils import compute_target_char_range
-    lo, hi = compute_target_char_range(5.0)
-    assert 15 <= lo <= 18
+    lo, hi = compute_target_char_range(5.0, use_jieba=False)
+    assert 15 <= lo <= 19
     assert 26 <= hi <= 30
     assert lo < hi
 
@@ -31,10 +31,9 @@ def test_target_range_short_segment():
 
 
 def test_target_range_long_segment():
-    """长段比例 OK"""
+    """12s use_jieba=False → CPS 区间 [42, 66]"""
     from text_utils import compute_target_char_range
-    lo, hi = compute_target_char_range(12.0)
-    # 12s * 3.5 = 42, 12 * 5.5 = 66
+    lo, hi = compute_target_char_range(12.0, use_jieba=False)
     assert 38 <= lo <= 45
     assert 60 <= hi <= 70
 

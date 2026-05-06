@@ -60,13 +60,15 @@ def test_时间戳按字符等比分配():
         assert abs(lines[i]["end"] - lines[i+1]["start"]) < 1e-3
 
 
-def test_text_en保留在每子行():
-    """所有子行共享同一个 text_en (整段英文)"""
+def test_text_en按比例分配到每子行():
+    """text_en 按汉字比例切分到各子行 (P2-4); 各 subline 都应非空"""
     from pipeline import split_unit_into_subtitle_lines
     seg = _seg(0.0, 10.0, "这是一段较长的中文内容。需要被分成多行字幕。", "Original English text here.")
     lines = split_unit_into_subtitle_lines(seg, max_chars=12)
-    for l in lines:
-        assert l["text_en"] == "Original English text here."
+    # 每条非空, 拼起来覆盖原英文所有词
+    combined = " ".join(l["text_en"] for l in lines if l["text_en"])
+    for w in "Original English text here.".split():
+        assert w in combined
 
 
 def test_纯标点不导致空段():

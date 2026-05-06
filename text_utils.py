@@ -76,15 +76,69 @@ def strip_char_count_prefix(text: str) -> str:
     return re.sub(r"^\s*\(\s*\d+(?:\s*-\s*\d+)?\s*字?\s*\)\s*", "", text).strip()
 
 
-def compute_target_char_range(duration_sec: float, cps_lo: float = 3.5,
-                              cps_hi: float = 5.5) -> tuple:
+_JIEBA_MS_PER_CHAR_CACHE = None
+
+
+def _global_ms_per_char_jieba() -> float:
+    """用 jieba duration_estimator 在标准模板上探测 ms/字, 缓存结果。
+    标准模板取常见高频中文 (单字+双字混合) 的代表性样本。"""
+    global _JIEBA_MS_PER_CHAR_CACHE
+    if _JIEBA_MS_PER_CHAR_CACHE is not None:
+        return _JIEBA_MS_PER_CHAR_CACHE
+    try:
+        from duration_estimator import estimate_duration
+        sample = "我们今天来讨论这个问题，它是一个比较重要的事情。" \
+                 "在这里我们要把它说清楚，让大家都能理解明白。"
+        chars = sum(1 for c in sample if "一" <= c <= "鿿")
+        if chars <= 0:
+            return 220.0
+        ms = estimate_duration(sample)
+        _JIEBA_MS_PER_CHAR_CACHE = ms / chars
+    except Exception:
+        _JIEBA_MS_PER_CHAR_CACHE = 220.0
+    return _JIEBA_MS_PER_CHAR_CACHE
+
+
+def compute_target_char_range(duration_sec: float, sample_zh: str = None,
+                              use_jieba: bool = True,
+                              cps_lo: float = 3.5,
+                              cps_hi: float = 5.5,
+                              tolerance: float = 0.15) -> tuple:
     """根据 segment 时长计算中文字数目标区间。
 
-    cps_lo / cps_hi: 自然中文朗读字符/秒, 默认 [3.5, 5.5] (与项目 CPS 合规区间一致)。
+    优先级:
+      1) sample_zh 提供 → 用 jieba 估算 sample 的 ms/字, 反向求 target_chars
+      2) use_jieba=True (默认) → 用全局 jieba 探测的 mean ms/字
+      3) use_jieba=False → 回退 CPS 区间 [cps_lo, cps_hi]
+
+    tolerance: target_chars 上下浮动比例 (默认 ±15%)。
     返回 (lo_chars, hi_chars), 都是 int 且 lo < hi。
     """
     if duration_sec <= 0:
         return (1, 4)
+
+    target_ms = duration_sec * 1000
+
+    if use_jieba:
+        ms_per_char = None
+        if sample_zh:
+            try:
+                from duration_estimator import estimate_duration
+                sample_chars = sum(1 for c in sample_zh if "一" <= c <= "鿿")
+                sample_ms = estimate_duration(sample_zh)
+                if sample_chars > 0 and sample_ms > 0:
+                    ms_per_char = sample_ms / sample_chars
+            except Exception:
+                pass
+        if ms_per_char is None:
+            ms_per_char = _global_ms_per_char_jieba()
+        if ms_per_char and ms_per_char > 0:
+            target_chars = max(1, int(round(target_ms / ms_per_char)))
+            lo = max(1, int(round(target_chars * (1 - tolerance))))
+            hi = max(lo + 1, int(round(target_chars * (1 + tolerance))))
+            return (lo, hi)
+
+    # Fallback: CPS 区间
     lo = max(1, int(round(duration_sec * cps_lo)))
     hi = max(lo + 1, int(round(duration_sec * cps_hi)))
     return (lo, hi)
@@ -126,8 +180,19 @@ def normalize_llm_output(text: str, original: str = "", strip_refine: bool = Fal
 
 # ─── 括号注解语义去重 ────────────────────────────────────────────────
 
-# 全角+半角括号匹配
-_PAREN_PATTERN = re.compile(r'[（(]([^）)]*)[）)]')
+# 多种括号匹配: ()、（）、《》、[]、【】、{}
+# 用 alternation 保证开闭符号正确配对; _should_strip 从 match.groups() 中取第一个非 None
+_PAREN_PATTERN = re.compile(
+    r'（([^）]*)）'        # 全角圆括号
+    r'|\(([^)]*)\)'        # 半角圆括号
+    r'|《([^》]*)》'        # 书名号
+    r'|【([^】]*)】'        # 全角方括号
+    r'|\[([^\]]*)\]'      # 半角方括号
+    r'|\{([^}]*)\}'       # 半角花括号
+)
+
+# 任一开括号字符,用于 fast-path 早退
+_BRACKET_OPENERS = '（(《【[{'
 
 # 数学/代码排除：含运算符或数学符号
 _MATH_CHARS = set('+-*/=°×÷∑∫∂√≈≠≤≥<>^')
@@ -202,14 +267,15 @@ def strip_parenthetical_annotations(text_zh: str) -> str:
     """
     if not text_zh:
         return text_zh
-    if '（' not in text_zh and '(' not in text_zh:
+    if not any(c in text_zh for c in _BRACKET_OPENERS):
         return text_zh
-    # 排除不含拉丁字母的文本（纯中文括号内容无需检查）
-    if not re.search(r'[（(][^）)]*[a-zA-Z][^）)]*[）)]', text_zh):
+    # 排除不含拉丁字母的整体文本(纯中文括号内容无需检查)
+    if not re.search(r'[a-zA-Z]', text_zh):
         return text_zh
 
     def _should_strip(match):
-        inner = match.group(1)
+        # alternation 模式: 取第一个非 None 的 capture group 作为 inner
+        inner = next((g for g in match.groups() if g is not None), '')
         if not inner or len(inner) < 2:
             return match.group(0)
 
@@ -225,29 +291,35 @@ def strip_parenthetical_annotations(text_zh: str) -> str:
         if _is_pure_cjk_explanation(inner):
             return match.group(0)
 
-        # 提取括号前的 context（前面最近的有意义文本，最多 15 字符）
+        # 多窗口取最大相似度: 长 context 易稀释名词匹配 (e.g. "这是在与本·伊瑟" 拉低 sim)
+        # 6/10/15 字三档, 取最高 sim 作判定依据
         start = match.start()
-        context_before = text_zh[max(0, start - 15):start].strip()
-        # 去掉 context 中的标点
-        context_before = re.sub(r'[，。！？、；：""''…—\s]+', '', context_before)
+        _PUNCT_RE = r'[，。！？、；：""''…—\s]+'
+        max_sim = -2.0  # -2 表示尚未计算
+        for win in (6, 10, 15):
+            ctx = text_zh[max(0, start - win):start]
+            ctx = re.sub(_PUNCT_RE, '', ctx).strip()
+            if len(ctx) < 2:
+                continue
+            s = _semantic_similarity(ctx, inner)
+            if s > max_sim:
+                max_sim = s
 
-        if len(context_before) < 2:
-            # context 太短，回退启发式
+        if max_sim <= -2.0:
+            # 所有窗口 ctx 都太短，回退启发式
             cjk = sum(1 for c in inner if '\u4e00' <= c <= '\u9fff')
             if len(inner) > 0 and (len(inner) - cjk) / len(inner) > 0.5:
                 return ''
             return match.group(0)
 
-        # 使用 embedding 判断语义相似度
-        sim = _semantic_similarity(context_before, inner)
-        if sim < 0:
-            # 模型不可用，回退启发式
+        if max_sim < 0:
+            # 模型不可用 (返回 -1)，回退启发式
             cjk = sum(1 for c in inner if '\u4e00' <= c <= '\u9fff')
             if len(inner) > 0 and (len(inner) - cjk) / len(inner) > 0.5:
                 return ''
             return match.group(0)
 
-        if sim > 0.5:
+        if max_sim > 0.5:
             return ''  # 冗余，去除
         return match.group(0)  # 不冗余，保留
 

@@ -143,12 +143,12 @@ if [ "$MODE" = "baseline" ]; then
 else
     TWO_PASS=true
     NLP_SEG=true
-    POST_CAL=true
+    POST_CAL=false
     GAP_BORROW=true
     VID_SLOW=true
     ATEMPO_DISABLED=true
     FEEDBACK_LOOP=true
-    FEATURE_DESC="two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop, isometric=3"
+    FEATURE_DESC="two_pass, nlp_segmentation, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop(rate-only), unit_grouping; 关闭: isometric/post_tts_cal"
 fi
 
 cat > "$TMPCONFIG" <<JSONEOF
@@ -163,7 +163,7 @@ cat > "$TMPCONFIG" <<JSONEOF
     "batch_size": 8,
     "temperature": 0.3,
     "two_pass": $TWO_PASS,
-    "isometric": 3
+    "isometric": 0
   },
   "nlp_segmentation": $NLP_SEG,
   "tts_chain": ["edge-tts", "sherpa-onnx", "piper", "gtts", "pyttsx3"],

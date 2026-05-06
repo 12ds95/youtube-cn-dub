@@ -243,7 +243,9 @@ DEFAULT_CONFIG = {
         "system_prompt": (           # 翻译 system prompt（一般无需修改）
             "你是专业的英中翻译引擎。将以下英文文本翻译为简体中文。"
             "要求：1)翻译准确流畅，符合中文表达习惯；"
-            "2)专有名词与缩写优先保留原文; 若有约定俗成中文译法则用译法;"
+            "2)译文中的英文必须严格限定在三类: (a) proper_nouns 列出的真实人名/品牌/公司/作品名 "
+            "(b) URL 或文件路径 (c) 代码标识符 / 数学符号 / 缩写等不宜翻译的技术 token; "
+            "除此之外的英文 (动词/形容词/普通名词/短语) 都必须译为中文, 禁止中英混杂;"
             "3)忠实原文语义，不要为缩短字数而曲解原意，也不要过度扩充；"
             "4)翻译要适合做视频配音朗读，语句通顺自然，短句为主；"
             "5)只输出翻译结果，不要解释。"
@@ -256,6 +258,10 @@ DEFAULT_CONFIG = {
         "isometric": 0,              # 等时多候选翻译: 0=关闭, 3=为高CPS段生成3个长度变体自动选优
         "isometric_cps_threshold": 5.5,  # 估算CPS超过此值才触发多候选（自然中文 3.5-6.0）
         "isometric_expand_cps_threshold": 3.5,  # CPS低于此值触发多候选扩展
+        "low_cps_expand_lite": True,  # P2-1: 严重欠速段 (CPS<3.0 或 ratio<0.65) 单候选轻量扩展
+        "low_cps_expand_lite_cps": 3.3,        # lite 触发 CPS 阈值 (低于此值触发轻量扩展)
+        "low_cps_expand_lite_ratio": 0.72,     # lite 触发 estimated/target 阈值
+        "low_cps_expand_lite_n": 6,            # lite 多候选数 (依赖 LLM 随机性)
     },
 
     # ── TTS 配音引擎 ──
@@ -883,7 +889,7 @@ def group_segments_to_units(
     segments: List[dict],
     config: dict = None,
     *,
-    min_unit_duration: float = 1.5,
+    min_unit_duration: float = 2.0,
     max_unit_duration: float = 12.0,
     min_unit_gap_for_split_ms: int = 800,
 ) -> List[dict]:
@@ -1910,6 +1916,15 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
         effective_batch_size = 6
         print(f"     ⚠️  中等锚点密度 ({anchor_density:.2f}/段)，缩小批次 {batch_size}→{effective_batch_size}")
 
+    # 一次性加载 proper_nouns,后续按 batch 过滤注入 prompt
+    _batch_proper_nouns: List[str] = []
+    if output_dir:
+        try:
+            from translation_style import load_proper_nouns
+            _batch_proper_nouns = load_proper_nouns(output_dir) or []
+        except Exception:
+            _batch_proper_nouns = []
+
     result = []
     fix_log = []  # 记录所有翻译修复变更（用于 audit JSON）
     prev_context = None
@@ -1955,6 +1970,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
                 "请将完整句意均匀分配到各段，每段都要有实质内容，不要把所有信息堆到第一段。\n"
             )
 
+        # 本批次涉及的专有名词行内提示 (P1-2)
+        proper_noun_hint = build_batch_proper_noun_hint(batch, _batch_proper_nouns)
+
         batch_prompt = (
             (f"{context_hint}\n" if context_hint else "")
             + f"请翻译以下 {len(batch)} 句英文。每行已标注目标字数区间（来自 TTS 朗读时长，超出会音画不同步）。\n\n"
@@ -1964,8 +1982,9 @@ def _translate_llm(segments: List[dict], llm_config: dict, video_title: str = ""
             f"  - 实际字数指译文中的汉字个数, 必须落入给定区间\n"
             f"  - 译文需自然中文, 不照搬英文语序; 专有名词与缩写优先保留原文 (若有约定中文译法则用译法)\n"
             f"  - 前文/下文预览仅供理解上下文, 不要翻译预览内容\n"
-            f"{fragment_hint}\n"
-            f"【翻译任务】\n{user_msg}\n\n"
+            f"{fragment_hint}"
+            + (f"{proper_noun_hint}" if proper_noun_hint else "")
+            + f"\n【翻译任务】\n{user_msg}\n\n"
             f"请逐行输出 {len(batch)} 行, 格式: [N] (实际字数) 译文"
         )
 
@@ -2273,14 +2292,15 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
         "3) 只做必要的表达调整：修复不通顺的语句、消除翻译腔、调整不自然的语序\n"
         "4) 不要追求口语化——目标是准确、通顺、自然的标准中文\n"
         "5) 保持原文的语气和情感基调（教学讲解风格）\n"
-        "6) 专有名词、人名、作品名要翻译完整（如 Home Alone→《小鬼当家》）\n"
-        "7) 专有名词与缩写优先保留原文\n"
-        "8) 每句保持 [编号] 格式，一行一句\n"
-        "9) 如果直译版已经准确通顺，直接输出原文即可，不要为改而改\n"
-        "10) 只输出审校结果，不要解释\n\n"
+        "6) 专有名词处理: 真实人名/品牌/公司/产品名保留英文; 知名作品名优先用约定中文译法; "
+        "其他英文词 (动词/形容词/普通名词/短语) 必须翻译为中文, 不允许中英混杂\n"
+        "7) 每句保持 [编号] 格式，一行一句\n"
+        "8) 如果直译版已经准确通顺，直接输出原文即可，不要为改而改\n"
+        "9) 只输出审校结果，不要解释\n\n"
         "错误示范（不要这样做）：\n"
         "  ✗ 删减信息: '本频道的观众一定会喜欢他的内容' → '他频道超赞' ← 丢失了信息\n"
         "  ✗ 过度口语: '这个概念在数学中非常重要' → '这玩意儿贼重要' ← 不自然\n"
+        "  ✗ 中英混杂: '请 click 这里' / '这个 feature 很有用' ← 普通英文词必须翻译\n"
         "  ✓ 正确审校: '本频道的观众一定会喜欢他的内容，所以一定去看看' → (已通顺，保持原样)"
     )
 
@@ -2292,16 +2312,12 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
 
     for i in range(0, len(pass1_results), batch_size):
         batch = pass1_results[i:i + batch_size]
-        lines = []
-        for j, seg in enumerate(batch):
-            lines.append(
-                f"[{j+1}] EN: {seg['text_en']}\n"
-                f"     直译: {seg['text_zh']}"
-            )
+        lines = build_pass2_lines(batch)
 
         user_msg = (
             f"请审校以下 {len(batch)} 段直译，对照英文原文修正错误并提升表达自然度，"
-            f"保留全部信息，每句用 [编号] 格式输出：\n\n" + "\n\n".join(lines)
+            f"保留全部信息，请把译文长度控制在每行括号标注的字数区间内，"
+            f"每句用 [编号] 格式输出（不要在译文中输出字数标注）：\n\n" + "\n\n".join(lines)
         )
 
         payload = {
@@ -2332,6 +2348,7 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
                     continue  # 保持 Pass 1 结果
                 if adapted and len(adapted.strip()) >= 2:
                     clean = _strip_numbered_prefix(adapted) if re.match(r"^\[\d+\]", adapted) else adapted
+                    clean = strip_char_count_prefix(clean)
                     clean = _strip_markdown(clean, seg["text_en"])
                     pass1_zh = seg["text_zh"]
                     # 统一质量守卫（覆盖: 压缩/扩展/忠实度/未翻译英文/邻段重复/段内重复）
@@ -2408,6 +2425,31 @@ def _translate_llm_two_pass(segments: List[dict], llm_config: dict, video_title:
             print(f"  📐 等时扩展: {len(low_cps)}/{len(final_results)} 段估算 CPS < {expand_threshold}，生成多候选...")
             final_results = _isometric_expand_batch(final_results, low_cps, llm_config)
 
+    # ── P2-1 lite expand: 严重欠速段 5 候选轻量扩展 ──
+    if llm_config.get("low_cps_expand_lite", True) and llm_config.get("api_key"):
+        cps_th = llm_config.get("low_cps_expand_lite_cps", 3.0)
+        ratio_th = llm_config.get("low_cps_expand_lite_ratio", 0.65)
+        n_lite = llm_config.get("low_cps_expand_lite_n", 5)
+        underslow = _identify_severely_underslow_segments(
+            final_results, cps_threshold=cps_th, ratio_threshold=ratio_th)
+        if underslow:
+            print(f"  📐 lite 扩展: {len(underslow)}/{len(final_results)} 段严重欠速 (CPS<{cps_th} 或 ratio<{ratio_th}), {n_lite} 候选...")
+            final_results = _lite_expand_underslow(
+                final_results, underslow, llm_config, n_candidates=n_lite)
+
+    # ── 终态括号注解去重: 在写缓存前统一清理冗余 ()/（）/《》/[]/【】/{} ──
+    stripped_cnt = 0
+    for seg in final_results:
+        orig = seg.get("text_zh", "")
+        if not orig:
+            continue
+        cleaned = strip_parenthetical_annotations(orig)
+        if cleaned != orig:
+            seg["text_zh"] = cleaned
+            stripped_cnt += 1
+    if stripped_cnt:
+        print(f"     🧹 终态去括号注解: {stripped_cnt} 段")
+
     # ── 写入两步翻译审计日志 ──
     if two_pass_log and output_dir:
         audit_dir = Path(output_dir) / "audit"
@@ -2463,6 +2505,49 @@ def _translate_llm_single(batch, endpoint, headers, model, system_prompt, temper
 
 
 
+
+
+def build_batch_proper_noun_hint(batch: List[dict], proper_nouns: List[str]) -> str:
+    """筛选本批次实际涉及的 proper_nouns 生成行内提示。
+
+    检查 batch 中所有 segment 的 text 是否(大小写不敏感)出现 proper_noun 的
+    英文 anchor。命中则返回多行提示;否则返回空串。
+    """
+    if not proper_nouns or not batch:
+        return ""
+    from translation_style import parse_proper_noun
+    batch_text = " ".join(seg.get("text", "") or "" for seg in batch).lower()
+    relevant: List[str] = []
+    for noun_str in proper_nouns:
+        if not isinstance(noun_str, str) or not noun_str.strip():
+            continue
+        en, _zh_alt = parse_proper_noun(noun_str)
+        if en and len(en) >= 2 and en.lower() in batch_text:
+            relevant.append(noun_str.strip())
+    if not relevant:
+        return ""
+    lines = ["本批次涉及专有名词，必须保留原文或使用括号内指定中文译法："]
+    for n in relevant:
+        lines.append(f"  - {n}")
+    return "\n".join(lines) + "\n"
+
+
+def build_pass2_lines(batch: List[dict]) -> List[str]:
+    """构造 Pass 2 审校输入行: '[N] (X-Y字) EN: ... / 直译: ...'
+
+    与 Pass 1 不同, Pass 2 已有 Pass 1 的中文样本, 用它做 jieba 反向估算,
+    得到更精确的字数区间, 防止 Pass 2 改编时长度漂移。
+    """
+    lines: List[str] = []
+    for j, seg in enumerate(batch):
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        sample_zh = seg.get("text_zh", "") or None
+        lo, hi = compute_target_char_range(dur_sec, sample_zh=sample_zh)
+        lines.append(
+            f"[{j+1}] ({lo}-{hi}字) EN: {seg.get('text_en', '').strip()}\n"
+            f"     直译: {seg.get('text_zh', '').strip()}"
+        )
+    return lines
 
 
 def build_unit_translation_lines(batch: List[dict], seg_to_group: dict = None,
@@ -2579,6 +2664,35 @@ _SUBTITLE_SENT_END = "。！？.!?"
 _SUBTITLE_CLAUSE = "，；：、,;:"
 
 
+def split_english_proportional(text_en: str, ratios: List[float]) -> List[str]:
+    """将英文按 ratios 比例切成 len(ratios) 段(以词为单位)。
+
+    用于双语字幕: 中文 unit 按汉字数切多条 subline,
+    英文同步按字符比例分配,使英文中文行级对齐。
+    """
+    n = len(ratios)
+    if n <= 1 or not text_en:
+        return [text_en] * n if n > 0 else [text_en]
+    words = text_en.split()
+    if not words:
+        return [""] * n
+    total_w = len(words)
+    boundaries: List[int] = []
+    cum = 0.0
+    for r in ratios[:-1]:
+        cum += r
+        boundaries.append(int(round(cum * total_w)))
+    parts: List[str] = []
+    last = 0
+    for b in boundaries:
+        # 至少留 1 词,且不越界至最后一段
+        b = max(last + 1, min(total_w - (n - len(parts) - 1), b))
+        parts.append(" ".join(words[last:b]))
+        last = b
+    parts.append(" ".join(words[last:]))
+    return parts
+
+
 def split_unit_into_subtitle_lines(seg: dict, max_chars: int = 14) -> List[dict]:
     """把 sentence-unit 切成多条 SRT 子条目。
 
@@ -2642,13 +2756,48 @@ def split_unit_into_subtitle_lines(seg: dict, max_chars: int = 14) -> List[dict]
     if len(parts) < 2:
         return [{"start": start, "end": end, "text_zh": text_zh, "text_en": text_en}]
 
+    # 短行合并: 任意 part 汉字数 < min_chars_per_line → 并入相邻行 (P2-2)
+    min_chars_per_line = 5
+    def _hanzi(s: str) -> int:
+        return sum(1 for c in s if "一" <= c <= "鿿")
+    changed = True
+    while changed and len(parts) >= 2:
+        changed = False
+        for i, p in enumerate(parts):
+            if _hanzi(p) >= min_chars_per_line:
+                continue
+            # 短行: 选并入方向 (邻居汉字更少 → 合并到那边)
+            if i == 0:
+                target = i + 1
+            elif i == len(parts) - 1:
+                target = i - 1
+            else:
+                target = i - 1 if _hanzi(parts[i - 1]) <= _hanzi(parts[i + 1]) else i + 1
+            if target > i:
+                parts[target] = parts[i] + parts[target]
+            else:
+                parts[target] = parts[target] + parts[i]
+            del parts[i]
+            changed = True
+            break
+
+    if len(parts) < 2:
+        return [{"start": start, "end": end, "text_zh": parts[0] if parts else text_zh, "text_en": text_en}]
+
+    # 各 subline 汉字比例 → 英文按比例切 (P2-4)
+    parts_chars = [sum(1 for c in p if "一" <= c <= "鿿") for p in parts]
+    total_chars = sum(parts_chars) or len(parts)
+    ratios = [c / total_chars for c in parts_chars] if total_chars else \
+             [1.0 / len(parts)] * len(parts)
+    en_parts = split_english_proportional(text_en, ratios) if text_en else [""] * len(parts)
+
     # 时间戳按汉字数等比分配
     dur = end - start
     sub_entries: List[dict] = []
     cum_chars = 0
     cum_start = start
     for i, p in enumerate(parts):
-        p_chars = sum(1 for c in p if "一" <= c <= "鿿")
+        p_chars = parts_chars[i]
         cum_chars += p_chars
         if i == len(parts) - 1:
             p_end = end
@@ -2658,7 +2807,7 @@ def split_unit_into_subtitle_lines(seg: dict, max_chars: int = 14) -> List[dict]
             "start": cum_start,
             "end": p_end,
             "text_zh": p,
-            "text_en": text_en,
+            "text_en": en_parts[i] if i < len(en_parts) else "",
         })
         cum_start = p_end
     return sub_entries
@@ -2686,10 +2835,10 @@ def generate_srt_files(segments: List[dict], output_dir: Path,
                 "text_en": seg.get("text_en", ""),
             }
             sublines = split_unit_into_subtitle_lines(sub_seg, max_chars=max_chars_per_line)
-            # 英文不分行 (整段 text_en 显示在第一条子行, 其余子行只有中文)
+            # 英文按字符比例分段 (P2-4): 每条子行有自己的英文片段
             for sub_i, line in enumerate(sublines):
                 ts = f"{format_srt_time(line['start'])} --> {format_srt_time(line['end'])}"
-                en_show = line['text_en'] if sub_i == 0 else ""
+                en_show = line.get('text_en', '') or ""
                 fen.write(f"{sub_idx}\n{ts}\n{en_show}\n\n")
                 fzh.write(f"{sub_idx}\n{ts}\n{line['text_zh']}\n\n")
                 if en_show:
@@ -3108,9 +3257,9 @@ async def _generate_tts_segments(
                 # 判断调整方向
                 if item["raw_ratio"] > PRE_TTS_SHRINK_THRESHOLD:
                     action = "精简"
-                    # 所有精简段用多候选策略（n=3, 不同温度）
-                    n_candidates = 3
-                    temperatures = [0.3, 0.5, 0.7]
+                    # 多候选策略 (n=6, 温度 [0.2×3, 0.4×3] 同温度重采样保留 LLM 随机性)
+                    n_candidates = 6
+                    temperatures = [0.2, 0.2, 0.2, 0.4, 0.4, 0.4]
                     # 计算允许的最小字数（基于 adaptive_floor）
                     min_chars = max(2, int(len(old_zh) * adaptive_floor))
                     # 给 LLM 一个范围而非精确目标，减少过度压缩
@@ -3968,6 +4117,38 @@ def _identify_high_cps_segments(
     return high_cps
 
 
+def _identify_severely_underslow_segments(
+    segments: List[dict],
+    cps_threshold: float = 3.0,
+    ratio_threshold: float = 0.65,
+    min_zh_chars: int = 3,
+    min_duration_sec: float = 0.5,
+) -> List[int]:
+    """识别严重欠速段(用于轻量扩展候选 P2-1)。
+
+    比 _identify_low_cps_segments 更严格,只针对真正音画不同步的段:
+      - 中文字数 >= min_zh_chars (避免空段误判)
+      - 时长 >= min_duration_sec (太短的段不扩展)
+      - CPS < cps_threshold 或 estimated_ms/target_ms < ratio_threshold
+    """
+    out: List[int] = []
+    for i, seg in enumerate(segments):
+        text_zh = text_for_duration(seg.get("text_zh", ""))
+        zh_chars = sum(1 for c in text_zh if '一' <= c <= '鿿')
+        if zh_chars < min_zh_chars:
+            continue
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        if dur_sec < min_duration_sec:
+            continue
+        target_ms = int(dur_sec * 1000)
+        estimated_cps = zh_chars / dur_sec
+        estimated_ms = _estimate_duration_jieba(text_zh)
+        ratio = estimated_ms / target_ms if target_ms > 0 else 1.0
+        if estimated_cps < cps_threshold or ratio < ratio_threshold:
+            out.append(i)
+    return out
+
+
 def _identify_low_cps_segments(
     segments: List[dict], cps_threshold: float = 3.5,
 ) -> List[int]:
@@ -4329,25 +4510,34 @@ def _align_tts_to_timeline(segments: List[dict], output_dir: Path,
                             else:
                                 slowdown_rejected += 1
                         if not handled:
-                            # 最后手段分级: per-segment atempo 降级 → 截断
+                            # 最后手段: per-segment atempo 调速兜底 (始终先尝试,
+                            # 即使 speed_needed > 1.5 也用 cap 调速,接受高速失真好过断崖式截断)。
+                            # 仅在 ffmpeg 调用本身失败时才退化为截断。
                             speed_needed = tts_len / target_dur
-                            if speed_needed <= 1.35:
-                                # 溢出在 atempo 安全范围内，仅对该段做 atempo 调速
-                                adj_path = tts_dir / f"seg_{idx:04d}_adj.wav"
-                                filt = _build_atempo_filter(speed_needed)
-                                try:
-                                    subprocess.run([
-                                        "ffmpeg", "-i", str(tts_path),
-                                        "-filter:a", filt, "-ar", "16000",
-                                        "-ac", "1", str(adj_path), "-y"
-                                    ], capture_output=True, check=True, timeout=30)
-                                    tts_audio = PydubSegment.from_wav(str(adj_path))
-                                    stats["atempo_fallback"] += 1
-                                    handled = True
-                                except Exception:
-                                    pass
+                            atempo_max = align_cfg.get("max_atempo_fallback", 1.5)
+                            apply_speed = min(speed_needed, atempo_max)
+                            adj_path = tts_dir / f"seg_{idx:04d}_adj.wav"
+                            filt = _build_atempo_filter(apply_speed)
+                            try:
+                                subprocess.run([
+                                    "ffmpeg", "-i", str(tts_path),
+                                    "-filter:a", filt, "-ar", "16000",
+                                    "-ac", "1", str(adj_path), "-y"
+                                ], capture_output=True, check=True, timeout=30)
+                                tts_audio = PydubSegment.from_wav(str(adj_path))
+                                stats["atempo_fallback"] += 1
+                                handled = True
+                                # 调速后仍超出 (speed_needed > atempo_max),
+                                # 此时长度 ≈ tts_len/apply_speed > target_dur,
+                                # 用 fade-out 而非硬截断保留尾部听感
+                                if len(tts_audio) > target_dur:
+                                    fade_ms = min(80, target_dur // 4)
+                                    tts_audio = tts_audio[:target_dur].fade_out(fade_ms)
+                            except Exception:
+                                pass
                             if not handled:
-                                tts_audio = tts_audio[:target_dur]
+                                # ffmpeg 真的失败才走截断 (理论上不应发生)
+                                tts_audio = tts_audio[:target_dur].fade_out(min(80, target_dur // 4))
                                 stats["truncated"] += 1
 
             # 平滑过渡
@@ -5585,6 +5775,187 @@ def _isometric_translate_batch(
     return result
 
 
+def _retranslate_chinglish(
+    segments: List[dict], chinglish_issues: List[dict],
+    llm_config: dict, proper_nouns: List[str],
+) -> List[dict]:
+    """对中英混杂段做单段重译 (强制翻译残留英文)。
+
+    与普通翻译路径不同: prompt 内联 leftover 英文词, 明确要求逐个翻译。
+    proper_nouns 列表显式注入, 避免重译时把人名也译掉。
+    """
+    if not chinglish_issues or not llm_config.get("api_key"):
+        return segments
+    import copy, httpx
+    result = copy.deepcopy(segments)
+    api_url = llm_config["api_url"].rstrip("/")
+    endpoint = api_url if "/chat/completions" in api_url else f"{api_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {llm_config['api_key']}",
+        "Content-Type": "application/json",
+    }
+    model = llm_config["model"]
+
+    pn_block = ""
+    if proper_nouns:
+        pn_block = "保留原文不译的专有名词:\n  - " + "\n  - ".join(
+            str(n) for n in proper_nouns[:20]
+        ) + "\n"
+
+    sys_prompt = (
+        "你是中英翻译修复助手。下面这条中文译文中夹杂了不应该保留的英文词,"
+        "请把它们翻译成中文,只输出修复后的中文译文 (一行)。\n"
+        + pn_block
+        + "规则: (1) 译文中的英文必须严格限定在三类: "
+        "(a) 上面 proper_nouns 列出的真实人名/品牌/作品名 "
+        "(b) URL 或文件路径 (c) 代码标识符/数学符号; "
+        "其他英文一律译为中文。"
+        " (2) 保持原译文意思不变, 仅替换不应保留的英文词。"
+        " (3) 不要解释, 不要输出多行。"
+    )
+    fixed = 0
+    for it in chinglish_issues:
+        idx = it["idx"]
+        if idx >= len(result):
+            continue
+        seg = result[idx]
+        leftover = ", ".join(it.get("leftover", []))
+        user_msg = (
+            f"英文原文: {seg.get('text_en', '')}\n"
+            f"当前中文译文 (含残留英文 [{leftover}]): {seg.get('text_zh', '')}\n\n"
+            f"请输出修复后的中文译文 (单行):"
+        )
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(endpoint, json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 256,
+                }, headers=headers)
+                resp.raise_for_status()
+                new_zh = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            continue
+        new_zh = _strip_think_block(new_zh)
+        new_zh = _strip_markdown(new_zh, seg.get("text_en", ""))
+        new_zh = strip_parenthetical_annotations(new_zh)
+        if new_zh and len(new_zh) >= 2:
+            result[idx]["text_zh"] = new_zh
+            fixed += 1
+    if fixed:
+        print(f"     ✅ 中英混杂重译采纳: {fixed}/{len(chinglish_issues)} 段")
+    return result
+
+
+def _lite_expand_underslow(
+    segments: List[dict], indices: List[int], llm_config: dict,
+    n_candidates: int = 6,
+) -> List[dict]:
+    """轻量扩展严重欠速段: 多次 LLM 调用各产 1 个候选, 选最接近目标时长的。
+
+    候选机制:
+      - n_candidates 次 LLM 调用, 温度按 [0.2×3, 0.4×3] 分布 (同温度重采样)
+      - 同温度多次调用保留 LLM 内在随机性, 比单次调用要 N 个版本更可靠
+      - 每段独立处理; 用 _select_best_candidate(mode='fill') 选最优
+    """
+    import copy
+    import httpx
+
+    # 温度分布 (用户指定): 低温保守 ×3 + 中温多样 ×3
+    base_temps = [0.2, 0.2, 0.2, 0.4, 0.4, 0.4]
+    temps = (base_temps * ((n_candidates // len(base_temps)) + 1))[:n_candidates]
+
+    result = copy.deepcopy(segments)
+    api_url = llm_config["api_url"].rstrip("/")
+    api_key = llm_config["api_key"]
+    model = llm_config["model"]
+    endpoint = (api_url if "/chat/completions" in api_url
+                else f"{api_url}/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    sys_prompt = (
+        "你是英中视频配音翻译专家。下面给你一段英文原文及其当前的中文译文，"
+        "当前译文偏短导致音画不同步, 需要轻量扩展。\n"
+        "规则:\n"
+        "  1) 严格基于英文原文含义,不引入额外信息\n"
+        "  2) 保留专有名词原文/约定中文译法\n"
+        "  3) 输出比当前译文更长,接近目标字数\n"
+        "  4) 适合配音朗读,自然中文,不要堆砌\n"
+        "  5) 只输出扩展后的译文,不要解释、编号或额外标记"
+    )
+
+    adopted = 0
+    for idx in indices:
+        seg = result[idx]
+        text_en = seg.get("text_en") or seg.get("text") or ""
+        old_zh = seg.get("text_zh", "")
+        if not text_en or not old_zh:
+            continue
+        dur_sec = seg.get("end", 0) - seg.get("start", 0)
+        target_chars = max(2, int(dur_sec * 4.5))
+        zh_chars = sum(1 for c in old_zh if '一' <= c <= '鿿')
+        if zh_chars >= target_chars:
+            continue
+        target_ms = int(dur_sec * 1000)
+
+        user_msg = (
+            f"英文原文: {text_en}\n"
+            f"当前译文({zh_chars}字): {old_zh}\n"
+            f"目标字数: {target_chars} (时间窗口 {dur_sec:.1f}秒)\n\n"
+            f"请输出扩展后的中文译文,只输出译文一行。"
+        )
+
+        cands: List[str] = []
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                for t in temps:
+                    try:
+                        resp = client.post(endpoint, json={
+                            "model": model,
+                            "messages": [
+                                {"role": "system", "content": sys_prompt},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "temperature": t,
+                            "max_tokens": 256,
+                        }, headers=headers)
+                        resp.raise_for_status()
+                        cand = resp.json()["choices"][0]["message"]["content"].strip()
+                    except Exception:
+                        continue
+                    cand = _strip_think_block(cand)
+                    cand = _strip_markdown(cand, text_en)
+                    cand = normalize_llm_output(cand, text_en)
+                    cand = strip_parenthetical_annotations(cand)
+                    if cand and len(cand) >= 2 and cand != old_zh:
+                        cands.append(cand)
+        except Exception as e:
+            print(f"     ⚠️  lite expand #{idx} 失败: {e}")
+            continue
+        if not cands:
+            continue
+
+        best = _select_best_candidate(
+            cands, target_ms, old_zh, idx, result,
+            mode="fill",
+            fidelity_threshold=0.25,
+        )
+        if best and best != old_zh:
+            result[idx]["text_zh"] = best
+            adopted += 1
+
+    if adopted:
+        print(f"     ✅ lite 扩展采纳: {adopted}/{len(indices)} 段")
+    return result
+
+
 def _isometric_expand_batch(
     segments: List[dict], low_cps_indices: List[int], llm_config: dict,
 ) -> List[dict]:
@@ -6191,6 +6562,46 @@ async def process_video(config: dict):
                 segments = translate_segments(raw_segments, config)
                 segments = deduplicate_segments(segments)
                 segments = merge_short_segments(segments)
+                # ── rule-base: 中英混杂检测 + 重译 ──
+                try:
+                    from translation_style import (
+                        load_proper_nouns, detect_chinglish_issues,
+                    )
+                    _pn = load_proper_nouns(output_dir) or []
+                    _chinglish = detect_chinglish_issues(segments, _pn)
+                    if _chinglish:
+                        _log(f"  🔧 中英混杂: {len(_chinglish)} 段需重译 → "
+                             f"{[(it['idx'], it['leftover']) for it in _chinglish[:5]]}")
+                        segments = _retranslate_chinglish(
+                            segments, _chinglish, config.get("llm", {}), _pn)
+                    else:
+                        _log(f"  ✅ 中英混杂校验通过")
+                except Exception as _e:
+                    _log(f"  ⚠️  中英混杂校验跳过: {_e}")
+                # ── rule-base 校验: proper_nouns 在中文译文中是否保留 ──
+                try:
+                    from translation_style import (
+                        load_proper_nouns, verify_proper_nouns,
+                    )
+                    _proper_nouns = load_proper_nouns(output_dir)
+                    if _proper_nouns:
+                        _issues = verify_proper_nouns(segments, _proper_nouns)
+                        if _issues:
+                            _log(f"  ⚠️  专有名词校验: {len(_issues)} 处可能误译")
+                            for it in _issues[:8]:
+                                _log(f"     #{it['idx']:2d} '{it['noun']}' "
+                                     f"未保留: {it['text_zh'][:50]}")
+                            if len(_issues) > 8:
+                                _log(f"     ... 共 {len(_issues)} 处")
+                            audit_dir = output_dir / "audit"
+                            audit_dir.mkdir(parents=True, exist_ok=True)
+                            with open(audit_dir / "proper_noun_issues.json",
+                                      "w", encoding="utf-8") as _f:
+                                json.dump(_issues, _f, ensure_ascii=False, indent=2)
+                        else:
+                            _log(f"  ✅ 专有名词校验通过 ({len(_proper_nouns)} 个)")
+                except Exception as _e:
+                    _log(f"  ⚠️  专有名词校验跳过: {_e}")
                 with open(cache_file, "w", encoding="utf-8") as f:
                     json.dump(segments, f, ensure_ascii=False, indent=2)
             except Exception as e:

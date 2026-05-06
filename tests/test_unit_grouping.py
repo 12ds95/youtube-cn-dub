@@ -57,6 +57,17 @@ def test_短unit合并到邻居():
     assert len(units) == 2, f"短 unit 应合并, got {len(units)}: {[u['text'] for u in units]}"
 
 
+def test_默认min_duration_为2秒():
+    """默认 min_unit_duration=2.0,边缘 1.6s unit 应被并到邻居"""
+    segs = [
+        _seg(0.0, 4.0, "First complete sentence one."),
+        _seg(4.0, 5.6, "Short tail piece here."),  # 1.6s 边缘
+        _seg(5.6, 9.0, "Then comes another full sentence ending."),
+    ]
+    units = group_segments_to_units(segs)  # 用默认值
+    assert len(units) == 2, f"1.6s 边缘 unit 应合并 (默认 min=2.0), got {len(units)}: {[u['text'] for u in units]}"
+
+
 def test_超长unit按子句切():
     """单 unit > max_unit_duration 时在子句标点切"""
     long_text = (

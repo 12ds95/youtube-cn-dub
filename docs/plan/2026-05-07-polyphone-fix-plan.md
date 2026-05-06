@@ -72,40 +72,69 @@
    - 实际跑前后, 对比 `_fix_polyphones` 在 segments 上的替换次数和样例
    - 记录到 audit 日志
 
-### 阶段 2: C — g2pM 升级 (已实施, opt-in)
+### 阶段 2: C — g2pM 升级 (已实施 → 已删除)
 
 **实施日期**: 2026-05-07
-**结果**: 集成 g2pM (~30 MB BiLSTM), **默认禁用**, 仅作 opt-in 实验通道
+**删除日期**: 2026-05-07 (同日)
+**最终决策**: **完全删除 g2pM 代码 + 卸载 g2pm 包**
 
-**实测发现** (kCc 117 段 dry-run):
-- jieba-only vs jieba + g2pm 兜底: 11 段差异
-- 11 段中 **5 段是 false positive**: "严重 → 严虫", "权重 → 权虫", "所处 →
-  所触", "处于 → 触于" (g2pM 把 zhòng/chǔ 误判 chóng/chù)
-- 仅 ~2 段是真的扩展覆盖 ("三重注意力" → "三虫注意力" 是 chóng, "连接处"
-  → "连接触" 是 chù)
-- **错误率 ~45%** (5/11), 远超原计划 ~97% 期望
+**实测发现** (kCc 117 段 dry-run, 17 case 对比):
+- g2pM 在我们项目场景准确率 **~65%** (论文 CPP 97%)
+- jieba-only vs jieba + g2pm: 11 段差异中 **5 段 false positive**
+  - "严重 → 严虫" (zhòng 误判 chóng)
+  - "权重 → 权虫" (zhòng 误判 chóng, 多次)
+  - "所处 → 所触" (chǔ 误判 chù)
+  - "处于 → 触于" (chǔ 误判 chù)
+- 仅 ~2 段真扩展覆盖 ("三重注意力 → 三虫", "连接处 → 连接触")
+- **错误率 ~45%**, 远超原 97% 期望
 
-**根因分析**:
-- g2pM 在 CPP 数据集 ~97%, 但 CPP 文风偏新闻/通用语料
-- 我们项目场景是技术视频字幕 (神经网络/数学/编程), domain shift 显著
-- 高频技术词如 "权重 / 严重 / 处于" 在 CPP 训练分布中可能不充分
+**根因 (domain shift)**:
+- g2pM 训练在 CPP (新闻/通用语料), 我们场景是神经网络/数学/编程技术视频
+- 高频技术词 "权重 / 严重 / 处于" 在 CPP 训练分布中不充分
 
-**最终决策**:
-1. **保留 g2pM 集成代码**: `_fix_polyphones(text, use_g2pm_fallback=True)`
-   可显式开启 (例如未来扩展词表外的特殊场景)
-2. **默认禁用** (`use_g2pm_fallback=False`): 当前管线纯 jieba 白名单驱动,
-   实测错误率接近 0%
-3. **测试覆盖**: `tests/test_polyphone_g2pm_fallback.py` 19 用例验证:
-   - g2pm 转 pypinyin 拼音格式正确 (NFC 规范化, 数字声调 → 字符声调)
-   - 兜底 opt-in 逻辑正确
-   - 默认禁用时 false positive case (严重/权重/所处/处于) 不被误替换
-   - g2pm 不可用时降级 jieba-only 不报错
+**为何删除而非保留 opt-in**:
+- 阶段 3 (D 方案) 引入 g2pW (BERT), 同 case 实测 **~88%** 显著优于 g2pM
+- 保留两套兜底引擎增加维护负担, 且 g2pM 在所有 g2pW 修复的 case 上都
+  失败, 没有"互补"价值
+- 用户明确决定: "g2pM 直接删掉, 记录 docs 留痕"
 
-**未来若需更高覆盖率**: 应考虑域内微调 (在自有视频字幕上 fine-tune g2pm)
-或升级 g2pW (BERT, 99.08% CPP), 而非直接启用 vanilla g2pM。
+**留痕**: 此文档 + `docs/research/2026-05-07-polyphone-disambiguation-survey.md`
 
-**配套实施**: 参见 `docs/research/2026-05-07-g2pm-domain-shift-experiment.md`
-(本归档文档同时承担实验记录角色)。
+### 阶段 3: D — g2pW BERT 兜底特定字 (已实施, opt-in)
+
+**实施日期**: 2026-05-07
+
+**g2pW vs g2pM 实测对比** (17 case):
+| 引擎 | 论文 CPP | 我们域实测 | 关键 false positive 修复 |
+|---|---|---|---|
+| g2pM | 97% | **64.7%** | 严重 ✗ / 权重 ✗ / 所处 ✗ / 处于 ✗ / 了解 ✗ |
+| g2pW | 99.08% | **88.2%** | 严重 ✓ / 所处 ✓ / 处于 ✓ / 了解 ✓ |
+
+g2pW 修复了 g2pM 全部 5 个域内 false positive。
+
+**最终架构**:
+1. **主路径**: jieba 白名单 (词典级 ~100% 精度) — 默认开
+2. **g2pW 兜底**: BERT 99% / 我们域 88%, ~450MB 模型, 默认 opt-in
+   (`use_g2pw_fallback=True`)
+3. **特定字**: 兜底仅对 _POLYPHONE_RULES 中的 14 字 + jieba 词长 >= 2 生效
+   (这就是 D 方案的 "特定字" 含义)
+
+**g2pW 模型**:
+- bert-base-chinese (~400MB)
+- G2PWModel-v2-onnx (~50MB)
+- 首次加载下载 ~5min, 后续从 huggingface cache ~10s
+- 推理 ~50ms/句 (CPU)
+
+**测试覆盖**: `tests/test_polyphone_g2pw_fallback.py` ~16 用例
+- 默认禁用锁定
+- 拼音对齐工具 (含标点/英文/数字)
+- 主路径优先 (白名单 > g2pW)
+- g2pW 不可用时降级
+- 域内 false positive 修复 (严重/权重/所处/处于/了解)
+- 三层覆盖扩展 (三重注意力 → 三虫)
+- g2pw + g2pm 同时启用时 g2pw 优先 → **此用例移除** (g2pm 已删)
+
+**依赖**: `pypinyin-g2pw==0.4.0`, `g2pw==0.1.1` (transitive: torch + transformers)
 
 ## 设计原则
 

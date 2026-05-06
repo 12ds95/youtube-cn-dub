@@ -11,7 +11,14 @@
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | `llm.two_pass` | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
 | `llm.isometric` | 0 | 0 | 0 | 0 | 0 | 0 |
-| `nlp_segmentation` | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+| `nlp_segmentation` (transcribe-time) | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+| `unit_grouping.max_duration` (秒) | 18 | 18 | — | 18 | 18 | 18 |
+| `unit_grouping.nlp_segmentation_fallback` | ✅ | ✅ | — | ✅ | ✅ | ✅ |
+
+> `unit_grouping` 在 sentence-unit 阶段把 Whisper 碎片合并到句子单元;
+> 超长 unit 三级兜底切分: 子句标点 → spaCy NLP 句子边界 → word 时间均切。
+> 默认 max_duration=18s 是 edge-tts 安全段长边界与 LLM batch 内 unit 边界
+> 清晰度的折中。
 
 ## 时间线对齐 (alignment)
 

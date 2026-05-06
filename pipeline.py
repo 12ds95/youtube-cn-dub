@@ -890,15 +890,18 @@ def group_segments_to_units(
     config: dict = None,
     *,
     min_unit_duration: float = 2.0,
-    max_unit_duration: float = 12.0,
+    max_unit_duration: float = 18.0,
     min_unit_gap_for_split_ms: int = 800,
+    nlp_segmentation_fallback: bool = True,
 ) -> List[dict]:
     """把 Whisper 碎片合并到 sentence unit。
 
     规则:
     - 当前段以句末标点结尾 → 关闭 unit
     - 段间静音 ≥ min_unit_gap_for_split_ms → 关闭 unit (即使前段无标点)
-    - unit 累计时长 ≥ max_unit_duration → 在子句标点处强制切
+    - unit 累计时长 ≥ max_unit_duration → 在子句标点处强制切; 切不动则
+      用 spaCy NLP 按句子边界兜底 (nlp_segmentation_fallback=True), 仍不够
+      则按 word timestamps 时间均切
     - unit 时长 < min_unit_duration → 与时长更短的相邻 unit 合并
     """
     if not segments:
@@ -909,6 +912,9 @@ def group_segments_to_units(
         min_unit_duration = cfg.get("min_duration", min_unit_duration)
         max_unit_duration = cfg.get("max_duration", max_unit_duration)
         min_unit_gap_for_split_ms = cfg.get("min_gap_for_split_ms", min_unit_gap_for_split_ms)
+        nlp_segmentation_fallback = cfg.get(
+            "nlp_segmentation_fallback", nlp_segmentation_fallback
+        )
 
     # ── Pre-split: 把 seg 内部句末标点处切成多个 piece (preserve _orig_idx) ──
     pieces: List[dict] = []
@@ -968,15 +974,33 @@ def group_segments_to_units(
 
     _flush()
 
-    # ── Pass 2: 超长 unit 按子句切 ──
-    refined: List[dict] = []
-    for u in units:
+    # ── Pass 2: 超长 unit 切分 (clause → NLP → 时间均切 三级兜底) ──
+    def _split_with_fallback(u: dict) -> List[dict]:
+        """三级兜底切分: clause 标点 → spaCy NLP → word timestamps 时间均切。"""
         dur = u["end"] - u["start"]
         if dur <= max_unit_duration:
-            refined.append(u)
-            continue
+            return [u]
         parts = _split_long_unit_by_clause(u, max_unit_duration)
-        refined.extend(parts)
+        if not nlp_segmentation_fallback:
+            return parts
+        # 仍有 part 超长 → spaCy 兜底
+        out: List[dict] = []
+        for p in parts:
+            p_dur = p["end"] - p["start"]
+            if p_dur <= max_unit_duration:
+                out.append(p)
+                continue
+            sub = _split_long_unit_by_nlp(p, max_unit_duration)
+            for s in sub:
+                if s["end"] - s["start"] <= max_unit_duration:
+                    out.append(s)
+                else:
+                    out.extend(_split_long_unit_by_time(s, max_unit_duration))
+        return out
+
+    refined: List[dict] = []
+    for u in units:
+        refined.extend(_split_with_fallback(u))
 
     # ── Pass 3: 短 unit 合并到时长更短的邻居 ──
     if len(refined) <= 1:
@@ -1128,6 +1152,150 @@ def _split_long_unit_by_clause(unit: dict, max_dur: float) -> List[dict]:
                 if w.get("start", 0) >= p["start"] - 1e-3 and w.get("end", 0) <= p["end"] + 1e-3
             ]
     return parts
+
+
+def _split_long_unit_by_nlp(unit: dict, max_dur: float) -> List[dict]:
+    """NLP 兜底切分: 用 spaCy 按句子边界切超长 unit (Whisper 缺标点时)。
+
+    适用场景: _split_long_unit_by_clause 找不到子句标点 → 此函数按 spaCy
+    句子边界切; 没有 spaCy / 仍只识别一句 → 返回原 unit (调用方再降级到时间均切)。
+    """
+    text = unit.get("text", "")
+    dur = unit["end"] - unit["start"]
+    words = unit.get("words")
+    if dur <= max_dur or not text:
+        return [unit]
+
+    try:
+        import spacy
+    except ImportError:
+        return [unit]
+
+    if not hasattr(_split_long_unit_by_nlp, "_nlp"):
+        try:
+            _split_long_unit_by_nlp._nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            _split_long_unit_by_nlp._nlp = None
+    nlp = _split_long_unit_by_nlp._nlp
+    if nlp is None:
+        return [unit]
+
+    doc = nlp(text)
+    sents = list(doc.sents)
+    if len(sents) < 2:
+        return [unit]
+
+    parts: List[dict] = []
+    char_per_sec = len(text) / dur
+    cursor_char = 0
+    cursor_time = unit["start"]
+    member_indices = list(unit.get("_unit_member_indices", []))
+    for sent in sents:
+        sent_text = sent.text.strip()
+        if not sent_text:
+            continue
+        # 用 sent.end_char 在原 text 中定位结束 (spaCy 给的是相对 doc 的 char offset)
+        # 对应到原 text 的位置 = sent.end_char (因 doc 来自 text)
+        end_char = sent.end_char
+        if end_char <= cursor_char:
+            continue
+        end_time = unit["start"] + end_char / char_per_sec if char_per_sec > 0 else unit["end"]
+        end_time = min(end_time, unit["end"])
+        parts.append({
+            "start": cursor_time,
+            "end": end_time,
+            "text": sent_text,
+            "_unit_member_indices": list(member_indices),
+        })
+        cursor_char = end_char
+        cursor_time = end_time
+
+    if not parts:
+        return [unit]
+    # 修正首尾对齐
+    parts[0]["start"] = unit["start"]
+    parts[-1]["end"] = unit["end"]
+
+    # 按 word timestamps 精修边界 (若有 words)
+    if words:
+        for p in parts:
+            p["words"] = [
+                w for w in words
+                if w.get("start", 0) >= p["start"] - 1e-3
+                and w.get("end", 0) <= p["end"] + 1e-3
+            ]
+        # 用真实 word 时间修正 part 边界 (前一段尾词时间 + 后一段首词时间)
+        for i in range(len(parts) - 1):
+            cur_words = parts[i].get("words") or []
+            next_words = parts[i + 1].get("words") or []
+            if cur_words and next_words:
+                parts[i]["end"] = cur_words[-1].get("end", parts[i]["end"])
+                parts[i + 1]["start"] = next_words[0].get("start", parts[i + 1]["start"])
+
+    return parts if len(parts) >= 2 else [unit]
+
+
+def _split_long_unit_by_time(unit: dict, max_dur: float) -> List[dict]:
+    """终极兜底: 单句过长且无标点时, 按 word timestamps 时间均切。
+
+    无 word timestamps 时按字符均切 (时间按字符比例线性分配, 精度差但好过不切)。
+    """
+    text = unit.get("text", "")
+    dur = unit["end"] - unit["start"]
+    if dur <= max_dur or not text:
+        return [unit]
+
+    import math
+    n_parts = max(2, math.ceil(dur / max_dur))
+    target_dur = dur / n_parts
+    member_indices = list(unit.get("_unit_member_indices", []))
+    words = unit.get("words")
+
+    parts: List[dict] = []
+    if words:
+        # word-level 切: 累计时长达到 target_dur 切一段
+        cur_words: List[dict] = []
+        cur_start = unit["start"]
+        for w in words:
+            cur_words.append(w)
+            elapsed = w.get("end", cur_start) - cur_start
+            if elapsed >= target_dur and len(parts) < n_parts - 1:
+                seg_text = " ".join(ww.get("word", "").strip() for ww in cur_words).strip()
+                parts.append({
+                    "start": cur_start,
+                    "end": w.get("end", cur_start + target_dur),
+                    "text": seg_text,
+                    "words": list(cur_words),
+                    "_unit_member_indices": list(member_indices),
+                })
+                cur_start = w.get("end", cur_start + target_dur)
+                cur_words = []
+        if cur_words:
+            seg_text = " ".join(ww.get("word", "").strip() for ww in cur_words).strip()
+            parts.append({
+                "start": cur_start,
+                "end": unit["end"],
+                "text": seg_text,
+                "words": list(cur_words),
+                "_unit_member_indices": list(member_indices),
+            })
+    else:
+        # 字符均切 (无 words 时降级)
+        chars_per_part = max(1, len(text) // n_parts)
+        for k in range(n_parts):
+            ch_start = k * chars_per_part
+            ch_end = (k + 1) * chars_per_part if k < n_parts - 1 else len(text)
+            seg_text = text[ch_start:ch_end].strip()
+            if not seg_text:
+                continue
+            parts.append({
+                "start": unit["start"] + k * target_dur,
+                "end": unit["start"] + (k + 1) * target_dur if k < n_parts - 1 else unit["end"],
+                "text": seg_text,
+                "_unit_member_indices": list(member_indices),
+            })
+
+    return parts if len(parts) >= 2 else [unit]
 
 
 def deduplicate_segments(segments: List[dict]) -> List[dict]:
@@ -5842,9 +6010,32 @@ def _retranslate_chinglish(
         new_zh = _strip_think_block(new_zh)
         new_zh = _strip_markdown(new_zh, seg.get("text_en", ""))
         new_zh = strip_parenthetical_annotations(new_zh)
-        if new_zh and len(new_zh) >= 2:
-            result[idx]["text_zh"] = new_zh
-            fixed += 1
+        if not new_zh or len(new_zh) < 2:
+            continue
+        # 统一质量守卫: 防止 LLM 改写式漂移 / 长度爆炸 / 重复邻段
+        old_zh = seg.get("text_zh", "")
+        is_valid, _reason = _validate_text_adjustment(
+            new_zh, old_zh, idx, result,
+            mode="refine",
+            fidelity_threshold=0.30,
+            compression_floor=0.50,
+            expansion_ceiling=1.6,
+        )
+        if not is_valid:
+            continue
+        # 复跑 chinglish 检测: 仅当新译文确实修复了英文残留才采纳
+        try:
+            from translation_style import detect_chinglish_issues as _dci
+            _re_check = _dci(
+                [{"text_zh": new_zh, "text_en": seg.get("text_en", "")}],
+                proper_nouns,
+            )
+            if _re_check:
+                continue
+        except Exception:
+            pass
+        result[idx]["text_zh"] = new_zh
+        fixed += 1
     if fixed:
         print(f"     ✅ 中英混杂重译采纳: {fixed}/{len(chinglish_issues)} 段")
     return result

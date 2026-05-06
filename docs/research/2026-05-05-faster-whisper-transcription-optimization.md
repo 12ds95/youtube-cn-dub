@@ -2,7 +2,31 @@
 
 > 调研日期: 2026-05-05
 > 修订日期: 2026-05-05（评审 sonnet 3.5 初稿，纠正多处事实错误）
+> **2026-05-06 状态**: 本调研建议已**作废**，由 sentence-unit pipeline 取代 (见下方 "事后验证")
 > 目的: 评审项目 faster-whisper 使用方式，优化句子边界分割
+
+## 事后验证 (2026-05-06)
+
+引入 `group_segments_to_units` (sentence-unit 流水线) 后用同一视频 zjMuIxRvygQ 实测:
+
+| 维度 | Whisper 原始 (transcribe_cache) | Grouping 后 (segments_cache) |
+|------|-------------------------------|-----------------------------|
+| 段数 | 73 | 44 |
+| 破句对数 (前段无标点 + 后段首词带标点) | 5 (即 §2.1 列举的全部 case) | **0** |
+| 平均时长 | ~5s | 7.89s |
+| <2s 短段 | 多个 | 0 (min_unit_duration=2.0) |
+| >12s 超长段 | 0 | 1 (单边界 case, max_unit_duration=12s 已生效) |
+
+**结论**: sentence-unit pipeline 通过 (a) 句末标点 + 静音 gap 跨段合并 (b) `_split_segment_at_internal_sentence_breaks` 内部句号切分 (c) `_split_long_unit_by_clause` 子句标点切分 — 已涵盖本 doc P0/P1 全部建议的目标场景。
+
+逐条:
+- P1 `_fix_sentence_boundary`: 0 个目标 case → 实施无可观测效果, 不实施。
+- P0 VAD 500→700ms: 会让 raw broken 从 5 降到 ~2-3, 但 grouping 全吃掉 → 下游无可观测效果, 不实施。
+- P0 `nlp_segmentation` 默认 True: 与 sentence-unit grouping 功能重复 (split 长段 + merge 短段), 双轨可能冲突, 保持默认 False。
+- P1 NLP split 阈值 8→6s: 同上, 被 grouping 替代。
+- P2 `condition_on_previous_text=False`: 独立幻觉风险话题, 与本 doc 主旨无关, 现有 `deduplicate_segments` 兜底已足够。
+
+下文保留作历史记录。
 
 ## 0. 修订说明
 

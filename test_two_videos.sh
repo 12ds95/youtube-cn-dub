@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 集成测试脚本: 对 output/ 下所有视频执行全功能管线测试
-# 全功能开启: two_pass, nlp_segmentation, post_tts_calibration,
-#   gap_borrowing, video_slowdown, atempo_disabled, feedback_loop
+# 功能开关与 test_pipeline.sh --integrated 对齐:
+#   开启: two_pass, nlp_segmentation, gap_borrowing, video_slowdown,
+#         atempo_disabled, feedback_loop(rate-only), unit_grouping
+#   关闭: refine, isometric, post_tts_calibration
 # 用途: 收集 TTS 时长校准数据 + 回归测试
 
 set -euo pipefail
@@ -102,7 +104,8 @@ run_video() {
     "model": "$LLM_MODEL",
     "batch_size": 8,
     "temperature": 0.3,
-    "two_pass": true
+    "two_pass": true,
+    "isometric": 0
   },
   "nlp_segmentation": true,
   "tts_chain": ["edge-tts", "sherpa-onnx", "piper", "gtts", "pyttsx3"],
@@ -118,10 +121,10 @@ run_video() {
   },
   "skip_steps": $SKIP_STEPS,
   "refine": {
-    "enabled": true,
-    "max_iterations": 5,
+    "enabled": false,
+    "max_iterations": 3,
     "speed_threshold": 1.5,
-    "post_tts_calibration": true,
+    "post_tts_calibration": false,
     "calibration_threshold": 1.30
   },
   "alignment": {
@@ -130,8 +133,7 @@ run_video() {
     "video_slowdown": true,
     "max_slowdown_factor": 0.85,
     "atempo_disabled": true,
-    "feedback_loop": true,
-    "feedback_tolerance": 0.15
+    "feedback_loop": true
   },
   "audio_separation": {
     "enabled": true,
@@ -145,7 +147,7 @@ JSONEOF
 
     echo -e "${YELLOW}🚀 开始运行管线...${NC}"
     echo "   skip_steps: $SKIP_STEPS"
-    echo "   功能: two_pass, nlp_segmentation, post_tts_calibration, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop"
+    echo "   功能: two_pass, nlp_segmentation, gap_borrowing, video_slowdown, atempo_disabled, feedback_loop(rate-only), unit_grouping; 关闭: refine/isometric/post_tts_cal"
     echo ""
 
     local START_TIME

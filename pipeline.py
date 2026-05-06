@@ -5626,14 +5626,76 @@ def _ensure_polyphone_jieba_dict():
         pass
 
 
-def _fix_polyphones(text: str) -> str:
+# g2pM 数字声调 → pypinyin 字符声调
+_G2PM_TONE_DIACRITIC = {
+    '1': '̄',  # 一声 macron
+    '2': '́',  # 二声 acute
+    '3': '̌',  # 三声 caron
+    '4': '̀',  # 四声 grave
+    '5': '',        # 轻声 无标记
+}
+
+_G2PM_VOWEL_PRIORITY = 'aoeüiuv'  # 主元音优先级 (a > o > e > ü > i/u/v)
+
+
+def _g2pm_to_pypinyin(p: str) -> str:
+    """g2pM 'le5'/'jue2'/'hang2' → pypinyin 'le'/'jué'/'háng'。
+
+    返回 NFC 规范化的字符串 (与 pypinyin 输出一致, 单 codepoint 的 ó/é/ǚ)。
+    """
+    import unicodedata
+    if not p or not p[-1].isdigit():
+        return p
+    base, tone = p[:-1], p[-1]
+    # ü 在 g2pm 用 v 表示; pypinyin 用 ü
+    base = base.replace('v', 'ü')
+    if tone == '5':
+        return base
+    diacritic = _G2PM_TONE_DIACRITIC.get(tone, '')
+    if not diacritic:
+        return base
+    # 找主元音加声调
+    for vowel in _G2PM_VOWEL_PRIORITY:
+        if vowel in base:
+            idx = base.index(vowel)
+            return unicodedata.normalize(
+                'NFC', base[:idx + 1] + diacritic + base[idx + 1:])
+    return base
+
+
+_G2PM_INSTANCE = None
+
+
+def _get_g2pm():
+    """懒加载 g2pM, 失败时返回 None (降级到 jieba-only)。"""
+    global _G2PM_INSTANCE
+    if _G2PM_INSTANCE is False:
+        return None
+    if _G2PM_INSTANCE is None:
+        try:
+            from g2pM import G2pM
+            _G2PM_INSTANCE = G2pM()
+        except Exception:
+            _G2PM_INSTANCE = False
+            return None
+    return _G2PM_INSTANCE
+
+
+def _fix_polyphones(text: str, use_g2pm_fallback: bool = False) -> str:
     """对 TTS 输入文本做多音字同音替换，纠正 edge-tts 高频误读。
 
-    纯 jieba 词级白名单守卫:
-      - 字所在 jieba 词命中白名单 (相等或包含子串) → 替换为同音字
-      - 否则保留原字 (默认 edge-tts 读音, 大概率正确)
-    设计原则: 漏一个比错一个好。pypinyin 字级判定不可靠 (CPP ~87%),
-    词典级白名单虽然需要手维护, 但精度可控。
+    双层守卫 (jieba 白名单 + g2pM 神经兜底):
+      1) 主路径: 字所在 jieba 词命中白名单 → 替换为同音字
+      2) 兜底 (opt-in): 若 use_g2pm_fallback=True, 用 g2pM (BiLSTM, ~97%
+         CPP) 判定字读音; 若与 _POLYPHONE_RULES 目标读音匹配且词长 >= 2
+         时也替换。**默认禁用** — kCc dry-run 实测 g2pM 在 "严重/权重/
+         所处/处于" 等词上误判 chóng/chù, 引入 ~50% false positive,
+         对技术视频字幕场景反不如纯 jieba-only。配置 opt-in 仅供未来
+         扩展词表外的特殊场景使用。
+
+    设计原则: 漏一个比错一个好。jieba 白名单词典级精度 ~100%。
+
+    g2pM 不可用时自动降级为 jieba-only 模式, 不报错。
     """
     if not text:
         return text
@@ -5648,17 +5710,43 @@ def _fix_polyphones(text: str) -> str:
 
     char_to_word = _build_char_to_word_map(text, words)
     chars = list(text)
+    replaced: Set[int] = set()
+
+    # 主路径: jieba 白名单
     for i, c in enumerate(text):
         if c not in _POLYPHONE_RULES:
             continue
         word = char_to_word.get(i, "")
         if not word:
             continue
-        # 字可能对应多个 target_pinyin, 取首个白名单命中即替换
         for _target_py, (replacement, whitelist) in _POLYPHONE_RULES[c].items():
             if word in whitelist or any(w in word for w in whitelist):
                 chars[i] = replacement
+                replaced.add(i)
                 break
+
+    # 兜底: g2pM 神经消歧 (仅对未替换且词长 >= 2 的 _POLYPHONE_RULES 字)
+    if use_g2pm_fallback:
+        nlp = _get_g2pm()
+        if nlp is not None:
+            try:
+                pys_g2pm = nlp(text, tone=True, char_split=False)
+            except Exception:
+                pys_g2pm = None
+            if pys_g2pm and len(pys_g2pm) == len(text):
+                for i, c in enumerate(text):
+                    if i in replaced or c not in _POLYPHONE_RULES:
+                        continue
+                    word = char_to_word.get(i, "")
+                    if len(word) < 2:
+                        continue  # 单字成词 → 守卫拒绝, 避免 g2pM 误判
+                    py = _g2pm_to_pypinyin(pys_g2pm[i])
+                    rule = _POLYPHONE_RULES[c].get(py)
+                    if rule:
+                        replacement, _wl = rule
+                        chars[i] = replacement
+                        replaced.add(i)
+
     return ''.join(chars)
 
 

@@ -72,18 +72,40 @@
    - 实际跑前后, 对比 `_fix_polyphones` 在 segments 上的替换次数和样例
    - 记录到 audit 日志
 
-### 阶段 2 (条件): C — g2pM 升级
+### 阶段 2: C — g2pM 升级 (已实施, opt-in)
 
-**触发条件**: 阶段 1 验收后, 若仍有 ≥3% 替换错误率 (人工或脚本评估), 升级到 g2pM。
+**实施日期**: 2026-05-07
+**结果**: 集成 g2pM (~30 MB BiLSTM), **默认禁用**, 仅作 opt-in 实验通道
 
-**工作项**:
-1. `pip install g2pm` (~30 MB BiLSTM 模型)
-2. 改造 `_fix_polyphones` 优先用 g2pM 判定多音字读音, pypinyin 仅做兜底
-3. 跑同样 TDD 测试矩阵 + 端到端验证
+**实测发现** (kCc 117 段 dry-run):
+- jieba-only vs jieba + g2pm 兜底: 11 段差异
+- 11 段中 **5 段是 false positive**: "严重 → 严虫", "权重 → 权虫", "所处 →
+  所触", "处于 → 触于" (g2pM 把 zhòng/chǔ 误判 chóng/chù)
+- 仅 ~2 段是真的扩展覆盖 ("三重注意力" → "三虫注意力" 是 chóng, "连接处"
+  → "连接触" 是 chù)
+- **错误率 ~45%** (5/11), 远超原计划 ~97% 期望
 
-**预期**: 替换正确率达到 ~97% (CPP benchmark).
+**根因分析**:
+- g2pM 在 CPP 数据集 ~97%, 但 CPP 文风偏新闻/通用语料
+- 我们项目场景是技术视频字幕 (神经网络/数学/编程), domain shift 显著
+- 高频技术词如 "权重 / 严重 / 处于" 在 CPP 训练分布中可能不充分
 
-如果 C 仍不够 (<97%) 且关键场景仍出错, 才考虑阶段 3 (g2pW BERT)。
+**最终决策**:
+1. **保留 g2pM 集成代码**: `_fix_polyphones(text, use_g2pm_fallback=True)`
+   可显式开启 (例如未来扩展词表外的特殊场景)
+2. **默认禁用** (`use_g2pm_fallback=False`): 当前管线纯 jieba 白名单驱动,
+   实测错误率接近 0%
+3. **测试覆盖**: `tests/test_polyphone_g2pm_fallback.py` 19 用例验证:
+   - g2pm 转 pypinyin 拼音格式正确 (NFC 规范化, 数字声调 → 字符声调)
+   - 兜底 opt-in 逻辑正确
+   - 默认禁用时 false positive case (严重/权重/所处/处于) 不被误替换
+   - g2pm 不可用时降级 jieba-only 不报错
+
+**未来若需更高覆盖率**: 应考虑域内微调 (在自有视频字幕上 fine-tune g2pm)
+或升级 g2pW (BERT, 99.08% CPP), 而非直接启用 vanilla g2pM。
+
+**配套实施**: 参见 `docs/research/2026-05-07-g2pm-domain-shift-experiment.md`
+(本归档文档同时承担实验记录角色)。
 
 ## 设计原则
 

@@ -3,18 +3,25 @@
 # 跳过: download, extract, separate (保留已有的 original.mp4, audio.wav, 分离音频)
 #
 # 用法:
-#   bash test_pipeline.sh              # 快速测试: 跳过 transcribe+translate，复用缓存 (默认)
-#   bash test_pipeline.sh --integrated # 集成测试: 全功能开启，跳过 transcribe（用缓存）
-#   bash test_pipeline.sh --baseline   # 回归测试: 全功能关闭，验证不引入回归
-#   bash test_pipeline.sh --fast       # 快速测试 (跳过 transcribe+translate，复用缓存)
-#   bash test_pipeline.sh --refine     # 仅测翻译+迭代优化 (跳过 TTS/字幕/合成)
-#   bash test_pipeline.sh --retranslate # 删除翻译缓存从翻译开始，跳过 TTS 后步骤
+#   bash test_pipeline.sh [MODE] [VIDEO_ID]   # MODE 与 VIDEO_ID 顺序无关
+#   bash test_pipeline.sh                      # MODE=fast, VIDEO_ID=zjMuIxRvygQ (默认)
+#   bash test_pipeline.sh --integrated         # 默认视频, integrated 模式
+#   bash test_pipeline.sh --integrated d4EgbgTm0Bg  # 指定视频 + 模式
+#   bash test_pipeline.sh d4EgbgTm0Bg --fast   # 顺序无关
+#
+# MODE 选项:
+#   --full        # 完整流程 (从 download 开始, 实际跳过 download/extract/separate, 跑 transcribe→...)
+#   --integrated  # 集成测试: 全功能开启, 用 transcribe 缓存
+#   --baseline    # 回归测试: 全功能关闭
+#   --fast        # 快速测试: 用 segments_cache, 跳过 transcribe+translate (默认)
+#   --tts-only    # 仅 TTS+预检
+#   --refine      # 仅迭代优化
+#   --retranslate # 删除翻译缓存从翻译开始, 跳过 TTS 后步骤
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VIDEO_ID="zjMuIxRvygQ"
-VIDEO_DIR="output/$VIDEO_ID"
+DEFAULT_VIDEO_ID="zjMuIxRvygQ"
 
 # 颜色
 GREEN='\033[0;32m'
@@ -35,32 +42,72 @@ if [ -z "$LLM_API_KEY" ]; then
     exit 1
 fi
 
+# 解析参数: 支持 mode flag (--xxx) 和 VIDEO_ID 任意顺序
+MODE="fast"
+VIDEO_ID="$DEFAULT_VIDEO_ID"
+for arg in "$@"; do
+    case "$arg" in
+        --full)        MODE="full" ;;
+        --integrated)  MODE="integrated" ;;
+        --baseline)    MODE="baseline" ;;
+        --fast)        MODE="fast" ;;
+        --tts-only)    MODE="tts-only" ;;
+        --refine)      MODE="refine" ;;
+        --retranslate) MODE="retranslate" ;;
+        --*)
+            echo -e "${RED}❌ 未知参数: $arg${NC}"
+            exit 1
+            ;;
+        *)
+            VIDEO_ID="$arg"
+            ;;
+    esac
+done
+VIDEO_DIR="output/$VIDEO_ID"
+
 if [ ! -d "$VIDEO_DIR" ]; then
     echo -e "${RED}❌ 测试视频目录不存在: $VIDEO_DIR${NC}"
     exit 1
 fi
 
-# 检查必要文件
-for f in original.mp4 audio.wav info.json; do
+# 检查必要文件 (full/baseline 走完整流程会从 transcribe 开始, 不强制 audio.wav)
+case "$MODE" in
+    full|baseline)
+        REQUIRED_FILES=(original.mp4)
+        ;;
+    *)
+        REQUIRED_FILES=(original.mp4 audio.wav)
+        ;;
+esac
+for f in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$VIDEO_DIR/$f" ]; then
         echo -e "${RED}❌ 缺少必要文件: $VIDEO_DIR/$f${NC}"
         exit 1
     fi
 done
 
-MODE="fast"
-case "${1:-}" in
-    --full)        MODE="full" ;;
-    --integrated)  MODE="integrated" ;;
-    --baseline)    MODE="baseline" ;;
-    --fast)        MODE="fast" ;;
-    --tts-only)    MODE="tts-only" ;;
-    --refine)      MODE="refine" ;;
-    --retranslate) MODE="retranslate" ;;
-esac
-
 echo -e "${YELLOW}🧪 管线端到端测试${NC}"
-echo "   视频: $VIDEO_ID (Quaternions and 3d rotation, 359s)"
+# 视频描述: 从 info.json 读 title/duration, 没有就只显示 ID
+INFO_FILE="$VIDEO_DIR/info.json"
+if [ -f "$INFO_FILE" ]; then
+    VIDEO_DESC=$(python3 -c "
+import json
+try:
+    d = json.load(open('$INFO_FILE'))
+    title = d.get('title', '')
+    dur = d.get('duration', 0)
+    print(f'{title}, {int(dur)}s' if title else '')
+except Exception:
+    pass
+" 2>/dev/null)
+    if [ -n "$VIDEO_DESC" ]; then
+        echo "   视频: $VIDEO_ID ($VIDEO_DESC)"
+    else
+        echo "   视频: $VIDEO_ID"
+    fi
+else
+    echo "   视频: $VIDEO_ID"
+fi
 echo "   目录: $VIDEO_DIR"
 echo "   模式: $MODE"
 echo ""
@@ -127,6 +174,8 @@ case "$MODE" in
         ;;
 esac
 
+# 清理上次残留 (ctrl+c 中断后 mktemp 会因模板冲突失败)
+rm -f /tmp/test_pipeline_*.json 2>/dev/null
 TMPCONFIG=$(mktemp /tmp/test_pipeline_XXXXXX.json)
 trap "rm -f '$TMPCONFIG'" EXIT
 

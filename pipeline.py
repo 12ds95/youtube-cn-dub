@@ -5585,12 +5585,11 @@ def _select_best_candidate(
         else:
             if len(cand) >= len(original_zh):
                 continue
-        # 统一质量守卫 (compression_floor 自适应: 基于 target 与原文比例)
+        # 统一质量守卫 (compression_floor 自适应)
+        # _select_best_candidate 是"按时间选优"的 selector,不该当严格 validator;
+        # 调用方负责决定候选可接受度,本函数仅过滤极端破碎的候选。
         guard_mode = "expand" if mode == "fill" else "shrink"
-        _comp_floor = 0.60
-        if guard_mode == "shrink" and target_ms > 0 and len(original_zh) > 0:
-            _target_chars = max(2, int(target_ms / 222))  # ~222ms/char
-            _comp_floor = max(0.40, _target_chars / len(original_zh) - 0.05)
+        _comp_floor = 0.20  # 宽松,主要由 fidelity_threshold 防内容跑偏
         is_valid, _reason = _validate_text_adjustment(
             cand, original_zh, idx, segments,
             mode=guard_mode,

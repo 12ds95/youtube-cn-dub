@@ -67,6 +67,8 @@ def test_separate_audio_no_cache():
         output_dir = Path(tmpdir)
         video_path = output_dir / "original.mp4"
         video_path.write_bytes(b"fake video")
+        # 预创建 audio_hq.wav 跳过 ffmpeg 步骤, 直接走到 demucs 入口
+        (output_dir / "audio_hq.wav").write_bytes(b"fake wav")
 
         # Mock demucs 未安装
         with patch.dict("sys.modules", {"demucs": None, "demucs.api": None}):

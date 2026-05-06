@@ -58,7 +58,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Set
 
 from text_utils import (
     _strip_think_block,
@@ -5521,54 +5521,144 @@ def _refine_with_llm(
 # pypinyin 短语级消歧自动判定每个多音字的上下文读音，
 # 仅当正确读音 ≠ edge-tts 默认读音时，替换为同音字。
 # 格式: {多音字: {需替换的拼音: 同音替换字}}
-_POLYPHONE_HOMOPHONE_MAP: Dict[str, Dict[str, str]] = {
-    '了': {'liǎo': '瞭'},     # edge-tts 默认 le → liǎo 时替换为 瞭
-    '行': {'háng': '杭'},      # edge-tts 默认 xíng → háng 时替换为 杭
-    '重': {'chóng': '虫'},     # edge-tts 默认 zhòng → chóng 时替换为 虫
-    '调': {'tiáo': '条'},      # edge-tts 默认 diào → tiáo 时替换为 条
-    '率': {'shuài': '帅'},     # edge-tts 默认 lǜ → shuài 时替换为 帅
-    '量': {'liáng': '良'},     # edge-tts 默认 liàng → liáng 时替换为 良
-    '传': {'zhuàn': '撰'},     # edge-tts 默认 chuán → zhuàn 时替换为 撰
-    '应': {'yīng': '英'},      # edge-tts 默认 yìng → yīng 时替换为 英
-    '乐': {'yuè': '月'},       # edge-tts 默认 lè → yuè 时替换为 月
-    '的': {'dí': '滴'},        # edge-tts 默认 de → dí 时替换为 滴
-    '差': {'chāi': '拆'},      # edge-tts 默认 chā → chāi 时替换为 拆
-    '数': {'shǔ': '属'},       # edge-tts 默认 shù → shǔ 时替换为 属
-    '处': {'chù': '触'},       # edge-tts 默认 chǔ → chù 时替换为 触
+_POLYPHONE_RULES: Dict[str, Dict[str, Tuple[str, Set[str]]]] = {
+    '了': {'liǎo': ('瞭', {
+        '了解', '了断', '了结', '明了', '了如指掌', '了不起', '了悟',
+        '了无', '一目了然', '不了了之', '了不得', '了然',
+    })},
+    '觉': {'jué': ('决', {
+        '觉得', '感觉', '直觉', '觉悟', '警觉', '不觉', '自觉',
+        '错觉', '幻觉', '味觉', '视觉', '听觉', '触觉', '嗅觉',
+        '知觉', '不知不觉', '发觉', '察觉', '觉醒',
+    })},
+    '行': {'háng': ('杭', {
+        '银行', '行业', '行列', '同行', '行家', '内行', '外行',
+        '一行', '行情', '行话', '行当', '行会', '行规', '本行',
+        '改行', '排行',
+    })},
+    '重': {'chóng': ('虫', {
+        '重新', '重复', '重叠', '重逢', '重申', '重温', '重做',
+        '重启', '重审', '重读', '重唱', '重提', '重弹', '重头',
+        '重写', '重置', '重建', '重组', '重逢', '重生', '重现',
+    })},
+    '调': {'tiáo': ('条', {
+        '协调', '调和', '调节', '调整', '调理', '调养', '调解',
+        '调度', '调试', '调皮', '调侃', '空调', '调味', '调料',
+        '调剂', '调教',
+    })},
+    '率': {'shuài': ('帅', {
+        '率领', '率先', '率众', '统率', '直率', '坦率', '草率',
+        '轻率', '率性', '率真', '表率',
+    })},
+    '量': {'liáng': ('良', {
+        '测量', '丈量', '量度', '估量', '思量', '商量', '掂量',
+        '量地',
+    })},
+    '传': {'zhuàn': ('撰', {
+        '自传', '传记', '列传', '正传', '外传', '小传', '内传',
+        '别传', '评传',
+    })},
+    '应': {'yīng': ('英', {
+        '应该', '应当', '应有', '应得', '应承', '答应', '理应',
+        '应允', '应分', '应名',
+    })},
+    '乐': {'yuè': ('月', {
+        '音乐', '乐器', '乐曲', '乐谱', '乐章', '声乐', '管乐',
+        '器乐', '雅乐', '乐队', '乐团', '乐理', '乐坛',
+    })},
+    '的': {'dí': ('滴', {
+        '的确', '的的确确',
+    })},
+    '差': {'chāi': ('拆', {
+        '出差', '差使', '美差', '兼差', '公差', '差事', '差遣',
+    })},
+    '数': {'shǔ': ('属', {
+        '数落', '不可胜数', '历历可数', '数典忘祖', '数一数二',
+        '数得着', '屈指可数', '数不胜数',
+    })},
+    '处': {'chù': ('触', {
+        '此处', '何处', '深处', '处所', '到处', '处处', '出处',
+        '住处', '坏处', '好处', '用处', '别处', '远处', '近处',
+        '某处', '随处', '一处', '两处', '各处', '空处', '暗处',
+        '明处', '难处', '益处', '长处', '短处',
+    })},
 }
+
+# 向后兼容别名 (旧测试/外部代码可能引用)
+_POLYPHONE_HOMOPHONE_MAP: Dict[str, Dict[str, str]] = {
+    c: {p: r for p, (r, _wl) in v.items()}
+    for c, v in _POLYPHONE_RULES.items()
+}
+
+
+def _build_char_to_word_map(text: str, words: List[str]) -> Dict[int, str]:
+    """字符索引 → jieba 分词的映射 (索引指向该字所在的完整词)。"""
+    out: Dict[int, str] = {}
+    cursor = 0
+    for w in words:
+        for k in range(len(w)):
+            out[cursor + k] = w
+        cursor += len(w)
+    return out
+
+
+_POLYPHONE_JIEBA_DICT_LOADED = False
+
+
+def _ensure_polyphone_jieba_dict():
+    """把白名单词加进 jieba 用户词典, 防止 jieba 默认拆字 (如 '明了' → '明'/'了')。
+
+    幂等, 仅初始化一次。
+    """
+    global _POLYPHONE_JIEBA_DICT_LOADED
+    if _POLYPHONE_JIEBA_DICT_LOADED:
+        return
+    try:
+        import jieba
+        for char_rules in _POLYPHONE_RULES.values():
+            for _replacement, whitelist in char_rules.values():
+                for w in whitelist:
+                    if len(w) >= 2:
+                        # 高 freq 让 jieba 优先选这些词作为分词结果
+                        jieba.add_word(w, freq=10000)
+        _POLYPHONE_JIEBA_DICT_LOADED = True
+    except Exception:
+        pass
 
 
 def _fix_polyphones(text: str) -> str:
     """对 TTS 输入文本做多音字同音替换，纠正 edge-tts 高频误读。
 
-    使用 pypinyin 短语级消歧确定每个多音字的正确读音，
-    仅在 edge-tts 默认读音与正确读音不一致时替换为同音字。
+    纯 jieba 词级白名单守卫:
+      - 字所在 jieba 词命中白名单 (相等或包含子串) → 替换为同音字
+      - 否则保留原字 (默认 edge-tts 读音, 大概率正确)
+    设计原则: 漏一个比错一个好。pypinyin 字级判定不可靠 (CPP ~87%),
+    词典级白名单虽然需要手维护, 但精度可控。
     """
     if not text:
         return text
-    if not any(c in _POLYPHONE_HOMOPHONE_MAP for c in text):
+    if not any(c in _POLYPHONE_RULES for c in text):
         return text
     try:
-        from pypinyin import pinyin, Style
-        py_result = pinyin(text, style=Style.TONE, heteronym=False)
+        import jieba
+        _ensure_polyphone_jieba_dict()
+        words = list(jieba.cut(text))
     except Exception:
         return text
+
+    char_to_word = _build_char_to_word_map(text, words)
     chars = list(text)
-    text_pos = 0
-    for py_entry in py_result:
-        if text_pos >= len(chars):
-            break
-        c = chars[text_pos]
-        is_cjk = '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf'
-        if is_cjk:
-            if c in _POLYPHONE_HOMOPHONE_MAP:
-                replacement = _POLYPHONE_HOMOPHONE_MAP[c].get(py_entry[0])
-                if replacement:
-                    chars[text_pos] = replacement
-            text_pos += 1
-        else:
-            # pypinyin 将连续非汉字合并为单条目，按条目文本长度跳过
-            text_pos += len(py_entry[0])
+    for i, c in enumerate(text):
+        if c not in _POLYPHONE_RULES:
+            continue
+        word = char_to_word.get(i, "")
+        if not word:
+            continue
+        # 字可能对应多个 target_pinyin, 取首个白名单命中即替换
+        for _target_py, (replacement, whitelist) in _POLYPHONE_RULES[c].items():
+            if word in whitelist or any(w in word for w in whitelist):
+                chars[i] = replacement
+                break
     return ''.join(chars)
 
 

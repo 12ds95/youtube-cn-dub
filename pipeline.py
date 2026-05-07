@@ -44,6 +44,31 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# ── 修补 Python 关停期 SemLock._cleanup 的 FileNotFoundError 噪音 ─────
+# 现象: pipeline 主流程结束后, multiprocessing util._run_finalizers 触发
+# Semaphore 的 _cleanup 调用 sem_unlink, 若该 semaphore 已被其它路径
+# (子库 / resource_tracker 自身的 EOF cleanup) unlink, 则报
+# FileNotFoundError 并打印整段 traceback. 这是无害噪音, 但难看.
+# 修补: 包一层 try/except FileNotFoundError, 仍调用 unregister 让
+# resource_tracker 不再把它当作 leaked semaphore.
+# 必须在任何 multiprocessing.Semaphore 被创建前完成补丁.
+import multiprocessing.synchronize as _mp_sync
+
+
+def _safe_sem_cleanup(name):
+    from multiprocessing.resource_tracker import unregister
+    try:
+        _mp_sync.sem_unlink(name)
+    except FileNotFoundError:
+        pass  # 已被其它路径 unlink, 安全忽略
+    try:
+        unregister(name, "semaphore")
+    except Exception:
+        pass
+
+
+_mp_sync.SemLock._cleanup = staticmethod(_safe_sem_cleanup)
+
 import argparse
 import asyncio
 import json
@@ -7297,18 +7322,11 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        # 优雅关闭 multiprocessing resource_tracker（避免守护进程残留）。
-        # 历史方案是 SIGKILL，但会触发 Python 关停期"process died unexpectedly,
-        # relaunching"重启 → 重启后的 tracker 处理旧 tracker 已发的 UNREGISTER
-        # 消息时找不到 name，抛 KeyError。改用 _stop()：关闭 pipe 让 tracker
-        # 读到 EOF 后正常退出，不会触发重启路径。
-        try:
-            import multiprocessing.resource_tracker as _rt
-            _tracker = getattr(_rt, "_resource_tracker", None)
-            if _tracker is not None and getattr(_tracker, "_fd", None) is not None:
-                _tracker._stop()
-        except (ProcessLookupError, OSError, AttributeError, ChildProcessError):
-            pass
+    main()
+    # 不再显式 _stop() / SIGKILL multiprocessing.resource_tracker：
+    # 历史 SIGKILL 触发 Python 关停期 tracker 重启 → KeyError；改用 _stop()
+    # 又使 tracker 在 EOF 处的 leaked-semaphore 检查与后续 _run_finalizers
+    # 的 sem_unlink 形成竞态，打出 FileNotFoundError traceback。
+    # pipeline.py 是一次性脚本，进程退出时 OS 会回收 tracker 子进程，
+    # 让 Python 自然关停即可；上方 _safe_sem_cleanup 已兜底
+    # finalizer 路径的 FileNotFoundError 噪音。

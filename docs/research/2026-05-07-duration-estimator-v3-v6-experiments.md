@@ -518,7 +518,90 @@ v8→v9 的微改进+回退证明: **当前数据/特征/架构已接近最优**
 继续在 8327 净样本 + 23 维特征上调优 ROI 极低.
 真改进需要 (a) 更多数据, 或 (b) 端到端 LLM-aware 验证, 或 (c) 架构革新.
 
-## 方法论复盘 (8 次迭代收敛)
+## iter9: v10 长句 rule 兜底实验 — 2026-05-08 (失败回滚)
+
+### 假设
+
+iter8 错误分析显示 35-60 长句 mean residual −580 ms / 60+ 段 −426 ms (under-predict).
+假设: post-hoc rule 加固定 offset 修正长句 bias, 不重训模型, 风险局限.
+
+### Rule 设计 (保守 70% 修正)
+
+```python
+def _apply_long_sentence_bias(text_zh, pred):
+    chars = _meaningful_char_count(text_zh)
+    if chars >= 60:
+        return pred + 300.0  # 70% × 426
+    if chars >= 35:
+        return pred + 400.0  # ~70% × 580
+    return pred  # 短-中段不动 (本身 over-predict)
+```
+
+DURATION_LONG_BIAS=0 可关闭。
+
+### 端到端实测 (三视频)
+
+| 指标 | 视频 | v8 (no rule) | v10 (rule) | Δ |
+|---|---|---|---|---|
+| mean | zjMu | 0.9975 | 0.9821 | ↓ 偏离 +0.015 |
+|  | d4Eg | 1.0141 | **0.9996** | ✅ 偏离 -0.014 (近完美) |
+|  | kCc | 1.0051 | 0.9867 | ↓ 偏离 +0.013 |
+| 合规率 | zjMu | 100% | 97.2% | ↓ -2.8pp |
+|  | d4Eg | 95.5% | 95.0% | ↓ -0.5pp |
+|  | kCc | 97.4% | 97.6% | +0.2pp |
+| atempo | zjMu | 0 | 1 | ↓ +1 |
+|  | d4Eg | 10 | 11 | ↓ +1 |
+|  | kCc | 13 | 13 | 持平 |
+| **within_tolerance** | zjMu | 17 | **11** | -35% |
+|  | d4Eg | 88 | **63** | -28% |
+|  | kCc | 281 | **174** | **-38%** |
+| **padded** | zjMu | 17 | 23 | +35% |
+|  | d4Eg | 112 | 141 | +26% |
+|  | kCc | 309 | **420** | **+36%** |
+
+### 失败根因
+
+1. **Zero-sum 转移**: rule 让 estimator 长句 over-predict → LLM 翻译变短 → TTS
+   实际比 budget 短 → padded 大量增加. 问题从 "TTS 太长 (atempo)" 转移到 "TTS
+   太短 (padded)", 总分 (within_tolerance) 显著降低.
+
+2. **Per-video bias 不一致**: 错误分析数据 mean residual 是三视频混合统计:
+   - zjMu: residual mean **+496 ms** (overall over-predict, 长句也未必 under)
+   - d4Eg: +360 ms
+   - kCc: −457 ms (真正 under-predict)
+
+   单一 rule 加 +400/300 在 zjMu 和 d4Eg 短-中长 (35-60) 段是 over-correction,
+   只在 kCc 上方向正确但量级也不准.
+
+3. **未考虑 LLM 反馈**: estimator 估算被 LLM 用于决定翻译长度. estimator 准确度
+   提升若不与 LLM 行为同步建模, 改进可能反弹 (LLM 适应了旧 estimator 的偏差).
+
+### 决策: 回滚 v10 rule
+
+`duration_estimator.py` 已 revert, rule 函数完全移除. v8 模型保持默认.
+
+### v10 学习 → v11+ 真正可行方向
+
+1. **Per-segment domain detection**: 用 text features (英文密度/数学符号/术语词典)
+   在线判定 domain → 不同 rule. 但仍可能 under-fit.
+2. **Per-video calibration**: 用前 N 段实测 ratio 校准本视频后续段, 但 N 段冷启动
+   误差累积.
+3. **--integrated A/B**: 让 LLM 真适应 v8 vs v10 翻译, 比 tts-only 更接近真实
+   pipeline 行为. 但成本最高.
+4. **训练数据 domain 扩充** (最稳): 跑 ≥5 个 Karpathy 类视频 (编程 + 长句),
+   累积 20k+ 样本后重训 v8. 直接修 domain shift 根源.
+
+### 收敛终判
+
+- v6→v7 失败 (加特征)
+- v7→v8 微改 (调超参)
+- v8→v9 失败 (加约束)
+- v9→v10 失败 (post-hoc rule)
+
+四次失败/边际改善证明: **8327 净样本 + 23 维特征 + GBDT 已是当前数据架构上限**.
+继续在此 axis 上调优 ROI 极低. v11+ 必须改变 axis: 数据 / 端到端验证 / 模型结构.
+
+## 方法论复盘 (9 次迭代收敛)
 
 ```
 iter1 离线 v0+v3+v4 (Ridge)        — CV R² 0.952
@@ -528,8 +611,8 @@ iter4 端到端 v6 (zjMu+d4Eg)        — 全维度胜出 ✅ 上线
 iter5 generality v6 (kCc 617 段)   — 长视频稳定 ✅ 维持
 iter6 v7 token 特征                — 离线 +0.002 R² 端到端回退 ❌ 回滚
 iter7 v8 超参调优 (num_leaves=31)  — 6 项端到端微改 / 0 显著回退 ✅ 上线
-iter8 v9 monotonic + 错误分析      — 离线 MAE +8ms 长句问题未解 ❌ 不上线
-                                     找到 domain shift + length truncation 根因
+iter8 v9 monotonic + 错误分析      — 离线 MAE +8ms, 找到 domain shift 根因 ❌ 不上线
+iter9 v10 长句 rule 兜底           — within_tolerance 降 28-38%, 问题转移 ❌ 回滚
 ```
 
 **关键学习**:

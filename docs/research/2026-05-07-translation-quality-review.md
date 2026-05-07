@@ -151,6 +151,41 @@ LLM 翻译期审计日志 `audit/translation_fix_log.json` 记录三类自动修
 
 - 当前限流退避 2 次后直接降级 NLLB。可考虑加备用 endpoint（如 OpenAI 或本地大模型），避免落到质量天花板低的 NLLB。
 
+### 4.5 扩展 proper_nouns 识别"技术术语"类（高优先级）
+
+**触发**: 2026-05-08 用 `qwen2.5:3b` 注入 proper_nouns 重译测试，发现注入有效（命中段 100% 修复术语错译，如 `transformer→变压器` 纠正为保留 `transformer`），但**命中率仅 25%**——4 个视频里只有 1 个的缓存术语命中了测试段。
+
+**根因**: 当前 `translation_style.detect_translation_style()` 只识别"人名/品牌/作品名"，不识别**技术术语**：
+- NN/07 (Attention)：`key vector / query vector / key matrix` 没进 proper_nouns，导致 LLM/NLLB 都误译为"关键向量/关键矩阵"
+- DE/01：proper_nouns 只有人名（Strogatz 等），段里没人名时无术语注入
+- CS/01 (Wordle)：`sigmoid function` 在缓存里但 #92 段没出现
+
+**改进**: 主题识别 prompt 中明确扩展类别——不仅识别"人名/品牌"，还识别"技术术语/专业概念/数学符号"（如 "key vector / query vector / sigmoid / Brownian motion"）。代码点位：`translation_style.py:49` 主题识别 prompt 的 `proper_nouns` 字段定义说明。
+
+**验证**: 实测 AI images 视频缓存有 `Transformer` 和 `GPT`，注入后 3 段全部纠正：
+- `transformer → 变压器/变换器` ❌ → `transformer` ✅（保留原文）
+- `chat GPT → 聊天GPT` ❌ → `chat GPT` ✅
+
+### 4.6 本地小模型作 NLLB 替代兜底（中优先级，需实验确认）
+
+**测试结果**（2026-05-08，`/tmp/test_3b_vs_nllb_v2.py`）：
+
+| 维度 | NLLB-200-distilled (600M) | qwen2.5:3b (本地 ollama) |
+|------|--------|--------|
+| 平均耗时 | 1.3s/段 | 21.7s/段（含预热）|
+| 中文输出率 | 100% | 71%（长句易超时/解析失败）|
+| 术语保留（命中 proper_nouns）| 0%（不能注入）| 100% |
+| 长句通顺 | 中（截断、词表外字符 `⁇`、`map→地图`）| 高（命中场景） |
+
+**结论**: 3b 在命中 proper_nouns 时质量明显高于 NLLB，但 28% 失败率（解析失败 / 超时）和 16x 慢需要工程兜底。建议作为 NLLB 的可选替代：
+- **位置**: LLM 限流后第二层兜底（NLLB 之前），或完全替代 NLLB
+- **超时**: 单段 60s（本地无成本，长句最长测得 ~26s 完成）；超时 → fallback NLLB
+- **批次**: `batch=2-3`（不要 8，超过会等太久）
+- **解析失败**: `[N]` 编号解析失败时 → 单段重试或 fallback NLLB
+- **依赖**: 需用户本地装 ollama + `qwen2.5:3b`，不强制；环境变量 `LLM_LOCAL_FALLBACK=qwen2.5:3b` 启用
+
+代码点位：`pipeline.py:2246` NLLB fallback 之前插入本地小模型分支。
+
 ---
 
 ## 5. 行动项
@@ -159,7 +194,7 @@ LLM 翻译期审计日志 `audit/translation_fix_log.json` 记录三类自动修
   ```bash
   python3 batch_process.py --retranslate-only iv-5mZ_9CPY,p_di4Zn4wz4,v0YEaeIClKY,U_85TaXbeIo,YG15m2VwSjA,eMlx5fFNoYc,v68zYyaEmEA
   ```
-- [ ] Wordle (`v68zYyaEmEA`) 因 jieba 段错误失败，需单独重跑
+- [x] Wordle (`v68zYyaEmEA`) 段错误根因已查（LightGBM v6 estimator 与 OpenMP 库竞态），修复合入 `pipeline.py` 顶部 `OMP_NUM_THREADS=1` + 启动期预热 estimate_duration
 - [ ] 实现 4.1 的"NLLB 触发事件落 audit JSON"（小改动）
 - [ ] 实现 4.2 的西式标点确定性后处理（小改动）
 

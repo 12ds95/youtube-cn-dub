@@ -43,6 +43,17 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
 # 必须在任何 import 之前设置此环境变量。
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# OMP_NUM_THREADS=1 禁用 OpenMP 多线程, 防止 LightGBM (v6 estimator) 加载时
+# 与已加载的 OpenMP 运行时 (jieba/numpy/macOS libomp) 在线程池初始化阶段
+# 竞态触发 SIGSEGV. 实测 Wordle 视频在 build_unit_translation_lines 首次
+# 调用 estimate_duration 时连续 100% 复现, 设此变量后通过.
+# duration estimator 是单段 prediction (无 batch), 单线程足够, 无性能损失.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+# 启用 faulthandler 在 SIGSEGV/SIGABRT 时打印 Python traceback,
+# 帮助定位 native 崩溃点 (jieba/ctranslate2/torch 等).
+import faulthandler
+faulthandler.enable()
 
 # ── 修补 Python 关停期 SemLock._cleanup 的 FileNotFoundError 噪音 ─────
 # 现象: pipeline 主流程结束后, multiprocessing util._run_finalizers 触发
@@ -98,6 +109,14 @@ from text_utils import (
     text_for_tts,
 )
 from duration_estimator import estimate_duration as _estimate_duration_jieba
+
+# 预热 duration estimator (含 jieba + LightGBM 模型加载).
+# 必须在模块导入阶段、httpx/asyncio 等任何其他 native 库工作前完成,
+# 避免翻译循环首次调用时 LightGBM 与并发的 OpenMP 库竞态触发 SIGSEGV.
+try:
+    _estimate_duration_jieba("预热")
+except Exception:
+    pass  # 模型缺失自动降级 v4, 不阻断启动
 
 
 # ─── 审计目录 ──────────────────────────────────────────────────────

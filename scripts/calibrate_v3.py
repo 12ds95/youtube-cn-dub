@@ -473,7 +473,7 @@ def cross_validate(samples: List[Dict], features: List[str],
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", default="all",
-                        choices=["v0", "v5", "v3", "v4", "v6", "v7", "all"])
+                        choices=["v0", "v5", "v3", "v4", "v6", "v7", "v8", "all"])
     parser.add_argument("--save-result", help="保存实验结果 JSON 到指定路径")
     args = parser.parse_args()
 
@@ -543,6 +543,76 @@ def main():
         }
         print(f"  in-sample: R²={metrics['r2']}, MAE={metrics['mae_ms']}ms")
         print(f"  5-fold CV: R²={cv.get('r2','?')}, MAE={cv.get('mae_ms','?')}ms")
+
+    # ── v8: 替代 loss / 超参 调优 v6 (同 23 维特征) ──
+    # 学习自 v7 失败: 不改特征架构, 仅调 loss/超参. 试探:
+    #   - L1 (MAE) vs L2 (v6 baseline) vs Huber: 哪种 loss 对 outlier 更鲁棒
+    #   - 不同 num_leaves / n_estimators 是否过/欠拟合
+    if args.stage in ("v8", "all"):
+        try:
+            import lightgbm as lgb
+            print("\n🛡️  v8: 替代 loss/超参 调优 (23 维, 同 v6 特征)...")
+            feat_v8 = BASE_FEATURES + SYLLABLE_FEATURES + PROSODY_FEATURES
+            n = len(clean_samples)
+            X = np.zeros((n, len(feat_v8)))
+            y = np.zeros(n)
+            for i, s in enumerate(clean_samples):
+                f = extract_all_features(s["text_zh"], include_v7=False)
+                for j, name in enumerate(feat_v8):
+                    X[i, j] = f.get(name, 0)
+                y[i] = s["natural_ms"]
+            by_video = {}
+            for s in clean_samples:
+                by_video.setdefault(s["video"], []).append(s)
+            videos = sorted(by_video.keys())
+            np.random.seed(42)
+            np.random.shuffle(videos)
+            fold_size = max(1, len(videos) // 5)
+
+            def cv_metrics(model_kwargs):
+                cv_mae, cv_r2 = [], []
+                for k in range(5):
+                    test_vids = set(videos[k * fold_size: (k + 1) * fold_size])
+                    train_idx = [i for i, s in enumerate(clean_samples) if s["video"] not in test_vids]
+                    test_idx = [i for i, s in enumerate(clean_samples) if s["video"] in test_vids]
+                    if not train_idx or not test_idx:
+                        continue
+                    model = lgb.LGBMRegressor(verbosity=-1, **model_kwargs)
+                    model.fit(X[train_idx], y[train_idx])
+                    pred = model.predict(X[test_idx])
+                    m = compute_metrics(y[test_idx], pred)
+                    cv_mae.append(m["mae_ms"])
+                    cv_r2.append(m["r2"])
+                return {"r2_mean": round(float(np.mean(cv_r2)), 4),
+                        "mae_mean": round(float(np.mean(cv_mae)), 1)}
+
+            v8_results = {}
+            configs = [
+                ("L2_v6_repro",       {"objective": "regression",    "n_estimators": 200, "learning_rate": 0.05, "num_leaves": 15, "min_child_samples": 20}),
+                ("L1_MAE",            {"objective": "regression_l1", "n_estimators": 200, "learning_rate": 0.05, "num_leaves": 15, "min_child_samples": 20}),
+                ("L2_more_trees",     {"objective": "regression",    "n_estimators": 400, "learning_rate": 0.03, "num_leaves": 15, "min_child_samples": 20}),
+                ("L2_deeper",         {"objective": "regression",    "n_estimators": 200, "learning_rate": 0.05, "num_leaves": 31, "min_child_samples": 20}),
+                ("L2_more_min_child", {"objective": "regression",    "n_estimators": 200, "learning_rate": 0.05, "num_leaves": 15, "min_child_samples": 50}),
+            ]
+            for name, kw in configs:
+                m = cv_metrics(kw)
+                v8_results[name] = m
+                print(f"  {name:22s}: CV R²={m['r2_mean']}, MAE={m['mae_mean']}ms")
+            results["stages"]["v8"] = v8_results
+
+            # 选最佳 (按 MAE) 训练全量并保存
+            best_name = min(v8_results, key=lambda k: v8_results[k]['mae_mean'])
+            best_kw = dict(configs)[best_name]
+            print(f"  最佳: {best_name} (MAE={v8_results[best_name]['mae_mean']}ms, R²={v8_results[best_name]['r2_mean']})")
+            model_full = lgb.LGBMRegressor(verbosity=-1, **best_kw)
+            model_full.fit(X, y)
+            os.makedirs("models", exist_ok=True)
+            model_full.booster_.save_model("models/duration_estimator_lgbm_v8.txt")
+            with open("models/duration_estimator_lgbm_v8_features.json", 'w') as fout:
+                json.dump(feat_v8, fout)
+            print(f"  💾 v8 LightGBM 模型: models/duration_estimator_lgbm_v8.txt ({best_name})")
+        except ImportError:
+            print(f"  ⚠️  lightgbm 未安装")
 
     # ── v7: Ridge + GBDT 加 token 特征 (音译名/数学符号/单字母) ──
     if args.stage in ("v7", "all"):

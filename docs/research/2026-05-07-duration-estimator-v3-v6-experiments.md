@@ -404,7 +404,62 @@ estimator 只影响 atempo 决策不重新翻译)。
    可能 LLM 翻译时已基于估算调整, atempo 是次级现象
 4. **GBDT 集成限制**: 既加新特征又复用旧模型 GBDT 不能简单插值
 
-## 方法论复盘 (6 次迭代收敛)
+## iter7: v8 超参调优 — 2026-05-07 (微改进上线)
+
+### 假设
+
+iter6 v7 失败学习: 不增加特征复杂度, 改试超参/loss 调优。
+
+### 离线扫描 (5 配置, 同 23 维特征)
+
+| 配置 | CV R² | CV MAE |
+|---|---|---|
+| L2_v6_repro (baseline) | 0.9733 | 394.0 |
+| L1_MAE | 0.9718 | 394.9 |
+| L2_more_trees (400 trees, lr=0.03) | 0.9737 | 392.0 |
+| **L2_deeper (num_leaves=31)** | **0.9733** | **391.4** ✅ |
+| L2_more_min_child (50) | 0.9725 | 396.6 |
+
+L1 (MAE) 反而更差; 增加 leaves 31 微优 (-2.6 ms MAE)。
+
+注: lightgbm `objective='huber', alpha=*` 实测崩 (CV R² -0.017),
+alpha 参数语义与文档不符。
+
+### 端到端实测 (zjMu + d4Eg + kCc 三视频)
+
+| 指标 | 视频 | v6 | v8 (deeper) | Δ |
+|---|---|---|---|---|
+| mean | zjMu | 1.0001 | 0.9975 | 偏离 +0.0024 (略低估更安全) |
+|  | d4Eg | 1.0156 | 1.0141 | ✅ -0.0015 |
+|  | kCc | 1.0051 | 1.0051 | 持平 |
+| std | zjMu | 0.0588 | 0.058 | ✅ -0.0008 |
+|  | d4Eg | 0.0959 | 0.0926 | ✅ -0.0033 (-3.5%) |
+|  | kCc | 0.0729 | 0.0691 | ✅ -0.0038 (-5.2%) |
+| 合规率 | zjMu | 100% | 100% | 持平 |
+|  | d4Eg | 95.0% | 95.5% | ✅ +0.5pp |
+|  | kCc | 97.4% | 97.4% | 持平 |
+| atempo | zjMu | 0 | 0 | 持平 |
+|  | d4Eg | 11 | 10 | ✅ -1 |
+|  | kCc | 14 | 13 | ✅ -1 |
+
+**6 项改进 / 0 项显著回退** (zjMu mean 略偏 -0.0024 但绝对值小且偏低估更安全)。
+
+### 决策: 上线 v8
+
+边际改进真实 (尤其 std 全降, atempo 减 2)。模型文件直接替换:
+- `models/duration_estimator_lgbm.txt` ← v8 模型 (290KB → 562KB, num_leaves=31)
+- `duration_estimator.py` 不需改 (DURATION_LGBM_MODEL env 加载默认文件)
+- 新增 `DURATION_LGBM_MODEL` 环境变量支持实验时换模型 (默认无需设置)
+
+### v9+ 改进方向
+
+1. **--integrated 模式验证**: tts-only 复用翻译缓存, estimator 改进只反映在
+   atempo 决策, 未捕获 LLM 翻译质量影响. v9 应用 --integrated 真测
+2. **更多视频数据**: 8327 净样本可能不够支撑 GBDT 更细的 split, 跑更多视频
+   累积 20k+ 样本再训
+3. **--integrated A/B 测试**: 同视频 v6 vs v8 翻译输出对比, 看 LLM 行为差异
+
+## 方法论复盘 (7 次迭代收敛)
 
 ```
 iter1 离线 v0+v3+v4 (Ridge)        — CV R² 0.952
@@ -413,6 +468,7 @@ iter3 端到端 v4 (zjMu+d4Eg)        — mean 准但合规率 -1pp (混合信�
 iter4 端到端 v6 (zjMu+d4Eg)        — 全维度胜出 ✅ 上线
 iter5 generality v6 (kCc 617 段)   — 长视频稳定 ✅ 维持
 iter6 v7 token 特征 (zjMu+d4Eg)    — 离线 +0.002 R² 但端到端回退 ❌ 回滚
+iter7 v8 超参调优 (num_leaves=31)  — 6 项端到端微改 / 0 显著回退 ✅ 上线
 ```
 
 **关键学习**:

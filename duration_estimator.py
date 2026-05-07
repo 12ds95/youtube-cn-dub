@@ -4,13 +4,16 @@
 模型版本:
   v2 (legacy): Ridge 8 维 (词级 + 标点 + 截距) — R² 0.92, 已弃用
   v4:          Ridge 23 维 (+音节级 + 韵律级) — R² 0.952, MAE 569ms (8327 净样本)
-  v6 (默认):   LightGBM 23 维 — CV R² 0.973, MAE 394ms;
+  v6 (默认):   LightGBM 23 维 — CV R² 0.973, MAE 391ms (v8 调优后, num_leaves=31);
                极短文本 (<5 有效字符) 自动降级 v4 防 GBDT 训练分布外饱和;
                lightgbm 不可用或模型缺失自动降级 v4
 
-端到端实测 (zjMu 36 段 + d4Eg 221 段, --tts-only):
+端到端实测 (zjMu 36 + d4Eg 221 + kCc 617 段, --tts-only):
   v6 vs v2: raw_ratio_mean 偏离 -67% (zjMu) / -56% (d4Eg)
   v6 vs v4: 合规率 +5.6pp (zjMu 100% / d4Eg 95.0%), atempo_fallback 11 vs 13
+  v8 调优 (num_leaves 15→31): std 三视频均 -3~-5%, atempo d4Eg 11→10, kCc 14→13
+
+DURATION_LGBM_MODEL 环境变量可指定备用模型文件 (相对 models/), 用于实验对比.
 
 接口保持不变: estimate_duration(text_zh) -> float (毫秒)
 """
@@ -195,7 +198,11 @@ _LGBM_STATE: Dict[str, object] = {"loaded": False, "available": False, "model": 
 
 
 def _load_lgbm() -> bool:
-    """惰性加载 v6 LightGBM 模型 (失败则降级 v4)."""
+    """惰性加载 v6 LightGBM 模型 (失败则降级 v4).
+
+    可通过 DURATION_LGBM_MODEL 环境变量指定模型文件名 (相对 models/),
+    用于实验对比 (如 v8 调优模型). 默认 duration_estimator_lgbm.txt.
+    """
     if _LGBM_STATE["loaded"]:
         return bool(_LGBM_STATE["available"])
     _LGBM_STATE["loaded"] = True
@@ -203,8 +210,15 @@ def _load_lgbm() -> bool:
         import json
         import lightgbm as lgb
         base = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base, "models", "duration_estimator_lgbm.txt")
-        feat_path = os.path.join(base, "models", "duration_estimator_lgbm_features.json")
+        model_name = os.environ.get("DURATION_LGBM_MODEL", "duration_estimator_lgbm.txt")
+        feat_name = model_name.replace(".txt", "_features.json")
+        # 兼容默认命名 (无 _v6 / _v8 后缀的 features.json)
+        if feat_name == "duration_estimator_lgbm_features.json":
+            pass  # already correct
+        elif not feat_name.endswith("_features.json"):
+            feat_name = model_name.rsplit(".", 1)[0] + "_features.json"
+        model_path = os.path.join(base, "models", model_name)
+        feat_path = os.path.join(base, "models", feat_name)
         if not (os.path.exists(model_path) and os.path.exists(feat_path)):
             return False
         _LGBM_STATE["model"] = lgb.Booster(model_file=model_path)

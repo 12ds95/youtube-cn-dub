@@ -101,9 +101,16 @@ pipeline.py 启动
 
 ### Q: 多音字 G2PW（ONNX runtime）会触发同类问题吗？
 
-**默认不加载**。`pipeline.py:3383` 调 `_fix_polyphones(text_zh)` 不传 `use_g2pw_fallback`，走纯 Python 词典 + pypinyin，无 BERT/ONNX。
+**已经预防性处理**——不靠"等崩溃再说"，主动消除运行时懒加载这个反模式。
 
-如果用户 opt-in `use_g2pw_fallback=True`：会加载 `bert-base-chinese`（420MB）+ ONNX runtime + G2PWModel。ONNX runtime 也用 libomp，**理论上有同类风险**。如果届时观察到崩溃，按本文同样的"时间隔离"方案处理：在 pipeline.py 顶部预热 G2PW（调一次 `_get_g2pw().lazy_pinyin("预热用文本")`），让 ONNX runtime 在独占窗口完成 init。
+G2PW 内部用 ONNX runtime，自带 libomp，理论上同 LightGBM 有竞态风险。虽然当前 `_fix_polyphones` 调用方都没传 `use_g2pw_fallback=True`（死代码），仍然作了如下结构性修复：
+
+1. `_get_g2pw` 不再支持运行时懒加载: 加 `_G2PW_PREWARM_DONE` 标志，未 prewarm 调用直接返回 None；
+2. 新增 `_prewarm_g2pw()`，pipeline.py 模块导入期立即调用；
+3. 通过环境变量 `YTD_ENABLE_G2PW=1` 显式 opt-in 才真正加载（默认不加载，不白付 ~450MB BERT 内存）；
+4. opt-in 后 G2PW 在 import 期跟 LightGBM 一样独占 init 窗口加载，远早于 ctranslate2/torch 的 libiomp5。
+
+设计理念："不要懒加载就完了"——彻底消灭"运行时延迟加载 native lib"的代码路径。同样的模板将适用于未来任何新接入的 ONNX/PyTorch 类原生库。
 
 ### Q: 既然 lightgbm 用系统 libomp，sklearn/torch/ctranslate2 用 bundled libomp，本质问题是不是 wheel 自带 libomp？终极方案是不是 `pip install --no-binary lightgbm`？
 

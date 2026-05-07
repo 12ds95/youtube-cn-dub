@@ -5669,26 +5669,55 @@ def _ensure_polyphone_jieba_dict():
         pass
 
 
-_G2PW_INSTANCE = None
+_G2PW_INSTANCE = None  # None=未尝试加载 / False=加载失败 / 其它=已加载实例
+_G2PW_PREWARM_DONE = False  # 防止运行时懒加载: 必须在 import 期 prewarm
+
+
+def _prewarm_g2pw():
+    """import 期 eager 加载 G2PW (BERT + ONNX, ~450MB).
+
+    设计原则: G2PW 内部用 ONNX runtime, 自带 libomp; 若运行时懒加载,
+    会与已加载的 ctranslate2/torch/sklearn libomp 竞态触发 SIGSEGV
+    (同 LightGBM 问题, 见 docs/research/2026-05-08-lightgbm-libomp-conflict.md).
+    必须在 import 期独占 init 窗口加载.
+
+    通过环境变量 YTD_ENABLE_G2PW=1 opt-in. 默认不加载 (G2PW 当前为
+    死代码: _fix_polyphones 调用方没传 use_g2pw_fallback=True), 避免
+    白付 ~450MB BERT 内存.
+
+    强制 HF_HUB_OFFLINE=1: pypinyin_g2pw 默认尝试从 huggingface 检查
+    bert-base-chinese 更新, 网络阻塞时会卡数十秒重试. 项目用户应已
+    一次性下载好模型 (~/.cache/huggingface + G2PWModel/), 直接走本地.
+    """
+    global _G2PW_INSTANCE, _G2PW_PREWARM_DONE
+    _G2PW_PREWARM_DONE = True
+    if os.environ.get("YTD_ENABLE_G2PW") != "1":
+        return  # 未 opt-in, 保持 None (后续 _get_g2pw 调用走 fast path 返回)
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    try:
+        from pypinyin_g2pw import G2PWPinyin
+        _G2PW_INSTANCE = G2PWPinyin()
+    except Exception:
+        _G2PW_INSTANCE = False
 
 
 def _get_g2pw():
-    """懒加载 g2pW (BERT, ~450MB), 失败时返回 None (降级到 jieba-only)。
+    """返回已 prewarm 的 G2PW 实例 (或 None).
 
-    首次调用会下载 bert-base-chinese + G2PWModel-v2-onnx (~450MB);
-    第二次起从本地缓存加载 (~5-10s)。
+    严格不允许运行时懒加载: 必须 prewarm 阶段完成. 见 _prewarm_g2pw().
     """
-    global _G2PW_INSTANCE
-    if _G2PW_INSTANCE is False:
+    if not _G2PW_PREWARM_DONE:
+        # 防御: prewarm 未跑过, 说明调用顺序错了; fail-soft 返回 None 而非懒加载
         return None
-    if _G2PW_INSTANCE is None:
-        try:
-            from pypinyin_g2pw import G2PWPinyin
-            _G2PW_INSTANCE = G2PWPinyin()
-        except Exception:
-            _G2PW_INSTANCE = False
-            return None
+    if _G2PW_INSTANCE is False or _G2PW_INSTANCE is None:
+        return None
     return _G2PW_INSTANCE
+
+
+# 模块导入期立即 prewarm: opt-in 时强制独占 init 窗口加载 G2PW,
+# 消除运行时懒加载与 ctranslate2/torch libomp 竞态的可能.
+_prewarm_g2pw()
 
 
 def _fix_polyphones(text: str, use_g2pw_fallback: bool = False) -> str:

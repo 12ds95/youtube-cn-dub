@@ -539,9 +539,9 @@ def test_estimate_duration_reasonable():
 
 
 def test_estimate_duration_empty():
-    """空文本: Ridge v2 intercept 1210ms"""
+    """空文本: v4 模型返回 0 (无文本无时长)"""
     est = _estimate_duration_jieba("")
-    assert 1000 < est < 1500, f"Empty text should be ~1210ms (intercept), got {est}"
+    assert est == 0.0, f"Empty text should be 0ms (v4), got {est}"
     print("  ✅ test_estimate_duration_empty")
 
 

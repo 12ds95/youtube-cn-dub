@@ -85,7 +85,7 @@
 - 全文翻译质量明显更连贯自然
 - **关键问题: 语义错位** — 纯按字数切分无法保证英中段对齐，全文翻译语序/详略与分段不同
 
-**待探索的 4 个改进方向** (详见 `docs/research/2026-06-08-phase2-fulltext-translation-roadmap.md`):
+**待探索的 4 个改进方向** (详见 `docs/research/2026-05-03-phase2-fulltext-translation-roadmap.md`):
 1. Prompt 段边界标记（`|||`）
 2. 英中 Sentence Alignment（embedding + DTW）
 3. 两步法（全文翻译 + LLM 分句）

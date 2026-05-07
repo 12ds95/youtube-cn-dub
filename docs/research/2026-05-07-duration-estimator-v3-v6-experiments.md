@@ -1,7 +1,7 @@
 # Duration Estimator v3-v6 实验记录
 
 > 起始: 2026-05-07
-> 关联: `docs/research/2026-06-09-jieba-duration-estimator-roadmap.md` (原规划)
+> 关联: `docs/research/2026-05-04-jieba-duration-estimator-roadmap.md` (原规划)
 > 关联: `devlog/test-feedback-loop-methodology.md` (方法论)
 > 关联代码: `duration_estimator.py`, `calibrate_tts_duration.py`, `pipeline.py:_estimate_duration_jieba`
 

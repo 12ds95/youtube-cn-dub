@@ -23,7 +23,7 @@ test_two_videos.sh (10 视频)
   │
   └── 产出文档:
         ├── docs/research/2026-05-03-jieba-duration-calibration.md  (v1, 已被 v2 取代)
-        ├── docs/research/2025-06-06-jieba-estimator-v2-exploration.md  (v2, 当前)
+        ├── docs/research/2026-05-03-jieba-estimator-v2-exploration.md  (v2, 当前)
         └── docs/research/2026-05-04-translation-quality-optimization.md
 ```
 

@@ -1,6 +1,6 @@
 # 语速估算修复 — 测试反馈循环记录
 
-日期: 2026-05-01 → 2025-06-06 (持续迭代)
+日期: 2026-05-01 → 2026-05-03 (持续迭代)
 方法: test→feedback→fix→test 循环
 
 ## 迭代 1: 问题发现
@@ -73,7 +73,7 @@ bash test_pipeline.sh --fast
 
 ## 迭代 4: Ridge v2 校准 + rate 去混淆 bug 修复
 
-> 详见 `docs/research/2025-06-06-jieba-estimator-v2-exploration.md`
+> 详见 `docs/research/2026-05-03-jieba-estimator-v2-exploration.md`
 
 **改进**:
 1. 修复 `calibrate_tts_duration.py` 中残留的 `* 1.3` 旧乘数（rate 去混淆 bug）

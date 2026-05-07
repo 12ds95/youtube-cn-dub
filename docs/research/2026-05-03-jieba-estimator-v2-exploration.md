@@ -1,6 +1,6 @@
 # Jieba TTS 时长估算器 v2 校准
 
-**日期**: 2025-06-06
+**日期**: 2026-05-03
 **状态**: 已实施
 **前置**: `docs/research/2026-05-03-jieba-duration-calibration.md` (Ridge v1)
 
@@ -131,7 +131,7 @@ kCc8FmEb1nY 最难预测（最大的视频，可能内容多样性高）。
 | `pipeline.py:3054-3118` | v2 校准参数写入 `_estimate_duration_jieba` |
 | `calibrate_tts_duration.py` | 修复 rate 去混淆 bug、支持嵌套目录扫描、更新基线参数 |
 | `test_two_videos.sh` | 从 3 → 10 视频，支持嵌套路径 |
-| `docs/research/2025-06-06-jieba-estimator-v2-exploration.md` | 本文档 |
+| `docs/research/2026-05-03-jieba-estimator-v2-exploration.md` | 本文档 |
 
 ## 7. 后续
 

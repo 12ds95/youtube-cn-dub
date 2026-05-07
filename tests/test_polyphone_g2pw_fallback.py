@@ -2,9 +2,8 @@
 
 设计:
   - 主路径 jieba 白名单 (词典级 ~100% 精度)
-  - 兜底: g2pW (BERT, CPP 99.08%, 我们域实测 ~88%)
-  - 优先级 g2pw > g2pm (若同时启用)
-  - g2pW 模型 ~450MB, 默认禁用; opt-in 时首次下载
+  - 兜底: g2pW (BERT, CPP 99.08%, 我们域实测 ~88%) — 始终启用
+  - g2pW 模型 ~450MB, import 期 prewarm; 缺失时降级 jieba-only
 
 依赖 g2pw + bert-base-chinese 模型。CI 环境若无模型则跳过相应测试 (fallback to None)。
 """
@@ -18,14 +17,14 @@ from pipeline import _fix_polyphones, _get_g2pw, _align_g2pw_pinyins
 
 
 # ───────────────────────────────────────────────────────────────────
-# 默认值: g2pW 兜底默认禁用 (避免强制下载 450MB)
+# g2pW 兜底始终启用 (无 opt-in 参数)
 # ───────────────────────────────────────────────────────────────────
-def test_default_use_g2pw_fallback_is_false():
-    """_fix_polyphones 默认不开启 g2pW 兜底 (450MB 模型 opt-in)"""
+def test_no_use_g2pw_fallback_param():
+    """_fix_polyphones 已移除 use_g2pw_fallback 参数 (g2pW 始终启用)"""
     import inspect
     from pipeline import _fix_polyphones as fn
     sig = inspect.signature(fn)
-    assert sig.parameters['use_g2pw_fallback'].default is False
+    assert 'use_g2pw_fallback' not in sig.parameters
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -68,7 +67,7 @@ def test_align_g2pw_pinyins_underflow():
 def test_jieba_whitelist_priority_over_g2pw():
     """白名单命中时不调 g2pW (即使 g2pW 也对, 词典级足够)"""
     # 主路径 "了解" 在白名单, 应替换为 "瞭解"
-    out = _fix_polyphones("我了解你", use_g2pw_fallback=True)
+    out = _fix_polyphones("我了解你")
     assert "瞭解" in out
 
 
@@ -79,7 +78,7 @@ def test_no_g2pw_falls_back_to_jieba_only(monkeypatch):
     """g2pW 加载失败时主路径仍工作"""
     import pipeline
     monkeypatch.setattr(pipeline, '_get_g2pw', lambda: None)
-    out = _fix_polyphones("我了解你", use_g2pw_fallback=True)
+    out = _fix_polyphones("我了解你")
     assert "瞭解" in out  # 主路径仍生效
 
 
@@ -92,7 +91,7 @@ def test_g2pw_inference_error_no_crash(monkeypatch):
             raise RuntimeError("simulated")
 
     monkeypatch.setattr(pipeline, '_get_g2pw', lambda: FakeG2PW())
-    out = _fix_polyphones("我了解你", use_g2pw_fallback=True)
+    out = _fix_polyphones("我了解你")
     assert "瞭解" in out
 
 

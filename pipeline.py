@@ -5676,23 +5676,23 @@ _G2PW_PREWARM_DONE = False  # 防止运行时懒加载: 必须在 import 期 pre
 def _prewarm_g2pw():
     """import 期 eager 加载 G2PW (BERT + ONNX, ~450MB).
 
+    G2PW 是 _fix_polyphones 的 BERT 兜底 (CPP 99.08%, 我们域 ~88%),
+    跨多音字消歧场景必启用, 不再走 env var opt-in.
+
     设计原则: G2PW 内部用 ONNX runtime, 自带 libomp; 若运行时懒加载,
     会与已加载的 ctranslate2/torch/sklearn libomp 竞态触发 SIGSEGV
     (同 LightGBM 问题, 见 docs/research/2026-05-08-lightgbm-libomp-conflict.md).
     必须在 import 期独占 init 窗口加载.
 
-    通过环境变量 YTD_ENABLE_G2PW=1 opt-in. 默认不加载 (G2PW 当前为
-    死代码: _fix_polyphones 调用方没传 use_g2pw_fallback=True), 避免
-    白付 ~450MB BERT 内存.
-
     强制 HF_HUB_OFFLINE=1: pypinyin_g2pw 默认尝试从 huggingface 检查
     bert-base-chinese 更新, 网络阻塞时会卡数十秒重试. 项目用户应已
     一次性下载好模型 (~/.cache/huggingface + G2PWModel/), 直接走本地.
+
+    模型缺失或加载失败时 _G2PW_INSTANCE = False, _fix_polyphones
+    自动降级 jieba-only 主路径, 不 crash.
     """
     global _G2PW_INSTANCE, _G2PW_PREWARM_DONE
     _G2PW_PREWARM_DONE = True
-    if os.environ.get("YTD_ENABLE_G2PW") != "1":
-        return  # 未 opt-in, 保持 None (后续 _get_g2pw 调用走 fast path 返回)
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     try:
@@ -5720,26 +5720,26 @@ def _get_g2pw():
 _prewarm_g2pw()
 
 
-def _fix_polyphones(text: str, use_g2pw_fallback: bool = False) -> str:
+def _fix_polyphones(text: str) -> str:
     """对 TTS 输入文本做多音字同音替换，纠正 edge-tts 高频误读。
 
     双层守卫 (jieba 白名单 → g2pW BERT 兜底):
 
     1) 主路径: 字所在 jieba 词命中白名单 → 替换为同音字 (词典级 ~100% 精度)
 
-    2) g2pW 兜底 (opt-in): 若 use_g2pw_fallback=True, 用 g2pW (BERT, CPP
-       99.08%) 判定字读音 (我们域实测 ~88%, 修复了 "严重/权重/所处/
-       处于/了解" 等域内 false positive)。需 ~450MB BERT 模型 (首次
-       下载), ~10s 加载。仅对未被主路径替换的 _POLYPHONE_RULES 字 +
+    2) g2pW 兜底 (始终启用): 用 g2pW (BERT, CPP 99.08%) 判定字读音
+       (我们域实测 ~88%, 修复了 "严重/权重/所处/处于/了解" 等域内
+       false positive)。仅对未被主路径替换的 _POLYPHONE_RULES 字 +
        jieba 词长 >= 2 生效 (单字成词不走兜底, 防误判)。
 
     历史决策: 早期实施过 g2pM (BiLSTM, CPP 97%) 兜底, 但实测在我们项目
     场景 (技术视频字幕) 仅 ~65%, 引入"严重/权重" 等 false positive,
     已删除。详见 docs/research/2026-05-07-polyphone-disambiguation-survey.md。
 
-    设计原则: 漏一个比错一个好。g2pW 兜底默认禁用, jieba 主路径足够稳。
+    设计原则: 漏一个比错一个好。g2pW 守卫: 仅替换被白名单未覆盖且
+    g2pW 判定为目标读音的字, 单字成词不动。
 
-    g2pW 不可用时自动降级 jieba-only, 不报错。
+    g2pW 不可用时自动降级 jieba-only 主路径, 不报错。
     """
     if not text:
         return text
@@ -5769,18 +5769,17 @@ def _fix_polyphones(text: str, use_g2pw_fallback: bool = False) -> str:
                 replaced.add(i)
                 break
 
-    # 兜底: g2pW BERT 神经消歧 (opt-in)
+    # 兜底: g2pW BERT 神经消歧 (始终启用, prewarm 失败时降级 jieba-only)
     fallback_pinyins: Optional[List[str]] = None
-    if use_g2pw_fallback:
-        nlp = _get_g2pw()
-        if nlp is not None:
-            try:
-                from pypinyin import Style
-                pw = nlp.lazy_pinyin(text, style=Style.TONE)
-                # g2pw 字符声调直接用; lazy_pinyin 跳过非汉字, 按位置重建
-                fallback_pinyins = _align_g2pw_pinyins(text, pw)
-            except Exception:
-                fallback_pinyins = None
+    nlp = _get_g2pw()
+    if nlp is not None:
+        try:
+            from pypinyin import Style
+            pw = nlp.lazy_pinyin(text, style=Style.TONE)
+            # g2pw 字符声调直接用; lazy_pinyin 跳过非汉字, 按位置重建
+            fallback_pinyins = _align_g2pw_pinyins(text, pw)
+        except Exception:
+            fallback_pinyins = None
 
     if fallback_pinyins and len(fallback_pinyins) == len(text):
         for i, c in enumerate(text):

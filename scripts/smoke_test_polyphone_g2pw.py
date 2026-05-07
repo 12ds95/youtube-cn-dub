@@ -41,7 +41,7 @@ def main():
 
     pass_n = 0
     for text, must_not, must_have, comment in cases:
-        out = _fix_polyphones(text, use_g2pw_fallback=True)
+        out = _fix_polyphones(text)
         ok = (must_not not in out) and (must_have in out)
         status = "✓" if ok else "✗"
         if ok:

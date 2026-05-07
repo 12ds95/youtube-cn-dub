@@ -221,7 +221,10 @@ def _load_lgbm() -> bool:
         feat_path = os.path.join(base, "models", feat_name)
         if not (os.path.exists(model_path) and os.path.exists(feat_path)):
             return False
-        _LGBM_STATE["model"] = lgb.Booster(model_file=model_path)
+        _LGBM_STATE["model"] = lgb.Booster(
+            model_file=model_path,
+            params={"num_threads": 1},
+        )
         with open(feat_path) as f:
             _LGBM_STATE["features"] = json.load(f)
         _LGBM_STATE["available"] = True

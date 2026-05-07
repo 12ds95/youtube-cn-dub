@@ -43,12 +43,9 @@ YouTube 英文视频 → 中文配音 + 中英双语字幕 端到端 Pipeline (v
 # 必须在任何 import 之前设置此环境变量。
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-# OMP_NUM_THREADS=1 禁用 OpenMP 多线程, 防止 LightGBM (v6 estimator) 加载时
-# 与已加载的 OpenMP 运行时 (jieba/numpy/macOS libomp) 在线程池初始化阶段
-# 竞态触发 SIGSEGV. 实测 Wordle 视频在 build_unit_translation_lines 首次
-# 调用 estimate_duration 时连续 100% 复现, 设此变量后通过.
-# duration estimator 是单段 prediction (无 batch), 单线程足够, 无性能损失.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+# 注: 不设全局 OMP_NUM_THREADS=1 — 历史教训 (commit 8df0988): 全局 OMP=1
+# 会拖慢 demucs/whisper. 改为外科手术: LightGBM 加载/predict 时显式
+# 传 num_threads=1, 见 duration_estimator.py:_load_lgbm/_estimate_v6.
 
 # 启用 faulthandler 在 SIGSEGV/SIGABRT 时打印 Python traceback,
 # 帮助定位 native 崩溃点 (jieba/ctranslate2/torch 等).
@@ -110,9 +107,10 @@ from text_utils import (
 )
 from duration_estimator import estimate_duration as _estimate_duration_jieba
 
-# 预热 duration estimator (含 jieba + LightGBM 模型加载).
-# 必须在模块导入阶段、httpx/asyncio 等任何其他 native 库工作前完成,
-# 避免翻译循环首次调用时 LightGBM 与并发的 OpenMP 库竞态触发 SIGSEGV.
+# 预热 duration estimator: 在 import 阶段、其它 native 库 (httpx/asyncio
+# 内部线程) 开始工作前, 完成 LightGBM + jieba 的 OpenMP 线程池初始化.
+# 类似 commit 8df0988 demucs 子进程隔离的思路, 这里用"时间隔离"而非
+# "进程隔离" — 给 LightGBM 一个干净的 OpenMP init 窗口.
 try:
     _estimate_duration_jieba("预热")
 except Exception:

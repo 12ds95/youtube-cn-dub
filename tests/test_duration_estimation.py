@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""测试 jieba 分词时长估算 (v4 模型, R²=0.952, MAE=569ms)。
+"""测试 jieba 分词时长估算。
 
-v4 是 23 维 Ridge 模型 (词级 + 音节 + 韵律), 来自 8327 净样本拟合。
-v2 legacy 仍可用 (DURATION_ESTIMATOR_VERSION=v2)。
+默认 v6 (LightGBM CV R²=0.973), 极短文本 (<5 有效字符) 自动降级 v4。
+v4 (Ridge 23 维 R²=0.952) 通过 DURATION_ESTIMATOR_VERSION=v4 切换。
+v2 legacy 通过 DURATION_ESTIMATOR_VERSION=v2 切换。
 """
 import os
 import sys
@@ -93,6 +94,26 @@ class TestDurationEstimation:
         # 加 1 个语气词应延长 100+ ms (v4 系数 287)
         assert with_filler - plain > 100, \
             f"语气词应延长: {with_filler} vs {plain}"
+
+    def test_v6_hybrid_short_text_uses_v4(self):
+        """v6 默认下极短文本 (<5 有效字符) 降级 v4, 防 GBDT 训练分布外饱和."""
+        from duration_estimator import _estimate_v4, estimate_duration
+        # "你好" 2 字 应该走 v4 (匹配 v4 输出)
+        v4_short = _estimate_v4("你好")
+        default_short = estimate_duration("你好")
+        assert abs(default_short - v4_short) < 1.0, \
+            f"短文本应降级 v4: estimate={default_short}, v4={v4_short}"
+
+    def test_v6_long_text_uses_lgbm(self):
+        """v6 在长文本上输出 (若 lightgbm 可用) 应不同于 v4."""
+        from duration_estimator import _estimate_v4, _load_lgbm, estimate_duration
+        if not _load_lgbm():
+            pytest.skip("lightgbm 不可用, v6 自动降级 v4")
+        long_text = "这是一段比较长的中文测试文本用来验证 v6 估算准确度"
+        v4_pred = _estimate_v4(long_text)
+        v6_pred = estimate_duration(long_text)
+        assert abs(v6_pred - v4_pred) > 50, \
+            f"v6 长文本应与 v4 不同 (>50ms): v6={v6_pred}, v4={v4_pred}"
 
     def test_tone_neutral_shorter(self):
         """轻声字 (de/le/me) 应比四声字短 (v4 声调特征)"""

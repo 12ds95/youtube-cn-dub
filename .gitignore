@@ -12,8 +12,11 @@ venv/
 .venv/
 env/
 
-# ─── Whisper 模型（体积大，不入库）──────────────────
-models/
+# ─── Whisper / TTS 大模型（体积大，不入库）───────────
+models/*
+# 例外: 小型可分发模型 (duration estimator v6 LightGBM, ~290KB)
+!models/duration_estimator_lgbm.txt
+!models/duration_estimator_lgbm_features.json
 
 # ─── 视频处理输出（每次运行生成）─────────────────────
 output/

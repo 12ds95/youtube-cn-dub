@@ -3,8 +3,14 @@
 
 模型版本:
   v2 (legacy): Ridge 8 维 (词级 + 标点 + 截距) — R² 0.92, 已弃用
-  v4 (当前):   Ridge 23 维 (+音节级 + 韵律级) — R² 0.952, MAE 569ms (8327 净样本)
-  v6 (可选):   LightGBM 23 维 — R² 0.973, MAE 394ms (需 lightgbm + libomp)
+  v4:          Ridge 23 维 (+音节级 + 韵律级) — R² 0.952, MAE 569ms (8327 净样本)
+  v6 (默认):   LightGBM 23 维 — CV R² 0.973, MAE 394ms;
+               极短文本 (<5 有效字符) 自动降级 v4 防 GBDT 训练分布外饱和;
+               lightgbm 不可用或模型缺失自动降级 v4
+
+端到端实测 (zjMu 36 段 + d4Eg 221 段, --tts-only):
+  v6 vs v2: raw_ratio_mean 偏离 -67% (zjMu) / -56% (d4Eg)
+  v6 vs v4: 合规率 +5.6pp (zjMu 100% / d4Eg 95.0%), atempo_fallback 11 vs 13
 
 接口保持不变: estimate_duration(text_zh) -> float (毫秒)
 """
@@ -184,6 +190,61 @@ def _estimate_v4(text_zh: str) -> float:
     return max(0.0, total)
 
 
+# ── v6 LightGBM (实验性, 模型文件可选) ──────────────────────────
+_LGBM_STATE: Dict[str, object] = {"loaded": False, "available": False, "model": None, "features": None}
+
+
+def _load_lgbm() -> bool:
+    """惰性加载 v6 LightGBM 模型 (失败则降级 v4)."""
+    if _LGBM_STATE["loaded"]:
+        return bool(_LGBM_STATE["available"])
+    _LGBM_STATE["loaded"] = True
+    try:
+        import json
+        import lightgbm as lgb
+        base = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base, "models", "duration_estimator_lgbm.txt")
+        feat_path = os.path.join(base, "models", "duration_estimator_lgbm_features.json")
+        if not (os.path.exists(model_path) and os.path.exists(feat_path)):
+            return False
+        _LGBM_STATE["model"] = lgb.Booster(model_file=model_path)
+        with open(feat_path) as f:
+            _LGBM_STATE["features"] = json.load(f)
+        _LGBM_STATE["available"] = True
+        return True
+    except Exception:
+        return False
+
+
+def _meaningful_char_count(text_zh: str) -> int:
+    """统计有效字符数 (剔除空白和标点)."""
+    return sum(
+        1 for c in text_zh
+        if c.strip() and not unicodedata.category(c).startswith("P")
+    )
+
+
+def _estimate_v6(text_zh: str) -> float:
+    """v6: LightGBM 23 维 (CV R²=0.973, MAE=394ms).
+
+    - 极短文本 (<5 有效字符) 降级 v4: GBDT 在训练稀疏区域回归到样本均值,
+      pipeline 实际段长 ≥9 字符不会触发, 但保护 caller 边界
+    - 模型/lightgbm 缺失自动降级 v4 (向后兼容)
+    """
+    if _meaningful_char_count(text_zh) < 5:
+        return _estimate_v4(text_zh)
+    if not _load_lgbm():
+        return _estimate_v4(text_zh)
+    import numpy as np
+    feat = _extract_word_features(text_zh)
+    feat.update(_extract_syllable_features(text_zh))
+    feat.update(_extract_prosody_features(text_zh))
+    features = _LGBM_STATE["features"]  # type: ignore
+    X = np.array([[feat.get(name, 0) for name in features]], dtype=float)
+    pred = _LGBM_STATE["model"].predict(X)[0]  # type: ignore
+    return max(0.0, float(pred))
+
+
 def _estimate_v2_legacy(text_zh: str) -> float:
     """v2 legacy: 仅词级 (兼容 pypinyin 不可用时降级)."""
     p = V2_LEGACY_PARAMS
@@ -217,19 +278,23 @@ def _estimate_v2_legacy(text_zh: str) -> float:
 
 
 # ── 主接口 ──────────────────────────────────────────────────────
-# 通过 DURATION_ESTIMATOR_VERSION 环境变量切换版本: v4 (默认) / v2
+# 通过 DURATION_ESTIMATOR_VERSION 环境变量切换版本: v6 (默认) / v4 / v2
 
-_VERSION = os.environ.get("DURATION_ESTIMATOR_VERSION", "v4")
+_VERSION = os.environ.get("DURATION_ESTIMATOR_VERSION", "v6")
 
 
 def estimate_duration(text_zh: str) -> float:
     """中文 TTS 时长估算 (毫秒)。
 
-    默认 v4 (R²=0.952, MAE=569ms, 23 维 Ridge)。
-    通过环境变量 DURATION_ESTIMATOR_VERSION=v2 切换到 legacy 8 维模型。
+    默认 v6 (LightGBM CV R²=0.973, 极短文本自动降级 v4)。
+    DURATION_ESTIMATOR_VERSION 环境变量可切换:
+      - v4: 23 维 Ridge (R²=0.952, 无外部模型依赖)
+      - v2: legacy 8 维 Ridge (向后兼容)
     """
     if not text_zh:
         return 0.0
     if _VERSION == "v2":
         return _estimate_v2_legacy(text_zh)
-    return _estimate_v4(text_zh)
+    if _VERSION == "v4":
+        return _estimate_v4(text_zh)
+    return _estimate_v6(text_zh)

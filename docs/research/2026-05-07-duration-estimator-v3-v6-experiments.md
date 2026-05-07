@@ -196,3 +196,80 @@ LightGBM 配置: `n_estimators=200, learning_rate=0.05, num_leaves=15, min_child
 - `audit/duration_estimator_v4_params.json` — v4 参数
 - `models/duration_estimator_lgbm.txt` — v6 LightGBM 备用模型
 - `tests/test_duration_estimation.py` — v4 行为契约测试
+
+## iter4: v6 LightGBM 端到端集成 — 2026-05-07
+
+### 假设挑战 + 实测
+
+iter3 后续, 通过 `DURATION_ESTIMATOR_VERSION=v6` 跑 d4Eg+zjMu --tts-only。
+
+**离线观测 (单元测试单字)**:
+- `estimate_duration("你好") = 2497ms` (实际人声 ~600ms)
+- GBDT 在训练稀疏区域 (有效字符 < 5) 回归到样本均值 ~2500ms
+- 担心 v6 上线会让 LLM 误判 budget → 翻译过长 → ratio>1.4 → atempo
+
+**端到端实测 (才是真理)**:
+
+#### zjMu (36 段)
+| 指标 | v2 | v4 | **v6** |
+|---|---|---|---|
+| raw_ratio_mean | 1.0232 | 1.0063 | **1.0001** ✅ 近完美 |
+| std_raw | 0.0614 | 0.0844 | **0.0588** ✅ 最稳 |
+| 合规率 | 100% | 94.4% | **100%** ✅ |
+| atempo_fallback | 0 | 1 | **0** ✅ |
+
+#### d4Eg (221 段)
+| 指标 | v2 | v4 | **v6** |
+|---|---|---|---|
+| raw_ratio_mean | 1.0355 | 1.0245 | **1.0156** ✅ 偏离 -56% |
+| std_raw | 0.1012 | 0.1037 | **0.0959** ✅ 最稳 |
+| 合规率 | 92.8% | 91.4% | **95.0%** ✅ +2.2pp 优于 v2 |
+| atempo_fallback | 13 | 13 | **11** ✅ -2 |
+| outliers_gt_1.4 | 1 | 1 | 1 |
+
+### 根因分析: 为何离线短文本担忧不成立
+
+实测 pipeline 段落分布:
+- zjMu: min=13 / p10=23 / p50=43 / p90=72 / max=103 有效字符
+- d4Eg: min=9 / p10=17 / p50=35 / p90=58 / max=89 有效字符
+
+ASR 切分得到的段都是**完整短语/句子**, 最短 9 字符。GBDT OOD 短文本 (< 5 字) 仅在
+单元测试中出现, pipeline 实际不会触发。
+
+### 决策: v6 设为默认 + hybrid 阈值保护
+
+`duration_estimator.py` 实施:
+1. `_VERSION` 默认从 `v4` 改为 `v6`
+2. `_estimate_v6` 在 `_meaningful_char_count(text) < 5` 时降级 v4 (保护边界 caller, pipeline 不影响)
+3. `_load_lgbm` 失败时 (lightgbm/libomp 缺失或模型文件缺失) 自动降级 v4
+4. `models/duration_estimator_lgbm.txt` 加入 git tracking (290KB, 例外通过 `!` 规则)
+5. `tests/test_duration_estimation.py` 新增 hybrid 行为测试 (短文本走 v4 / 长文本走 v6)
+
+### 方法论复盘 (test-feedback-loop)
+
+```
+iter1: 离线 v0+v3+v4 (Ridge 24 维) → CV R²=0.952
+iter2: 离线 v6 LightGBM → CV R²=0.973 (期望但未端到端验证)
+iter3: 集成 v4 + 端到端 → mean 准但合规率 -1pp (混合信号)
+iter4: 端到端 v6 → 全维度胜出 (假设被实测推翻)
+```
+
+**关键学习**:
+- **离线 R² 与端到端表现不一定一致** (v4 离线提升明显, 端到端合规率反而轻微下降)
+- **GBDT OOD 担忧可能不成立** (实际输入分布远离 OOD 区域)
+- **方法论严格执行 "实测验证再决策" 才避免了错误的保守选择**
+  (本来准备 v4 上线, 实测发现 v6 反而更优)
+- 单元测试用极短样本 ("你好" 2 字) 不能反映 pipeline 真实行为, 需配合端到端测试
+
+### 总结对比 (v2 → v4 → v6)
+
+| 指标 | v2 baseline | v4 (Ridge) | **v6 (LightGBM, 默认)** |
+|---|---|---|---|
+| 模型 | Ridge 8 维 | Ridge 23 维 | GBDT 23 维 |
+| CV R² | ~0.92 | 0.952 | **0.973** |
+| CV MAE | — | 569 ms | **394 ms** |
+| zjMu 合规率 | 100% | 94.4% | **100%** |
+| d4Eg 合规率 | 92.8% | 91.4% | **95.0%** |
+| d4Eg atempo | 13 | 13 | **11** |
+| 部署 | 内置 | 内置 | + lightgbm + 模型 290KB |
+| OOD 短文本 | OK (Ridge 外推) | OK | 降级 v4 (hybrid) |

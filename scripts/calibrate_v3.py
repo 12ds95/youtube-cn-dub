@@ -55,7 +55,19 @@ PROSODY_FEATURES = [
     "n_filler_word",      # 语气词数量 (吧/呢/啊/嘛)
 ]
 
+# v7 token 特征 (针对 d4Eg/kCc atempo 失效模式: 数学符号 + 音译名 + 单字母变量)
+V7_TOKEN_FEATURES = [
+    "n_capital_word",   # 音译名 (Linus / Felix / TTS) — edge-tts 朗读较慢
+    "n_math_op",         # 数学运算符 (×, ÷, ·, −, √, ∑, ∫, →, ⊥, ∞ ...)
+    "n_ascii_isolated",  # 单 ASCII 字母变量 (i, j, k, x, y, z 等数学变量)
+]
+
 FILLER_WORDS = {'吧', '呢', '啊', '嘛', '哦', '哎', '嗯', '哈', '呀'}
+
+# 数学运算符 (不含 ASCII +-*/= 防中文文本误伤)
+MATH_OPS = set("×÷·−√∑∫⊥∞→←⇒⇐∂∇≤≥≠≈⊆⊇∈∉∪∩⊕⊗∥‖")
+CAPITAL_WORD_RE = re.compile(r'[A-Z][a-zA-Z]+')  # ≥2 字母, 首字母大写
+ASCII_ISOLATED_RE = re.compile(r'(?<![a-zA-Z])[a-zA-Z](?![a-zA-Z])')
 
 
 def extract_base_features(text_zh: str) -> Dict[str, int]:
@@ -167,11 +179,27 @@ def extract_prosody_features(text_zh: str) -> Dict[str, int]:
     return feat
 
 
-def extract_all_features(text_zh: str) -> Dict[str, int]:
-    """提取全部 (v2 + v3 + v4) 特征."""
+def extract_token_features(text_zh: str) -> Dict[str, int]:
+    """v7 token 特征: 数学符号/音译名/单字母变量 (TTS 朗读较慢)."""
+    feat = {k: 0 for k in V7_TOKEN_FEATURES}
+    if not text_zh:
+        return feat
+    feat["n_capital_word"] = len(CAPITAL_WORD_RE.findall(text_zh))
+    feat["n_math_op"] = sum(1 for c in text_zh if c in MATH_OPS)
+    feat["n_ascii_isolated"] = len(ASCII_ISOLATED_RE.findall(text_zh))
+    return feat
+
+
+def extract_all_features(text_zh: str, include_v7: bool = True) -> Dict[str, int]:
+    """提取全部特征 (v2 + v3 + v4 [+ v7]).
+
+    include_v7=False 用于复现 v6 23 维模型 (向后兼容).
+    """
     f = extract_base_features(text_zh)
     f.update(extract_syllable_features(text_zh))
     f.update(extract_prosody_features(text_zh))
+    if include_v7:
+        f.update(extract_token_features(text_zh))
     return f
 
 
@@ -445,7 +473,7 @@ def cross_validate(samples: List[Dict], features: List[str],
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", default="all",
-                        choices=["v0", "v5", "v3", "v4", "v6", "all"])
+                        choices=["v0", "v5", "v3", "v4", "v6", "v7", "all"])
     parser.add_argument("--save-result", help="保存实验结果 JSON 到指定路径")
     args = parser.parse_args()
 
@@ -515,6 +543,85 @@ def main():
         }
         print(f"  in-sample: R²={metrics['r2']}, MAE={metrics['mae_ms']}ms")
         print(f"  5-fold CV: R²={cv.get('r2','?')}, MAE={cv.get('mae_ms','?')}ms")
+
+    # ── v7: Ridge + GBDT 加 token 特征 (音译名/数学符号/单字母) ──
+    if args.stage in ("v7", "all"):
+        print("\n🔬 v7: 加 token 特征 (Ridge)...")
+        feat_v7 = BASE_FEATURES + SYLLABLE_FEATURES + PROSODY_FEATURES + V7_TOKEN_FEATURES
+        params, metrics = fit_ridge(clean_samples, feat_v7, alpha=1.0)
+        cv = cross_validate(clean_samples, feat_v7, alpha=1.0)
+        results["stages"]["v7_ridge"] = {
+            "features": feat_v7,
+            "params": params,
+            "in_sample": metrics,
+            "cv_5fold": cv,
+        }
+        print(f"  Ridge in-sample: R²={metrics['r2']}, MAE={metrics['mae_ms']}ms")
+        print(f"  Ridge 5-fold CV: R²={cv.get('r2','?')}, MAE={cv.get('mae_ms','?')}ms")
+        # 检查 v7 token 系数是否显著
+        for tk in V7_TOKEN_FEATURES:
+            print(f"  系数[{tk}]: {params.get(tk, 0):.1f} ms/token")
+
+        try:
+            import lightgbm as lgb
+            print("\n🌲 v7: GBDT (LightGBM 26 维)...")
+            n = len(clean_samples)
+            X = np.zeros((n, len(feat_v7)))
+            y = np.zeros(n)
+            for i, s in enumerate(clean_samples):
+                f = extract_all_features(s["text_zh"], include_v7=True)
+                for j, name in enumerate(feat_v7):
+                    X[i, j] = f.get(name, 0)
+                y[i] = s["natural_ms"]
+            by_video = {}
+            for s in clean_samples:
+                by_video.setdefault(s["video"], []).append(s)
+            videos = sorted(by_video.keys())
+            np.random.seed(42)
+            np.random.shuffle(videos)
+            fold_size = max(1, len(videos) // 5)
+            cv_mae, cv_r2 = [], []
+            for k in range(5):
+                test_vids = set(videos[k * fold_size: (k + 1) * fold_size])
+                train_idx = [i for i, s in enumerate(clean_samples) if s["video"] not in test_vids]
+                test_idx = [i for i, s in enumerate(clean_samples) if s["video"] in test_vids]
+                if not train_idx or not test_idx:
+                    continue
+                model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05,
+                                          num_leaves=15, min_child_samples=20,
+                                          verbosity=-1)
+                model.fit(X[train_idx], y[train_idx])
+                pred = model.predict(X[test_idx])
+                m = compute_metrics(y[test_idx], pred)
+                cv_mae.append(m["mae_ms"])
+                cv_r2.append(m["r2"])
+            cv_lgbm = {"r2_mean": round(float(np.mean(cv_r2)), 4),
+                       "mae_mean": round(float(np.mean(cv_mae)), 1),
+                       "k_folds": len(cv_r2)}
+            results["stages"]["v7_lgbm"] = {"cv_5fold_lgbm": cv_lgbm}
+            print(f"  LightGBM CV: R²={cv_lgbm['r2_mean']}, MAE={cv_lgbm['mae_mean']}ms")
+
+            # 训练全量并保存 v7 模型 (单独文件, 不覆盖 v6)
+            model_full = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05,
+                                           num_leaves=15, min_child_samples=20,
+                                           verbosity=-1)
+            model_full.fit(X, y)
+            os.makedirs("models", exist_ok=True)
+            model_full.booster_.save_model("models/duration_estimator_lgbm_v7.txt")
+            with open("models/duration_estimator_lgbm_v7_features.json", 'w') as fout:
+                json.dump(feat_v7, fout)
+            print(f"  💾 v7 LightGBM 模型: models/duration_estimator_lgbm_v7.txt")
+
+            # 保存 v7 Ridge 参数
+            v7_path = "audit/duration_estimator_v7_params.json"
+            os.makedirs(os.path.dirname(v7_path), exist_ok=True)
+            with open(v7_path, 'w', encoding='utf-8') as fout:
+                json.dump({"params": params, "features": feat_v7,
+                           "metrics": metrics, "cv": cv,
+                           "lgbm_cv": cv_lgbm}, fout, indent=2, ensure_ascii=False)
+            print(f"  💾 v7 Ridge 参数: {v7_path}")
+        except ImportError:
+            print(f"  ⚠️  lightgbm 未安装, 仅训练 Ridge")
 
     # ── v6: GBDT (LightGBM) ──
     if args.stage in ("v6", "all"):

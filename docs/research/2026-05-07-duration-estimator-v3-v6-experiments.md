@@ -321,14 +321,98 @@ kCc 20 feedback 段:
 | per-engine 校准 (edge-tts vs VITS) | 跨 TTS 引擎稳定 | 高 (需 VITS 数据) |
 | MLP 取代 GBDT | R² 不一定提升 (8k 样本上限) | 中 |
 
-### 方法论复盘 (5 次迭代收敛)
+## iter6: v7 token 特征实验 — 2026-05-07 (失败回滚)
+
+### 假设
+
+iter5 失效模式分析显示 d4Eg/kCc atempo 段集中于:
+- 数学符号 (i, j, k, −1, LaTeX)
+- 音译人名 (Linus / Felix)
+- 单字母变量
+
+假设: 加 token 特征 (n_capital_word / n_math_op / n_ascii_isolated) 重训
+v7 LightGBM 应能减少这类 atempo。
+
+### 实施
+
+`scripts/calibrate_v3.py` 加 V7_TOKEN_FEATURES (3 维) + extract_token_features:
+```python
+MATH_OPS = set("×÷·−√∑∫⊥∞→←⇒⇐∂∇≤≥≠≈⊆⊇∈∉∪∩⊕⊗∥‖")
+CAPITAL_WORD_RE = re.compile(r'[A-Z][a-zA-Z]+')
+ASCII_ISOLATED_RE = re.compile(r'(?<![a-zA-Z])[a-zA-Z](?![a-zA-Z])')
+```
+
+### 离线训练 (8327 净样本, 5-fold CV by video)
+
+| 模型 | CV R² | CV MAE |
+|---|---|---|
+| v4 Ridge 23 维 | 0.952 | 569 ms |
+| v6 LightGBM 23 维 | 0.973 | 394 ms |
+| **v7 Ridge 26 维** | **0.9549** | 553 ms (-3% MAE) |
+| **v7 LightGBM 26 维** | **0.9745** | **387 ms** (-2% MAE) |
+
+Ridge 系数 (v7):
+- `n_capital_word`: **−48** ms/token (反直觉负值: 音译名一气呵成比独立朗读快)
+- `n_math_op`: +85 ms/token
+- `n_ascii_isolated`: **+223** ms/token (大!)
+
+### 端到端实测 (zjMu + d4Eg)
+
+| 指标 | v6 (default) | v7 | Δ |
+|---|---|---|---|
+| zjMu mean | 1.0001 | 1.0026 | ↓ |
+| zjMu 合规率 | 100% | 97.2% | **-2.8pp** |
+| zjMu atempo | 0 | 1 | **+1** |
+| d4Eg mean | 1.0156 | 1.0169 | ↓ |
+| d4Eg 合规率 | 95.0% | 94.1% | **-0.9pp** |
+| d4Eg atempo | 11 | 13 | **+2** |
+| d4Eg outliers_gt_1.4 | 1 | 2 | **+1** |
+
+### 段级对比 (d4Eg --tts-only)
+
+12 个 v6 失败段 v6 vs v7 dev 完全一致 (因 --tts-only 复用翻译缓存,
+estimator 只影响 atempo 决策不重新翻译)。
+- v7 修复: #93, #156 (含 −1, i, j 等 math/ascii)
+- v7 新增: #170, #175, #213 (新增 atempo)
+- 净结果: v6 atempo 11 → v7 13 (-1 修复 +3 新增)
+
+### 决策: 回滚 v7
+
+按 test-feedback-loop 方法论严格执行 "失败了则回滚":
+1. 离线 R² 仅 +0.0015, MAE 仅 -7ms — 边际改进
+2. 端到端在两个视频均回退 (合规率 ↓ 1-3pp, atempo +1~3)
+3. 失效模式分析方向**部分正确** (修了 2 段 math/ascii)
+4. 但 GBDT 因新增 3 个特征产生其他段的小偏差, 累积让边缘段越界
+5. 测试方法局限: --tts-only 不重新翻译, 无法验证 v7 estimator
+   下 LLM 翻译质量是否改善
+
+### v7 实验保留产物 (供 v8+ 参考)
+
+- `scripts/calibrate_v3.py` v7 stage — 可重用 (失败实验工具不删)
+- `audit/duration_estimator_v7_params.json` — 26 维 Ridge 系数
+- v7 LightGBM 模型文件**未入库** (生产不上线)
+- `duration_estimator.py` v7 集成代码已 revert (生产代码精简)
+
+### v8+ 改进方向 (从 v7 失败学到)
+
+1. **测试方法升级**: tts-only 模式不能验证 estimator 对 LLM 翻译的影响,
+   未来 v8 实验需用 --integrated 或 --retranslate 重新翻译验证
+2. **特征质量优于数量**: 加 3 维特征导致 noise > signal, 需考虑:
+   - 仅加 1 个最强特征 (`n_ascii_isolated` +223ms 系数)
+   - 或用更多训练数据降低 noise
+3. **失效模式 ≠ 修复方向**: dev=+24% 段不一定意味着 estimator 低估,
+   可能 LLM 翻译时已基于估算调整, atempo 是次级现象
+4. **GBDT 集成限制**: 既加新特征又复用旧模型 GBDT 不能简单插值
+
+## 方法论复盘 (6 次迭代收敛)
 
 ```
 iter1 离线 v0+v3+v4 (Ridge)        — CV R² 0.952
-iter2 离线 v6 (LightGBM)           — CV R² 0.973 ⚠️ 离线指标
+iter2 离线 v6 (LightGBM)           — CV R² 0.973 ⚠️ 仅离线指标
 iter3 端到端 v4 (zjMu+d4Eg)        — mean 准但合规率 -1pp (混合信号)
-iter4 端到端 v6 (zjMu+d4Eg)        — 全维度胜出 (推翻离线担忧)
-iter5 generality v6 (kCc 617 段)   — 长视频稳定 (97.4% 合规)
+iter4 端到端 v6 (zjMu+d4Eg)        — 全维度胜出 ✅ 上线
+iter5 generality v6 (kCc 617 段)   — 长视频稳定 ✅ 维持
+iter6 v7 token 特征 (zjMu+d4Eg)    — 离线 +0.002 R² 但端到端回退 ❌ 回滚
 ```
 
 **关键学习**:

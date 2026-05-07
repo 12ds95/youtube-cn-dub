@@ -111,8 +111,9 @@ from duration_estimator import estimate_duration as _estimate_duration_jieba
 # 内部线程) 开始工作前, 完成 LightGBM + jieba 的 OpenMP 线程池初始化.
 # 类似 commit 8df0988 demucs 子进程隔离的思路, 这里用"时间隔离"而非
 # "进程隔离" — 给 LightGBM 一个干净的 OpenMP init 窗口.
+# 关键: 字符串必须 ≥ 5 有效中文字符, 否则 _estimate_v6 直接降级 v4 不加载 LightGBM.
 try:
-    _estimate_duration_jieba("预热")
+    _estimate_duration_jieba("预热模型加载用的占位文本以触发 LightGBM 实际加载")
 except Exception:
     pass  # 模型缺失自动降级 v4, 不阻断启动
 

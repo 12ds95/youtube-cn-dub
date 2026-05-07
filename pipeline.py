@@ -6728,6 +6728,55 @@ def merge_final_video(video_path: Path, dub_path: Path,
     return final_path
 
 
+def mux_subtitle_into_video(video_path: Path, srt_path: Path) -> bool:
+    """把双语 srt remux 进 mp4 软字幕轨 (atomic + idempotent).
+
+    m3u8 + 外挂字幕在 IINA 下不可靠 (mpv 不支持 #EXTVLCOPT, playlist
+    模式扫描行为不一致). mux 后任何播放器都识别. 仅 -c copy, 几秒.
+    详细见 docs/research/2026-05-08-iina-subtitle-mux.md (如有).
+    """
+    if not srt_path.exists():
+        print(f"  ⚠️  字幕源不存在, 跳过 mux: {srt_path.name}")
+        return False
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "s",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+             str(video_path)],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        if out.strip():
+            print(f"  ✅ {video_path.name} 已含字幕轨, 跳过 mux")
+            return True
+    except Exception:
+        pass
+
+    tmp = video_path.with_suffix(".tmp.mp4")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(video_path), "-i", str(srt_path),
+             "-c", "copy", "-c:s", "mov_text",
+             "-metadata:s:s:0", "language=zho",
+             "-metadata:s:s:0", "title=双语",
+             "-disposition:s:0", "default+forced",
+             str(tmp)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            print(f"  ❌ ffmpeg mux 失败: {result.stderr[-300:]}")
+            if tmp.exists():
+                tmp.unlink()
+            return False
+        tmp.replace(video_path)
+        print(f"  ✅ 双语字幕已 mux 进 {video_path.name}")
+        return True
+    except subprocess.TimeoutExpired:
+        if tmp.exists():
+            tmp.unlink()
+        print(f"  ❌ ffmpeg mux 超时 (>300s)")
+        return False
+
+
 # ─── 主流程 ────────────────────────────────────────────────────────
 async def process_video(config: dict):
     """端到端处理"""
@@ -7185,6 +7234,8 @@ async def process_video(config: dict):
             final_path = merge_final_video(
                 video_path, dub_path, output_dir, config["volume"],
                 audio_sep_config=config.get("audio_separation"))
+            mux_subtitle_into_video(
+                final_path, output_dir / "subtitle_bilingual.srt")
             _log("")
         else:
             _log(f"[{step_n}/{total_steps}] 合成视频 - 跳过")
@@ -7257,6 +7308,8 @@ async def process_video(config: dict):
             final_path = merge_final_video(
                 video_path, dub_path, output_dir, config["volume"],
                 audio_sep_config=config.get("audio_separation"))
+            mux_subtitle_into_video(
+                final_path, output_dir / "subtitle_bilingual.srt")
             _log("")
         else:
             _log(f"[{step_n}/{total_steps}] 合成视频 - 跳过")

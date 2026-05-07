@@ -7300,14 +7300,15 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        # 清理 multiprocessing resource_tracker 守护进程
-        # ctranslate2/PyTorch 内部会 fork+exec 出 resource_tracker，
-        # pipeline.py 退出后它会残留在进程列表中。
+        # 优雅关闭 multiprocessing resource_tracker（避免守护进程残留）。
+        # 历史方案是 SIGKILL，但会触发 Python 关停期"process died unexpectedly,
+        # relaunching"重启 → 重启后的 tracker 处理旧 tracker 已发的 UNREGISTER
+        # 消息时找不到 name，抛 KeyError。改用 _stop()：关闭 pipe 让 tracker
+        # 读到 EOF 后正常退出，不会触发重启路径。
         try:
             import multiprocessing.resource_tracker as _rt
-            _tracker_pid = getattr(_rt._resource_tracker, '_pid', None)
-            if _tracker_pid:
-                import signal
-                os.kill(_tracker_pid, signal.SIGKILL)
-        except (ProcessLookupError, OSError, AttributeError):
+            _tracker = getattr(_rt, "_resource_tracker", None)
+            if _tracker is not None and getattr(_tracker, "_fd", None) is not None:
+                _tracker._stop()
+        except (ProcessLookupError, OSError, AttributeError, ChildProcessError):
             pass

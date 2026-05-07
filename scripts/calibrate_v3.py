@@ -473,7 +473,7 @@ def cross_validate(samples: List[Dict], features: List[str],
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", default="all",
-                        choices=["v0", "v5", "v3", "v4", "v6", "v7", "v8", "all"])
+                        choices=["v0", "v5", "v3", "v4", "v6", "v7", "v8", "v9", "all"])
     parser.add_argument("--save-result", help="保存实验结果 JSON 到指定路径")
     args = parser.parse_args()
 
@@ -543,6 +543,83 @@ def main():
         }
         print(f"  in-sample: R²={metrics['r2']}, MAE={metrics['mae_ms']}ms")
         print(f"  5-fold CV: R²={cv.get('r2','?')}, MAE={cv.get('mae_ms','?')}ms")
+
+    # ── v9: monotonic constraints 解决长句 truncation ──
+    # 错误分析发现: 长句 (60+ chars) residual mean = -426ms (under-predict),
+    # 短句 +500ms (over-predict). 用 monotonic_increasing 约束 char/syllable
+    # 特征防止 GBDT 长句区域 split 饱和.
+    if args.stage in ("v9", "all"):
+        try:
+            import lightgbm as lgb
+            print("\n📐 v9: monotonic constraints (单调约束 char/syllable 特征)...")
+            feat_v9 = BASE_FEATURES + SYLLABLE_FEATURES + PROSODY_FEATURES
+
+            # 字符/音节相关特征单调递增, 韵律/标点不约束
+            mono = []
+            for name in feat_v9:
+                if name in BASE_FEATURES or name.startswith("n_tone") or name.startswith("n_final"):
+                    mono.append(1)  # increasing
+                elif name in {"n_exclaim", "n_ellipsis"}:
+                    mono.append(-1)  # 韵律负系数 (Ridge 显示)
+                else:
+                    mono.append(0)  # 不约束
+
+            n = len(clean_samples)
+            X = np.zeros((n, len(feat_v9)))
+            y = np.zeros(n)
+            for i, s in enumerate(clean_samples):
+                f = extract_all_features(s["text_zh"], include_v7=False)
+                for j, name in enumerate(feat_v9):
+                    X[i, j] = f.get(name, 0)
+                y[i] = s["natural_ms"]
+
+            by_video = {}
+            for s in clean_samples:
+                by_video.setdefault(s["video"], []).append(s)
+            videos = sorted(by_video.keys())
+            np.random.seed(42)
+            np.random.shuffle(videos)
+            fold_size = max(1, len(videos) // 5)
+
+            cv_mae, cv_r2 = [], []
+            for k in range(5):
+                test_vids = set(videos[k * fold_size: (k + 1) * fold_size])
+                train_idx = [i for i, s in enumerate(clean_samples) if s["video"] not in test_vids]
+                test_idx = [i for i, s in enumerate(clean_samples) if s["video"] in test_vids]
+                if not train_idx or not test_idx:
+                    continue
+                model = lgb.LGBMRegressor(
+                    objective='regression',
+                    n_estimators=200, learning_rate=0.05,
+                    num_leaves=31, min_child_samples=20,
+                    monotone_constraints=mono,
+                    monotone_constraints_method='advanced',
+                    verbosity=-1)
+                model.fit(X[train_idx], y[train_idx])
+                pred = model.predict(X[test_idx])
+                m = compute_metrics(y[test_idx], pred)
+                cv_mae.append(m["mae_ms"])
+                cv_r2.append(m["r2"])
+            cv_lgbm = {"r2_mean": round(float(np.mean(cv_r2)), 4),
+                       "mae_mean": round(float(np.mean(cv_mae)), 1)}
+            results["stages"]["v9_monotonic"] = {"cv_5fold_lgbm": cv_lgbm}
+            print(f"  monotonic CV: R²={cv_lgbm['r2_mean']}, MAE={cv_lgbm['mae_mean']}ms")
+
+            model_full = lgb.LGBMRegressor(
+                objective='regression',
+                n_estimators=200, learning_rate=0.05,
+                num_leaves=31, min_child_samples=20,
+                monotone_constraints=mono,
+                monotone_constraints_method='advanced',
+                verbosity=-1)
+            model_full.fit(X, y)
+            os.makedirs("models", exist_ok=True)
+            model_full.booster_.save_model("models/duration_estimator_lgbm_v9.txt")
+            with open("models/duration_estimator_lgbm_v9_features.json", 'w') as fout:
+                json.dump(feat_v9, fout)
+            print(f"  💾 v9 LightGBM 模型: models/duration_estimator_lgbm_v9.txt")
+        except ImportError:
+            print(f"  ⚠️  lightgbm 未安装")
 
     # ── v8: 替代 loss / 超参 调优 v6 (同 23 维特征) ──
     # 学习自 v7 失败: 不改特征架构, 仅调 loss/超参. 试探:

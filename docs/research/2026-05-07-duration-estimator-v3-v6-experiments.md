@@ -459,7 +459,66 @@ alpha 参数语义与文档不符。
    累积 20k+ 样本再训
 3. **--integrated A/B 测试**: 同视频 v6 vs v8 翻译输出对比, 看 LLM 行为差异
 
-## 方法论复盘 (7 次迭代收敛)
+## iter8: v9 错误分析 + monotonic constraints — 2026-05-07 (不上线)
+
+### 错误分析 (v8 三视频 872 段)
+
+**Per-video systematic bias** (domain shift):
+- zjMu (3b1b 数学): residual mean **+496 ms** (over-predict)
+- d4Eg (3b1b 四元数): **+360 ms**
+- kCc (Karpathy GPT 编程): **−457 ms** (UNDER!) ← 解释 kCc atempo 14 段最多
+
+**Per-length bias** (GBDT truncation):
+| 长度 (chars) | n | residual mean |
+|---|---|---|
+| [0, 10) | 5 | +500 ms |
+| [10, 20) | 98 | +526 ms |
+| [20, 35) | 175 | +384 ms |
+| [35, 60) | 341 | **−580 ms** |
+| [60, 200) | 253 | −426 ms |
+
+**根因**: 训练数据偏 3blue1brown 数学风格, kCc 编程类长句 + 专有 token 不足
+GBDT 长句区域 split 稀疏, 边缘长句外推被截断到训练样本均值附近.
+
+### v9 monotonic constraints 实验
+
+```python
+monotone_constraints = [+1] * (字符/音节 features) + [-1] * (n_exclaim, n_ellipsis)
+```
+
+LightGBM CV R²=0.9727 (v8 0.9733, -0.0006), MAE=399.6 ms (v8 391.4, +8 ms).
+
+| 长度 | v8 res mean | v9 res mean | v8 \|res\| | v9 \|res\| |
+|---|---|---|---|---|
+| [0, 10) | +500 | +361 | 502 | 414 ✅ |
+| [10, 20) | +526 | +488 | 703 | 679 ✅ |
+| [20, 35) | +384 | +367 | 954 | 932 ✅ |
+| [35, 60) | −580 | −606 | 1354 | **1373 ⚠️** |
+| [60, 200) | −426 | −378 | 1435 | 1443 |
+
+**结论**: monotonic 仅微调短-中段 mean offset, 长句 truncation 未解决.
+35-60 段 |residual| 反升 1.4%, 离线 MAE +8 ms.
+
+### 决策: v9 不上线
+
+边际改进太小, 长句问题根因不是 monotonic 能解决的 — 是训练数据 domain shift.
+
+### v10+ 真正可行方向
+
+| 方向 | 期望增益 | 成本 |
+|---|---|---|
+| **训练数据 domain 扩充** | 解决 kCc -457ms bias | 高 (跑更多视频) |
+| **Per-domain 校准** | 多视频混合时 mean offset | 中 (识别 domain) |
+| **Residual boosting** | 第二模型预测残差, 二级修正 | 中 |
+| **--integrated 模式真验证** | 测 LLM 翻译适应估算 | 高 (LLM API 成本) |
+
+### 收敛判断
+
+v8→v9 的微改进+回退证明: **当前数据/特征/架构已接近最优**.
+继续在 8327 净样本 + 23 维特征上调优 ROI 极低.
+真改进需要 (a) 更多数据, 或 (b) 端到端 LLM-aware 验证, 或 (c) 架构革新.
+
+## 方法论复盘 (8 次迭代收敛)
 
 ```
 iter1 离线 v0+v3+v4 (Ridge)        — CV R² 0.952
@@ -467,8 +526,10 @@ iter2 离线 v6 (LightGBM)           — CV R² 0.973 ⚠️ 仅离线指标
 iter3 端到端 v4 (zjMu+d4Eg)        — mean 准但合规率 -1pp (混合信号)
 iter4 端到端 v6 (zjMu+d4Eg)        — 全维度胜出 ✅ 上线
 iter5 generality v6 (kCc 617 段)   — 长视频稳定 ✅ 维持
-iter6 v7 token 特征 (zjMu+d4Eg)    — 离线 +0.002 R² 但端到端回退 ❌ 回滚
+iter6 v7 token 特征                — 离线 +0.002 R² 端到端回退 ❌ 回滚
 iter7 v8 超参调优 (num_leaves=31)  — 6 项端到端微改 / 0 显著回退 ✅ 上线
+iter8 v9 monotonic + 错误分析      — 离线 MAE +8ms 长句问题未解 ❌ 不上线
+                                     找到 domain shift + length truncation 根因
 ```
 
 **关键学习**:

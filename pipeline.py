@@ -5690,15 +5690,20 @@ _G2PW_PREWARM_DONE = False  # 防止运行时懒加载: 必须在 import 期 pre
 
 
 def _prewarm_g2pw():
-    """import 期 eager 加载 G2PW (BERT + ONNX, ~450MB).
+    """import 期 eager 加载 G2PW (BERT + ONNX, ~450MB) + 触发实际推理.
 
     G2PW 是 _fix_polyphones 的 BERT 兜底 (CPP 99.08%, 我们域 ~88%),
     跨多音字消歧场景必启用, 不再走 env var opt-in.
 
     设计原则: G2PW 内部用 ONNX runtime, 自带 libomp; 若运行时懒加载,
-    会与已加载的 ctranslate2/torch/sklearn libomp 竞态触发 SIGSEGV
-    (同 LightGBM 问题, 见 docs/research/2026-05-08-lightgbm-libomp-conflict.md).
-    必须在 import 期独占 init 窗口加载.
+    会与已加载的 ctranslate2/torch/sklearn libomp 在 OpenMP 临界区
+    死锁或竞态 SIGSEGV (同 LightGBM 问题, 见
+    docs/research/2026-05-08-lightgbm-libomp-conflict.md).
+
+    关键: ONNX Runtime 的 libomp 是 **lazy init** — 仅 G2PWPinyin()
+    构造不会触发 libomp 初始化, 必须真正跑一次 lazy_pinyin() 推理才
+    完成 OpenMP 线程池初始化. 类比 LightGBM 预热必须用 ≥5 字符触发
+    _estimate_v6 实际加载才有效的教训.
 
     强制 HF_HUB_OFFLINE=1: pypinyin_g2pw 默认尝试从 huggingface 检查
     bert-base-chinese 更新, 网络阻塞时会卡数十秒重试. 项目用户应已
@@ -5713,7 +5718,26 @@ def _prewarm_g2pw():
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     try:
         from pypinyin_g2pw import G2PWPinyin
-        _G2PW_INSTANCE = G2PWPinyin()
+        instance = G2PWPinyin()
+        # **关键**: 强制 DataLoader num_workers=0 (主进程同步推理).
+        # g2pw 库存在 Python truthiness bug:
+        #   self.num_workers = num_workers if num_workers else self.config.num_workers
+        # 传 num_workers=0 会被 `if 0` 短路 → 走 config 默认 (>0). 必须构造
+        # 后直接改属性绕过.
+        # 不限 num_workers=0 会让 DataLoader spawn worker 子进程, 子进程
+        # import pipeline.py 再触发 prewarm → 再 spawn DataLoader → 递归
+        # 死锁 (实测 faulthandler 抓到 popen_spawn_posix:_launch 卡 worker
+        # 启动). 36 段顺序推理 < 1s, 远小于 spawn 开销.
+        try:
+            instance._g2pw.num_workers = 0
+        except AttributeError:
+            pass
+        # 触发实际推理完成 ONNX libomp init (独占 init 窗口).
+        try:
+            instance.lazy_pinyin("预热")
+        except Exception:
+            pass
+        _G2PW_INSTANCE = instance
     except Exception:
         _G2PW_INSTANCE = False
 

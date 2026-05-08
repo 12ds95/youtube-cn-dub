@@ -25,6 +25,16 @@ output/
 config.json
 config.resume.json
 config.scratch.json
+config.json.backup*
+
+# ─── Claude Code 本地配置 ───────────────────────────
+.claude/
+
+# ─── G2PW BERT 模型 (~450MB, 用户首次运行时下载) ─────
+G2PWModel/
+
+# ─── 测试 mktemp 残留 (test_pipeline.sh 等) ─────────
+*_XXXXXX.json
 
 # ─── macOS ────────────────────────────────────────
 .DS_Store

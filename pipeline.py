@@ -93,6 +93,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Set
 
+# ── jieba prewarm + 静默 ─────────────────────────────────────────────
+# 主进程 import 期触发 jieba.initialize(), 写入 cache_file (~/...jieba.cache).
+# 后续任何 spawn 子进程 / subprocess 重新 import jieba 时, OS 自动 mmap
+# 同一 cache 文件 (read-only) 共享物理页, 减少重复 disk I/O.
+# unmarshal trie 的 ~0.7s CPU 仍会重新做 (Python 进程独立 GC heap), 但通过
+# setLogLevel(WARNING) 抑制 "Building prefix dict from the default dictionary"
+# 调试日志噪音.
+#
+# OpenMP 安全: jieba 纯 Python (无 libomp 依赖), 早期 prewarm 不触发 libomp init,
+# 不影响后续 lightgbm/torch/ctranslate2 加载.
+import logging as _early_logging
+import jieba as _jieba_prewarm
+_jieba_prewarm.setLogLevel(_early_logging.WARNING)
+_jieba_prewarm.initialize()
+del _early_logging, _jieba_prewarm
+
 from text_utils import (
     _strip_think_block,
     _strip_markdown,
